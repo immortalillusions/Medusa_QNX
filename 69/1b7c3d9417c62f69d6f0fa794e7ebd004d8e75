@@ -1,0 +1,89 @@
+medusa/tflite_detector.py
+  s_3fd2e6e0fe6a39::t_b50bf24a1425a7 116
+  s_3fd2e6e0fe6a39::t_c02ee9e76ddf41 1-115,117-135
+laptop_event_listener.py
+  s_3fd2e6e0fe6a39::t_eea25f7b174dcb 1-36
+dashboard/next-env.d.ts
+  s_3fd2e6e0fe6a39::t_b8e8c020c7db59 3,5-6
+  s_3fd2e6e0fe6a39::t_742ba4bbba82f6 1-2,4
+medusa/preview.py
+  s_3fd2e6e0fe6a39::t_1fdb97e1074161 1-82
+dashboard/package.json
+  s_3fd2e6e0fe6a39::t_742ba4bbba82f6 1-20
+TODO.md
+  s_3fd2e6e0fe6a39::t_a803ea792fb27f 22
+  s_3fd2e6e0fe6a39::t_f61050fef57ae1 1-12,14-21,23-34
+  s_3fd2e6e0fe6a39::t_bfbadbffca465e 13
+medusa/__init__.py
+  s_3fd2e6e0fe6a39::t_8b5ef90201db3d 1
+  s_3fd2e6e0fe6a39::t_e403e6a00c08f0 2
+medusa/models.py
+  s_3fd2e6e0fe6a39::t_e403e6a00c08f0 1-35
+docs/qnx-deployment.md
+  s_3fd2e6e0fe6a39::t_e487cccf9f7959 1-4,6-8,10-29,31,33-48
+  s_3fd2e6e0fe6a39::t_c1d987db62b06d 5,9,30,32
+tests/test_decision.py
+  s_3fd2e6e0fe6a39::t_bc6ff266928d88 1-2,12,16-19,22-28,31-35
+  s_3fd2e6e0fe6a39::t_a5c331f0a9d9e5 3-4,6-11,20-21,29-30,36
+  s_3fd2e6e0fe6a39::t_62312bb3672f57 5,13-15
+dashboard/app/page.tsx
+  s_3fd2e6e0fe6a39::t_742ba4bbba82f6 1-67
+docs/wiring-diagram.md
+  s_3fd2e6e0fe6a39::t_f61050fef57ae1 1-47
+medusa/actions.py
+  s_3fd2e6e0fe6a39::t_c22018a2a3ba88 1-17
+dashboard/app/layout.tsx
+  s_3fd2e6e0fe6a39::t_742ba4bbba82f6 1-8
+.gitignore
+  s_3fd2e6e0fe6a39::t_ad46600da101dd 8-11
+docs/parts.md
+  s_3fd2e6e0fe6a39::t_2c25e284c9e85d 8-9
+  s_3fd2e6e0fe6a39::t_f34d744921ce15 3-7,10-30
+qnx/README.md
+  s_3fd2e6e0fe6a39::t_e487cccf9f7959 1-13
+medusa/decision.py
+  s_3fd2e6e0fe6a39::t_e403e6a00c08f0 1-55
+dashboard/app/globals.css
+  s_3fd2e6e0fe6a39::t_ad46600da101dd 3
+  s_3fd2e6e0fe6a39::t_742ba4bbba82f6 1-2,4-7
+docs/design.md
+  s_3fd2e6e0fe6a39::t_f34d744921ce15 1,3,6-8,10-11,16,18,20,22,24
+  s_3fd2e6e0fe6a39::t_2c25e284c9e85d 9,14
+  s_3fd2e6e0fe6a39::t_c1d987db62b06d 5,12
+docs/system-plan.md
+  s_3fd2e6e0fe6a39::t_f34d744921ce15 1-12,14,16-21,24-27,29-46
+  s_3fd2e6e0fe6a39::t_2c25e284c9e85d 13,15,23
+  s_3fd2e6e0fe6a39::t_c1d987db62b06d 22,28
+dashboard/tsconfig.json
+  s_3fd2e6e0fe6a39::t_742ba4bbba82f6 1-3,9-13,25
+  s_3fd2e6e0fe6a39::t_b8e8c020c7db59 4-8,14-24,26-35
+qnx_ai_service.py
+  s_3fd2e6e0fe6a39::t_f25d9f8aa14cdf 1-82
+README.md
+  s_3fd2e6e0fe6a39::t_bfbadbffca465e 7,12,27,29,33,35-50
+  s_3fd2e6e0fe6a39::t_2c25e284c9e85d 8,18,22,24,34
+  s_3fd2e6e0fe6a39::t_f34d744921ce15 3,5,9-11,14,16,20,23,25-26,28,30-32,51-52
+dashboard/package-lock.json
+  s_3fd2e6e0fe6a39::t_695c92ec6c84cb 1-990
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "691b7c3d9417c62f69d6f0fa794e7ebd004d8e75",
+  "prompts": {},
+  "humans": {
+    "h_b4b1dfb8be78fe": {
+      "author": "immortalillusions <84871548+immortalillusions@users.noreply.github.com>"
+    }
+  },
+  "sessions": {
+    "s_3fd2e6e0fe6a39": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ffc1-cde5-7433-8a4c-c72b0b261e47",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "immortalillusions <84871548+immortalillusions@users.noreply.github.com>"
+    }
+  }
+}
