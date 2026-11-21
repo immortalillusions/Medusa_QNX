@@ -8,6 +8,7 @@ type Status = {
   reason: string;
   face_count?: number | null;
   snooper_detected?: boolean;
+  snooper_count?: number;
   nose_offset?: NoseOffset | null;
 };
 const defaultUrl = "http://raspberrypi.local:8080";
@@ -88,6 +89,8 @@ export default function Home() {
   };
 
   const snooperDetected = status.snooper_detected ?? status.active;
+  const snooperCount = status.snooper_count ?? 0;
+  const snooperLabel = snooperCount > 1 ? `${snooperCount} SNOOPERS DETECTED` : "SNOOPER DETECTED";
   const noseOffset = status.nose_offset;
 
   return <main>
@@ -110,13 +113,13 @@ export default function Home() {
       </div>
       <aside className={connected && snooperDetected ? "alert active" : "alert"}>
         <p className="eyebrow">CURRENT STATE</p>
-        <strong>{connected ? (snooperDetected ? "SNOOPER DETECTED" : "CLEAR") : "UNAVAILABLE"}</strong>
+        <strong>{connected ? (snooperDetected ? snooperLabel : "CLEAR") : "UNAVAILABLE"}</strong>
         {typeof status.face_count === "number" && (
           <p>{status.face_count} {status.face_count === 1 ? "face" : "faces"} detected</p>
         )}
         {connected && status.snooper_detected && (
-          <section className="nose-offset" aria-label="Snooper nose offset">
-            <p>Nose to preview center</p>
+          <section className="nose-offset" aria-label="Closest snooper nose offset">
+            <p>Closest snooper's nose to preview center</p>
             {noseOffset ? (
               <>
                 <strong>{Math.round(noseOffset.distance_px)} px</strong>
