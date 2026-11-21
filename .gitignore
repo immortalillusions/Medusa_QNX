@@ -5,6 +5,10 @@ __pycache__/
 venv/
 *.egg-info/
 
+# Next.js dashboard build/dependencies
+dashboard/node_modules/
+dashboard/.next/
+
 # camera captures
 captures/
 

@@ -1,35 +1,24 @@
-# Design
+# Medusa design
 
-## What each part does
+## Demo architecture
 
-- **Laptop:** its webcam watches for someone other than you looking at the screen. When it sees one, it switches Chrome to a blank Google Doc and tells the Pi "someone is looking".
-- **Raspberry Pi 5 (QNX):** the brain. It watches the dummy through the C270, finds the paper marker and the face, works out where to point, and sends angles to the UNO Q. Two programs run here: one that sees (AI) and one that decides (plain rules). If either is killed, it restarts on its own.
-- **C270 webcam:** the turret's eye. Sits on the base plate, just above the turret.
-- **UNO Q:** the hands and the safety guard. It moves the servos, switches the light, and refuses anything outside safe limits. If the Pi goes quiet for 0.3 s, it turns the light off and parks the turret.
-- **Two servos:** one turns the turret left and right, the other tilts it up and down.
-- **Light:** a finger light held in a printed clamp on the turret. It stays dark unless the UNO Q switches it on.
-- **Paper marker:** a black and white square on the dummy's forehead. The turret only ever aims at a face with this marker. Anyone else in view just switches the light off.
+```text
+                    local Wi-Fi
+QNX Pi event --------------------> laptop event listener -> blank Google Doc
+    |
+    | USB camera + local TensorFlow Lite inference
+    v
+snooper decision -> Arduino heartbeat/target -> servo-mounted low-power LED
+```
 
-## How they connect
+The Raspberry Pi 5 runs QNX and is the authoritative embedded computer. It uses the QNX OSS TensorFlow Lite runtime to execute local face-detection and face-landmark models. Frames remain on the Pi; the laptop receives only a small decision event.
 
-- **Laptop ↔ Pi:** Wi-Fi (phone hotspot). The laptop sends "looking / not looking" about 15 times a second.
-- **C270 → Pi:** USB.
-- **Pi ↔ UNO Q:** three wires (send, receive, ground), each data wire through a 1 kΩ resistor. The 3.3 V pins are never joined.
-- **UNO Q → servos:** pin D9 to the left-right servo, pin D10 to the up-down servo.
-- **UNO Q → light:** pin D5 drives a transistor that sits in the light's battery loop. A foil-and-card insert in the light lets the transistor do the switching.
+## Safety design
 
-## Power
+The Arduino UNO Q is an independent actuator safety layer. It accepts only safe angle limits, defaults the LED to off, and parks the servo when the QNX heartbeat expires. A physical kill switch removes servo and LED power.
 
-- Pi: Apple charger.
-- UNO Q: laptop USB.
-- Servos: their own 5 V supply, never shared with the Pi or UNO Q.
-- Light: its own batteries.
-- **Kill plug:** one pull tab that cuts both servo power and the light at once.
+## Detection rule
 
-## When something fails
+The QNX model identifies faces and estimates whether each face is directed toward the screen. When at least two high-confidence screen-facing faces remain visible for the hold period, Medusa treats the smaller/farther face as the likely snooper. This is a distance heuristic, not face identification.
 
-- **Pi unplugged:** the UNO Q notices within 0.3 s, turns the light off and parks the turret.
-- **Camera unplugged, or a program killed:** the light goes off, and the program restarts by itself.
-- **Laptop gone:** after 0.5 s with no news, the light goes off.
-- **UNO Q unplugged:** resistors hold the light off and the servos still.
-- **Kill plug pulled:** servos and light lose power, no software involved.
+The camera is fixed above the display. The moving component is the LED mount, not the camera.
