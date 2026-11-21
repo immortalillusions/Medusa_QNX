@@ -1,0 +1,21 @@
+medusa/tflite_detector.py
+  s_23fc94f2b4e91f::t_18847d67c6f1d6 1-9
+README.md
+  s_23fc94f2b4e91f::t_d227dfe74df7d2 20-36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "740dd9ce359da3f0e4293efbd124976aecb0b14a",
+  "prompts": {},
+  "sessions": {
+    "s_23fc94f2b4e91f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a2000b-bfe3-7622-8674-fef2c37f959c",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "immortalillusions <84871548+immortalillusions@users.noreply.github.com>"
+    }
+  }
+}
