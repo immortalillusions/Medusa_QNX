@@ -1,3 +1,12 @@
+"""QNX AI model adapter.
+
+This module loads Medusa's checked-in MediaPipe-derived TFLite models with
+QNX's ``tflite_runtime`` package, runs face/landmark inference on Pi camera
+frames, and turns the results into screen-facing face observations. It is the
+code path that uses the AI models on QNX; the QNX image must still have the
+matching TensorFlow Lite runtime installed first.
+"""
+
 from __future__ import annotations
 
 import math

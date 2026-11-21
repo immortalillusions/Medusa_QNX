@@ -37,6 +37,23 @@ The QNX Pi is the AI host and decision maker. Frames remain on the Pi; the lapto
 
 Medusa uses **TensorFlow Lite runtime** from QNX OSS on the Raspberry Pi. The checked-in BlazeFace and face-landmark models are stored locally and execute with no cloud service.
 
+For the Python service, install `python3-tflite-runtime` (the QNX 8.0.3
+AArch64 repository lists `python3-tflite-runtime-2.21.0-r1.apk`). Its runtime
+dependency is `tflite-runtime-2.21.0-r1.apk`. Confirm the Pi's QNX version
+before installation; do not mix packages from different QNX releases.
+
+## AI models
+
+- **MediaPipe BlazeFace short-range** (`qnx/blaze_face_short_range.tflite`):
+  detects faces in the fixed camera frame.
+- **MediaPipe face landmark detector** (`qnx/face_landmark_detector.tflite`):
+  returns facial landmarks.
+- **Medusa head-direction rule:** compares nose and eye landmark geometry to
+  conservatively decide whether a face is directed toward the screen.
+
+These are MediaPipe-derived TFLite model files, but the Pi runs them through
+the QNX OSS TensorFlow Lite runtime—not the full MediaPipe runtime.
+
 ## Run the QNX demo
 
 1. Complete the [QNX camera setup](docs/qnx-deployment.md#take-a-face-detection-snapshot) and take a test photo.
