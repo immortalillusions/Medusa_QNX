@@ -1,30 +1,51 @@
 # Parts
 
-## Core QNX system
+## MLH & QNX Provided
 
-- Raspberry Pi 5 (8 GB) with QNX microSD card
-- Raspberry Pi Active Cooler
-- Logitech C270 USB webcam, mounted fixed above the display
-- Local BlazeFace and face-landmark TFLite models stored on the Pi
-- QNX OSS TensorFlow Lite runtime for AArch64
-- Laptop on the same local network, for the privacy event listener
+- 1 Raspberry Pi 5 (8 GB) with QNX microSD card
+- 1 Raspberry Pi Active Cooler
+- 1 Logitech C270 webcam
+- 2 Arduino UNO Q (one is a spare)
+- 1 micro-HDMI to HDMI cable
+- Jumper wires (bundle)
+- 1 MacBook with built-in webcam, also the power source for everything (ours)
+- 1 Apple USB-C charger, backup power for the Pi (ours)
+- 1 realistic dummy head (ours)
 
-## Actuator and safety hardware
+## Joanna Provided
 
-- Arduino UNO Q (one spare is helpful)
-- One SG90 micro servo for left/right aiming
-- Optional second SG90 micro servo for tilt
-- Low-power LED, finger light, or mini flashlight; never a laser
-- 2N2222A transistor to switch the LED circuit
-- 1 kOhm base resistor and a base pull-down resistor
-- Breadboard and jumper wires
-- Dedicated regulated 5 V servo supply
-- 470 uF or larger capacitor across the servo supply near the servos
-- Physical kill switch or pull-tab for servo and LED power
-- Multimeter
+- 2 SG90 micro servos, with their horns (and their small screws, if they have them)
+- 1 2N2222A transistor
+- 3 resistors around 1 kΩ (anything from 470 Ω to 2.2 kΩ)
+- 6 resistors around 10 kΩ (anything from 4.7 kΩ to 47 kΩ)
+- 1 breadboard
+- 1 MB102 power module
+- 1 push button
+- 1 multimeter
+- 1 capacitor, 470 µF or bigger (required: steadies the servos' power)
+- About 20 male-to-male and 3 female-to-male jumper wires
 
-## Mechanical items
+## Externally Provided
 
-- LED mount and servo bracket (the existing CAD parts may be used)
-- Zip ties or double-sided tape
-- Fixed camera mount above the display
+- 1 LED finger light (or a small light: 20 g or less, 60 mm or shorter); the Canada Life flashlight from the prize table may work if it meets that
+- 3D printed parts: base, yoke, light clamp, fit coupon (see [printing.md](printing.md))
+- 13 small zip ties plus 3 spares (2.5–3.6 mm wide)
+- 3 to 7 loonies for the counterweight
+- Hot glue, low-temperature gun if possible (the makerspace)
+- 4 small rubber feet and a 20 × 20 mm patch of foam tape or mounting putty
+- About 1 m of solid-core wire, for the horn wire loops and the light's two leads
+- 1 old USB cable we can cut for the servos' 5 V: USB-A (with a USB-C adapter), or USB-C plus a 5.1 kΩ resistor
+- 1 USB-C to USB-C cable for the UNO Q
+- 1 paper marker (ArUco ID 7, 4 cm square) on matte paper
+- Kitchen foil, thin card and tape (for the light's on/off switch)
+- Recommended: 2 spare SG90 servos
+
+## Power
+
+Everything runs off the laptop's three USB-C ports:
+
+1. Pi
+2. UNO Q
+3. Servos (through the cut cable)
+
+The light uses its own batteries. Keep the laptop on its charger and stop it from sleeping, or it may cut USB power mid-demo.
