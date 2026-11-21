@@ -9,8 +9,11 @@ import sys
 from pathlib import Path
 
 from medusa.decision import SnooperSelector
+from medusa.models import SnooperDecision
+from medusa.nose_offset import measure_nose_offset
 from medusa.preview import PreviewServer
-from medusa.tflite_detector import TFLiteFaceGazeDetector
+from medusa.snooper import select_snooper
+from medusa.tflite_detector import TFLiteFaceGazeDetector, draw_face_boxes
 
 
 def send(sock, target, active, target_x, reason):
@@ -20,7 +23,9 @@ def send(sock, target, active, target_x, reason):
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--camera", type=int, default=0)
+    cameras = parser.add_mutually_exclusive_group()
+    cameras.add_argument("--camera", type=int, default=0, help="OpenCV camera index")
+    cameras.add_argument("--qnx-camera-unit", type=int, help="QNX Sensor Framework camera unit")
     parser.add_argument("--face-detector", type=Path, default=Path("qnx/blaze_face_short_range.tflite"))
     parser.add_argument("--face-landmarker", type=Path, default=Path("qnx/face_landmark_detector.tflite"))
     parser.add_argument("--event-host", required=True)
@@ -34,12 +39,17 @@ def main() -> int:
     try:
         import cv2
         detector = TFLiteFaceGazeDetector(str(args.face_detector), str(args.face_landmarker))
-    except (RuntimeError, ValueError) as error:
+        if args.qnx_camera_unit is None:
+            camera = cv2.VideoCapture(args.camera)
+            if not camera.isOpened():
+                camera.release()
+                raise RuntimeError("OpenCV camera is unavailable")
+        else:
+            from medusa.qnx_camera import QnxCamera
+
+            camera = QnxCamera(args.qnx_camera_unit)
+    except (ImportError, RuntimeError, ValueError, OSError) as error:
         print(f"Medusa cannot start safely: {error}", file=sys.stderr)
-        return 2
-    camera = cv2.VideoCapture(args.camera)
-    if not camera.isOpened():
-        print("Medusa cannot start safely: QNX camera is unavailable", file=sys.stderr)
         return 2
 
     preview = PreviewServer(args.preview_port) if args.preview_port else None
@@ -55,18 +65,28 @@ def main() -> int:
                     if preview:
                         preview.state.update_status(False, "camera frame unavailable")
                     continue
-                if preview:
-                    preview.state.update_frame(frame)
+                boxes = None
                 try:
-                    decision = selector.update(detector.detect(frame))
-                except (RuntimeError, ValueError):
-                    send(events, target, False, None, "AI inference unavailable")
-                    if preview:
-                        preview.state.update_status(False, "AI inference unavailable")
-                    continue
+                    boxes = detector.face_detector.detect(frame)
+                    decision = selector.update(detector.detect(frame, boxes=boxes))
+                except (RuntimeError, ValueError, cv2.error):
+                    decision = SnooperDecision(active=False, reason="AI inference unavailable")
                 send(events, target, decision.active, decision.target_x, decision.reason)
                 if preview:
-                    preview.state.update_status(decision.active, decision.reason)
+                    snooper = select_snooper(boxes) if boxes is not None else None
+                    nose_offset = None
+                    if snooper is not None and snooper.nose is not None:
+                        height, width = frame.shape[:2]
+                        nose_offset = measure_nose_offset(snooper.nose, width, height)
+                    if boxes:
+                        draw_face_boxes(frame, boxes, snooper=snooper)
+                    preview.state.update_frame(frame)
+                    preview.state.update_status(
+                        decision.active, decision.reason,
+                        face_count=len(boxes) if boxes is not None else None,
+                        snooper_detected=snooper is not None,
+                        nose_offset=nose_offset,
+                    )
         except KeyboardInterrupt:
             pass
         finally:

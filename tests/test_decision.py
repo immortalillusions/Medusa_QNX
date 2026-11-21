@@ -2,17 +2,32 @@ import unittest
 
 from medusa.decision import SnooperSelector
 from medusa.models import FaceObservation
-from medusa.tflite_detector import TFLiteFaceGazeDetector
+from medusa.tflite_detector import TFLiteFaceDetector
 
 
 def face(x: float, size: float, looking: bool = True) -> FaceObservation:
     return FaceObservation("laptop", x, 0.5, size, looking, 0.9)
 
 
-class SnooperSelectorTests(unittest.TestCase):
+class FaceDetectorTests(unittest.TestCase):
     def test_blazeface_short_range_has_896_anchors(self) -> None:
-        self.assertEqual(len(TFLiteFaceGazeDetector._anchors(128, 128)), 896)
+        self.assertEqual(len(TFLiteFaceDetector._anchors(128, 128)), 896)
 
+    def test_decode_removes_letterboxing_and_applies_sigmoid(self) -> None:
+        detector = TFLiteFaceDetector.__new__(TFLiteFaceDetector)
+        detector.anchors = [(0.5, 0.5), (0.5, 0.5)]
+        raw = (0, 0, 64, 32, 0, 0, 0, 0, 4, -2, 0, 0, 0, 0, 0, 0)
+        boxes = detector._decode([raw] * 2, [0.64, 0.63],
+                                 640, 480, 0, 16, 128, 96)
+
+        self.assertEqual(len(boxes), 1)
+        box = boxes[0]
+        self.assertEqual((box.left, box.top, box.right, box.bottom), (160, 160, 480, 320))
+        self.assertAlmostEqual(box.score, 0.65475346)
+        self.assertEqual(box.nose, (340, 230))
+
+
+class SnooperSelectorTests(unittest.TestCase):
     def test_only_one_face_never_triggers(self) -> None:
         selector = SnooperSelector(hold_frames=2)
         self.assertFalse(selector.update([face(0.5, 0.3)]).active)

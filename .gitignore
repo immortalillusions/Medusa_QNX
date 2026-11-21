@@ -11,6 +11,8 @@ dashboard/.next/
 
 # camera captures
 captures/
+/build/qnx/
+/qnx/libmedusa_camera.so
 
 # os and editors
 .DS_Store

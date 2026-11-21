@@ -1,5 +1,11 @@
 # TODO
 
+## Pi camera snapshot
+
+- [ ] Build the camera bridge and run `python3 capture_face.py` on the QNX Pi.
+- [ ] Confirm the JPEG shows a green box around a face and the command prints the count.
+- [ ] Repeat with an empty frame and confirm the command saves a photo with zero faces.
+
 ## QNX AI
 
 - [ ] Boot the Pi into QNX.
@@ -7,7 +13,7 @@
 - [ ] Install the QNX TensorFlow Lite runtime and Python binding.
 - [ ] Run a one-line import test: `python3 -c "from tflite_runtime.interpreter import Interpreter"`.
 - [ ] Copy the repository, including `qnx/*.tflite`, to the Pi.
-- [ ] Run `python3 qnx_ai_service.py --event-host <laptop-ip>`.
+- [ ] Run `python3 qnx_ai_service.py --qnx-camera-unit 5 --event-host <laptop-ip>`.
 - [ ] Confirm it loads both models and emits an inactive event when no faces are present.
 - [ ] Test two people facing the camera; confirm a sustained event is emitted.
 - [ ] Start `dashboard/` with `npm install` then `npm run dev`; confirm its preview and status update.

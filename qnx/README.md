@@ -1,4 +1,11 @@
-# TFLite models
+# QNX camera and models
+
+Build the Sensor Framework bridge in this directory and run
+`python3 capture_face.py` from the repo root on the Pi. See the
+[snapshot setup](../docs/qnx-deployment.md#take-a-face-detection-snapshot)
+for dependencies and build commands.
+
+## TFLite models
 
 These are the models used by the QNX service:
 

@@ -1,6 +1,26 @@
 # Medusa
 
-Medusa is a QNX embedded privacy device built for Hack Western 13. A fixed camera on a Raspberry Pi 5 running QNX detects when a second person is looking at the laptop screen. The Pi runs the AI locally, opens a blank document on the laptop, and directs a low-power LED toward the snooper's torso.
+Medusa uses a USB camera connected to a Raspberry Pi 5 running QNX. The snapshot command takes one photo, detects faces locally with the bundled BlazeFace model, and saves the photo with a green box around each detected face.
+
+## Take a photo and detect faces
+
+Plug the webcam into the Pi and follow the one-time [QNX camera setup](docs/qnx-deployment.md#take-a-face-detection-snapshot). Then run from the repo directory **on the Pi**.
+
+```sh
+python3 capture_face.py
+```
+
+The command uses Sensor Framework camera unit 5, the USB camera unit in the
+standard Pi 5 configuration. It prints the number of faces and writes
+`captures/face.jpg`, even when the count is zero. Use `--camera-unit` for a
+different Sensor Framework unit or `--output captures/second.jpg` to keep
+another photo.
+
+## Privacy demo
+
+Medusa was built for Hack Western 13. The continuous demo uses the fixed
+camera to detect a second person looking at the laptop screen and emit a
+privacy event.
 
 ## Architecture
 
@@ -19,24 +39,29 @@ Medusa uses **TensorFlow Lite runtime** from QNX OSS on the Raspberry Pi. The ch
 
 ## Run the QNX demo
 
-1. Install the matching QNX OSS TensorFlow Lite runtime package and its Python binding on the Raspberry Pi 5.
-2. Confirm the fixed C270 works on QNX.
-3. Copy the project and its `qnx/*.tflite` model files to the Pi.
-4. Start the laptop listener:
+1. Complete the [QNX camera setup](docs/qnx-deployment.md#take-a-face-detection-snapshot) and take a test photo.
+2. Start the laptop listener.
 
    ```powershell
    python laptop_event_listener.py
    ```
 
-5. Start the QNX AI service:
+3. Start the QNX AI service.
 
    ```sh
-   python3 qnx_ai_service.py --event-host <laptop-ip>
+   python3 qnx_ai_service.py --qnx-camera-unit 5 --event-host <laptop-ip>
    ```
 
 ## Local preview dashboard
 
 The QNX service exposes a LAN-only camera preview and status on port 8080.
+The live video draws boxes around detected faces. With at least two faces,
+it labels the smallest bounding box by area as **SNOOPER** and draws a line
+from the preview center to that person's nose. The dashboard shows the
+center-to-nose distance and horizontal and vertical offsets in camera
+pixels. It uses the middle of the camera frame as the screen center.
+The privacy alert uses the existing screen-facing and stability criteria.
+
 On the laptop, start the dashboard:
 
 ```powershell

@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import json
 import threading
+from dataclasses import asdict
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from .nose_offset import NoseOffset
 
 
 class PreviewState:
     def __init__(self) -> None:
         self.condition = threading.Condition()
         self.jpeg: bytes | None = None
-        self.status = {"active": False, "reason": "starting"}
+        self.frame_number = 0
+        self.closed = False
+        self.update_status(False, "starting")
 
     def update_frame(self, frame) -> None:
         import cv2
@@ -19,11 +24,21 @@ class PreviewState:
         if ok:
             with self.condition:
                 self.jpeg = encoded.tobytes()
+                self.frame_number += 1
                 self.condition.notify_all()
 
-    def update_status(self, active: bool, reason: str) -> None:
+    def update_status(
+        self, active: bool, reason: str, *, face_count: int | None = None,
+        snooper_detected: bool = False, nose_offset: NoseOffset | None = None,
+    ) -> None:
         with self.condition:
-            self.status = {"active": active, "reason": reason}
+            self.status = {
+                "active": active,
+                "reason": reason,
+                "face_count": face_count,
+                "snooper_detected": snooper_detected,
+                "nose_offset": asdict(nose_offset) if nose_offset is not None else None,
+            }
 
 
 class PreviewServer:
@@ -57,17 +72,25 @@ class PreviewServer:
                 self.send_response(HTTPStatus.OK)
                 self._headers("multipart/x-mixed-replace; boundary=frame")
                 self.end_headers()
+                last_frame_number = 0
                 try:
                     while True:
                         with state.condition:
-                            state.condition.wait_for(lambda: state.jpeg is not None, timeout=1)
+                            if not state.condition.wait_for(
+                                lambda: state.closed or state.frame_number != last_frame_number,
+                                timeout=1,
+                            ):
+                                continue
+                            if state.closed:
+                                return
                             frame = state.jpeg
+                            last_frame_number = state.frame_number
                         if frame is None:
                             continue
                         self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n")
                         self.wfile.write(f"Content-Length: {len(frame)}\r\n\r\n".encode())
                         self.wfile.write(frame + b"\r\n")
-                except (BrokenPipeError, ConnectionResetError):
+                except ConnectionError:
                     return
 
         self.server = ThreadingHTTPServer(("", port), Handler)
@@ -77,6 +100,9 @@ class PreviewServer:
         self.thread.start()
 
     def stop(self) -> None:
+        with self.state.condition:
+            self.state.closed = True
+            self.state.condition.notify_all()
         self.server.shutdown()
         self.server.server_close()
 

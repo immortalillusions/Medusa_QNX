@@ -2,41 +2,93 @@
 
 import { useEffect, useState } from "react";
 
-type Status = { active: boolean; reason: string };
+type NoseOffset = { dx_px: number; dy_px: number; distance_px: number };
+type Status = {
+  active: boolean;
+  reason: string;
+  face_count?: number | null;
+  snooper_detected?: boolean;
+  nose_offset?: NoseOffset | null;
+};
 const defaultUrl = "http://raspberrypi.local:8080";
+
+function describeOffset(value: number, negative: string, positive: string) {
+  const pixels = Math.round(Math.abs(value));
+  return pixels ? `${pixels} px ${value < 0 ? negative : positive}` : "0 px";
+}
 
 export default function Home() {
   const [baseUrl, setBaseUrl] = useState(defaultUrl);
   const [savedUrl, setSavedUrl] = useState(defaultUrl);
   const [status, setStatus] = useState<Status>({ active: false, reason: "waiting for QNX" });
   const [connected, setConnected] = useState(false);
+  const [previewFailed, setPreviewFailed] = useState(false);
+  const [previewAttempt, setPreviewAttempt] = useState(0);
 
   useEffect(() => {
-    setBaseUrl(localStorage.getItem("medusa-preview-url") || defaultUrl);
+    const rememberedUrl = localStorage.getItem("medusa-preview-url") || defaultUrl;
+    setBaseUrl(rememberedUrl);
+    setSavedUrl(rememberedUrl);
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    let activeRequest: AbortController | undefined;
+    let timer: number;
     const poll = async () => {
+      const request = new AbortController();
+      activeRequest = request;
+      const timeout = window.setTimeout(() => request.abort(), 3000);
       try {
-        const response = await fetch(savedUrl + "/status.json", { cache: "no-store" });
+        const response = await fetch(savedUrl + "/status.json", {
+          cache: "no-store",
+          signal: request.signal,
+        });
         if (!response.ok) throw new Error();
-        setStatus(await response.json());
+        const currentStatus = await response.json();
+        if (cancelled) return;
+        setStatus(currentStatus);
         setConnected(true);
       } catch {
+        if (cancelled) return;
         setConnected(false);
         setStatus({ active: false, reason: "QNX preview unavailable" });
+      } finally {
+        window.clearTimeout(timeout);
       }
+      timer = window.setTimeout(poll, 750);
     };
-    poll();
-    const timer = window.setInterval(poll, 750);
-    return () => window.clearInterval(timer);
+    void poll();
+    return () => {
+      cancelled = true;
+      activeRequest?.abort();
+      window.clearTimeout(timer);
+    };
   }, [savedUrl]);
 
+  useEffect(() => {
+    if (connected) {
+      setPreviewFailed(false);
+      setPreviewAttempt((attempt) => attempt + 1);
+    }
+  }, [connected]);
+
+  useEffect(() => {
+    if (!previewFailed) return;
+    const timer = window.setTimeout(() => setPreviewFailed(false), 1500);
+    return () => window.clearTimeout(timer);
+  }, [previewFailed]);
+
   const connect = () => {
-    const normalized = baseUrl.replace(/\/$/, "");
+    const normalized = baseUrl.trim().replace(/\/$/, "");
     localStorage.setItem("medusa-preview-url", normalized);
     setSavedUrl(normalized);
+    setPreviewFailed(false);
+    setPreviewAttempt((attempt) => attempt + 1);
   };
+
+  const snooperDetected = status.snooper_detected ?? status.active;
+  const noseOffset = status.nose_offset;
 
   return <main>
     <header>
@@ -52,12 +104,30 @@ export default function Home() {
 
     <section className="grid">
       <div className="video">
-        {connected ? <img src={savedUrl + "/stream.mjpg"} alt="Fixed QNX camera preview" /> : <p>Camera preview will appear here.</p>}
+        {previewFailed ? <p>Reconnecting camera preview…</p> :
+          <img key={previewAttempt} src={savedUrl + "/stream.mjpg"} alt="Fixed QNX camera preview"
+            onError={() => setPreviewFailed(true)} />}
       </div>
-      <aside className={status.active ? "alert active" : "alert"}>
+      <aside className={connected && snooperDetected ? "alert active" : "alert"}>
         <p className="eyebrow">CURRENT STATE</p>
-        <strong>{status.active ? "SNOOPER DETECTED" : "CLEAR"}</strong>
-        <p>{status.reason}</p>
+        <strong>{connected ? (snooperDetected ? "SNOOPER DETECTED" : "CLEAR") : "UNAVAILABLE"}</strong>
+        {typeof status.face_count === "number" && (
+          <p>{status.face_count} {status.face_count === 1 ? "face" : "faces"} detected</p>
+        )}
+        {connected && status.snooper_detected && (
+          <section className="nose-offset" aria-label="Snooper nose offset">
+            <p>Nose to preview center</p>
+            {noseOffset ? (
+              <>
+                <strong>{Math.round(noseOffset.distance_px)} px</strong>
+                <p>Horizontal {describeOffset(noseOffset.dx_px, "left", "right")}</p>
+                <p>Vertical {describeOffset(noseOffset.dy_px, "up", "down")}</p>
+              </>
+            ) : <p>Nose position unavailable</p>}
+          </section>
+        )}
+        {connected && <p>Privacy alert {status.active ? "active" : "inactive"}</p>}
+        <small>{status.reason}</small>
       </aside>
     </section>
 
