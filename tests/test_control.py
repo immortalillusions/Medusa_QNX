@@ -1,5 +1,6 @@
 import io
 import json
+import re
 import socket
 import sys
 import tempfile
@@ -183,7 +184,7 @@ class ControlTickTests(unittest.TestCase):
         self.loop.tick(1.0)
         self.assertEqual((self.loop.status.armed, self.loop.status.pan, self.loop.status_at), (True, 100.0, 1.0))
         self.assertEqual(self.loop.snapshot(1.2)["arduino"],
-                         {"link_ok": True, "armed": True, "parking": False, "gate_closed": None, "pan": 100.0,
+                         {"link_ok": True, "armed": True, "parking": False, "gate_closed": None, "needs_button": None, "pan": 100.0,
                           "tilt": 90.0, "age_s": 0.2})  # A 5-field S line: the gate is unknown.
         self.assertEqual(self.loop.snapshot(1.6)["arduino"]["link_ok"], False)
 
@@ -469,7 +470,7 @@ class HttpContractTests(StressRunnerFixture, unittest.TestCase):
         self.assertIn(data["state"], ("SAFE", "ACTIVE"))
         self.assertEqual(data["safe_reason"], "no AI target")
         self.assertEqual(set(data["arduino"]),
-                         {"link_ok", "armed", "parking", "gate_closed", "pan", "tilt", "age_s"})
+                         {"link_ok", "armed", "parking", "gate_closed", "needs_button", "pan", "tilt", "age_s"})
         self.assertEqual((data["arduino"]["armed"], data["arduino"]["pan"]), (True, 100.0))
         self.assertEqual(set(data["stress"]) >= {"running", "seconds_left"}, True)
         for key in ("loop_hz", "period_ms_mean", "jitter_ms_p99", "period_ms_max"):
@@ -762,11 +763,13 @@ class FirmwareStatusTests(unittest.TestCase):
     def test_firmware_sends_s_lines_every_100_ms_in_the_parsed_format(self) -> None:
         source = INO.read_text()
         self.assertIn("const unsigned long STATUS_PERIOD_MS = 100;", source)
-        self.assertIn('"S,%d,%ld,%ld,%lu,%d,%d\\n"', source)
-        self.assertIn("parking ? 1 : 0);", source)
+        self.assertIn('"S,%d,%ld,%ld,%lu,%d,%d,%d\\n"', source)
+        self.assertIn("parking ? 1 : 0, needsButton ? 1 : 0);", source)
         self.assertIn("Serial1.print(status);", source)
-        status = parse_status_line("S,%d,%ld,%ld,%lu,%d,%d" % (1, 1015, 900, 4294967295, 1, 0))
-        self.assertEqual((status.seq, status.gate_closed, status.parking), (4294967295, True, False))
+        status = parse_status_line("S,%d,%ld,%ld,%lu,%d,%d,%d" % (1, 1015, 900, 4294967295, 1, 0, 1))
+        self.assertEqual((status.seq, status.gate_closed, status.parking, status.latched),
+                         (4294967295, True, False, True))
+        self.assertLess(len("S,1,1650,700,4294967295,1,1,1\n"), int(re.search(r"char status\[(\d+)\]", source).group(1)))
 
 
 class ControlFlagTests(unittest.TestCase):

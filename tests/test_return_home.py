@@ -72,8 +72,8 @@ class FirmwareParkingTests(unittest.TestCase):
         self.assertIn("axis.target = axis.position;", function_body(self.source, "void detachAxis("))
 
     def test_status_reports_parking(self) -> None:
-        self.assertIn('"S,%d,%ld,%ld,%lu,%d,%d\\n"', self.source)
-        self.assertIn("parking ? 1 : 0);", function_body(self.source, "void sendStatus("))
+        self.assertIn('"S,%d,%ld,%ld,%lu,%d,%d,%d\\n"', self.source)
+        self.assertIn("parking ? 1 : 0, needsButton ? 1 : 0);", function_body(self.source, "void sendStatus("))
 
 
 class FirmwareArmLineTests(unittest.TestCase):
@@ -97,7 +97,7 @@ class FirmwareArmLineTests(unittest.TestCase):
 
     def test_arm_request_follows_the_state_rules(self) -> None:
         request = function_body(self.source, "void applyArmRequest(")
-        self.assertIn("if (!armed && !parking) setArmed(true);", request)   # gate/heartbeat checks inside
+        self.assertIn("if (!armed && !parking && !needsButton) setArmed(true);", request)  # gate/heartbeat inside
         self.assertIn("} else if (armed) {\n    startParking();", request)  # off glides home first
         self.assertNotIn("setArmed(false)", request)  # never cuts a glide short
         self.assertNotIn("lastCommandMs", request)
@@ -113,6 +113,62 @@ class FirmwareArmLineTests(unittest.TestCase):
         size = int(re.search(r"char line\[(\d+)\];", self.source).group(1))
         self.assertLess(len("A,1,4294967295"), size)
         self.assertIn("// Dashboard switch: A,<1 arm|0 switch off>,<sequence>", self.source)
+
+
+class FirmwareFaultLatchTests(unittest.TestCase):
+    """After any fault a human must press the physical button before the dashboard can arm."""
+
+    def setUp(self) -> None:
+        self.source = INO.read_text()
+        self.loop = function_body(self.source, "void loop(")
+
+    def test_latch_is_set_at_boot(self) -> None:
+        self.assertIn("bool needsButton = true;", self.source)
+        setup = function_body(self.source, "void setup(")
+        self.assertIn("needsButton = true;", setup)
+        self.assertGreater(setup.index("needsButton = true;"), setup.index("setArmed(false);"))
+
+    def test_link_loss_and_open_gate_set_the_latch_every_loop(self) -> None:
+        self.assertIn("if (!gateClosed || millis() - lastCommandMs > HEARTBEAT_TIMEOUT_MS) needsButton = true;",
+                      self.loop)
+        timeout = re.search(r"if \(armed && millis\(\) - lastCommandMs > HEARTBEAT_TIMEOUT_MS\) \{(.*?)\}",
+                            self.loop, re.S).group(1)
+        self.assertLess(timeout.index("needsButton = true;"), timeout.index("startParking();"))  # fault park
+        gate = function_body(self.source, "void updateKillGate(")
+        self.assertIn("if (!gateClosed) needsButton = true;", gate)
+        # The latch is checked after the button and serial input, so a press during a fault
+        # (gate open, no heartbeat) is undone in the same loop pass.
+        self.assertGreater(self.loop.index("needsButton = true;"), self.loop.index("updateArmButton();"))
+        self.assertGreater(self.loop.index("needsButton = true;"), self.loop.index("applyCommand(line);"))
+
+    def test_only_the_button_clears_it(self) -> None:
+        clears = [m.start() for m in re.finditer(r"needsButton = false;", self.source)]
+        self.assertEqual(len(clears), 1)
+        button = function_body(self.source, "void updateArmButton(")
+        self.assertIn("needsButton = false;", button)
+        press = button[button.index("if (stableButtonReading == LOW) {"):]
+        self.assertLess(press.index("needsButton = false;"), press.index("if (parking) setArmed(false);"))
+
+    def test_dashboard_arm_is_refused_while_latched_and_switch_off_does_not_latch(self) -> None:
+        request = function_body(self.source, "void applyArmRequest(")
+        self.assertIn("!needsButton", request)
+        self.assertNotIn("needsButton = true", request)
+        self.assertNotIn("needsButton", function_body(self.source, "void startParking("))  # A,0 / button off
+        self.assertNotIn("needsButton", function_body(self.source, "void setArmed("))
+
+    def test_control_json_reports_the_latch(self) -> None:
+        serial = FakeSerial()
+        loop = ControlLoop(serial, clock=FakeClock().monotonic)
+        serial.incoming += [b"S,0,900,0,1,1,0,1\n"]
+        loop.tick(1.0)
+        self.assertIs(loop.snapshot(1.1)["arduino"]["needs_button"], True)
+        serial.incoming += [b"S,0,900,0,2,1,0,0\n"]
+        loop.tick(1.2)
+        self.assertIs(loop.snapshot(1.3)["arduino"]["needs_button"], False)
+        serial.incoming += [b"S,0,900,0,3,1,0\n"]  # 7-field firmware: unknown
+        loop.tick(1.4)
+        self.assertIsNone(loop.snapshot(1.5)["arduino"]["needs_button"])
+        self.assertIsNone(loop.snapshot(5.0)["arduino"]["needs_button"])  # link lost: unknown
 
 
 class ControlParkLineTests(unittest.TestCase):

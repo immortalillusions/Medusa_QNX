@@ -6,10 +6,11 @@ priority (QNX: ``on -p 21 python3 -u medusa_control.py ...``; every thread it
 starts inherits that priority) so the Arduino heartbeat never depends on the
 AI loop. Each tick it:
 
-1. reads the firmware's ``S,<armed>,<pan_x10>,<tilt_x10>,<seq>[,<gate>[,<parking>]]``
+1. reads the firmware's ``S,<armed>,<pan_x10>,<tilt_x10>,<seq>[,<gate>[,<parking>[,<latched>]]]``
    status lines (gate 1: kill gate closed, servo power on; parking 1: the firmware
-   lost the heartbeat while armed and is gliding home before it goes limp; older
-   firmware sends neither; latest wins; anything else, such as the Zephyr boot
+   lost the heartbeat while armed and is gliding home before it goes limp; latched 1:
+   a fault happened and only the turret's physical button can re-arm it, A,1 is
+   refused; older firmware sends fewer fields; latest wins; anything else, such as the Zephyr boot
    banner, is ignored);
 2. drains ``medusa-target`` packets from the AI process (latest wins);
 3. sends ``N,yaw_x10,pitch_x10,led,seq`` (tenths of a degree) with the AI's
@@ -71,7 +72,7 @@ WINDOW_S = 10.0
 STRESS_MAX_S = 60
 _MAX_PACKETS_PER_TICK = 64
 _MAX_LINE = 128
-_STATUS_LINE = re.compile(r"S,([01]),(-?\d{1,5}),(-?\d{1,5}),(\d{1,10})(?:,([01])(?:,([01]))?)?")
+_STATUS_LINE = re.compile(r"S,([01]),(-?\d{1,5}),(-?\d{1,5}),(\d{1,10})(?:,([01])(?:,([01])(?:,([01]))?)?)?")
 _COMMAND_LINE = re.compile(r"([MN]),(-?\d+),(-?\d+),(-?\d+)(?:,(\d+))?")
 
 
@@ -138,17 +139,20 @@ class ArduinoStatus:
     seq: int
     gate_closed: bool | None = None  # None: a 5-field line from firmware without the kill-gate sense
     parking: bool = False  # link lost while armed: gliding home, then limp (7-field line only)
+    latched: bool | None = None  # fault latch: only the physical button re-arms (8-field line only)
 
 
 def parse_status_line(line: str) -> ArduinoStatus | None:
     """``S,armed,pan_x10,tilt_x10,seq``, the 6-field form with ``,gate`` (1 closed, 0 open),
-    or the 7-field form with ``,gate,parking`` (1: gliding home after a lost heartbeat)."""
+    the 7-field form with ``,gate,parking`` (1: gliding home after a lost heartbeat), or the
+    8-field form with ``,gate,parking,latched`` (1: a fault latched; the button must be pressed)."""
     match = _STATUS_LINE.fullmatch(line.strip())
     if match is None:
         return None
-    armed, pan, tilt, seq, gate, parking = match.groups()
+    armed, pan, tilt, seq, gate, parking, latched = match.groups()
     return ArduinoStatus(armed == "1", int(pan) / 10, int(tilt) / 10, int(seq),
-                         None if gate is None else gate == "1", parking == "1")
+                         None if gate is None else gate == "1", parking == "1",
+                         None if latched is None else latched == "1")
 
 
 class StatusReader:
@@ -472,6 +476,7 @@ class ControlLoop:
         armed = bool(link_ok and status and status.armed)
         parking = bool(link_ok and status and status.parking)
         gate_closed = status.gate_closed if link_ok and status else None
+        needs_button = status.latched if link_ok and status else None
         if not link_ok:
             reason = "Arduino link lost" if status_at is not None else "no Arduino status yet"
         elif gate_closed is False:
@@ -496,6 +501,7 @@ class ControlLoop:
             "ai_alive": target_age is not None and target_age < AI_ALIVE_S,
             "arduino": {
                 "link_ok": link_ok, "armed": armed, "parking": parking, "gate_closed": gate_closed,
+                "needs_button": needs_button,
                 "pan": status.pan if status else None, "tilt": status.tilt if status else None,
                 "age_s": None if status_at is None else round(now - status_at, 3),
             },

@@ -5,7 +5,8 @@
 // Whole-degree M,<yaw>,<pitch>,<led>,<sequence>\n and the old M,<yaw>,<led>,<sequence>\n
 // (pitch = tilt home) are still accepted.
 // Dashboard switch: A,<1 arm|0 switch off>,<sequence>\n. A,1 arms like a button press
-// from off (still refused with the kill gate open or no live heartbeat) and does nothing
+// from off (still refused with the kill gate open, no live heartbeat, or the fault latch
+// set: see needsButton) and does nothing
 // while armed or parking. A,0 starts the glide home while armed and does nothing while
 // parking or off. An A line is not a heartbeat: only N/M lines feed the 300 ms timeout.
 // Off means off: while disarmed both servos are DETACHED (no pulses at all), so
@@ -20,11 +21,17 @@
 // normal easing; once both are home, or after PARK_TIMEOUT_MS, they detach and the
 // turret is disarmed (a button press re-arms). The button or the kill gate opening
 // during parking cuts straight to limp.
+// Fault latch (needsButton): after any fault a human must press the physical button before
+// the dashboard can arm again. It is set at boot, whenever the QNX heartbeat is stale (link
+// loss, including the park it causes), and whenever the kill gate is open; only a D2 press
+// clears it, and a press during the fault is undone at once (the fault still holds). While
+// it is set, A,1 is refused. The button itself works exactly as before. A clean dashboard
+// switch-off (A,0) or a button switch-off is not a fault and leaves the latch clear.
 // Kill gate: KILL 1 of the kill plug feeds the servo +5 V rail, and a 3 x 10k
 // divider from that rail feeds A2 (about 1.67 V with the tab in, 0 V with it out).
 // An open gate forces a disarm and refuses to arm.
 // Status back to QNX about every 100 ms on the same UART (UNO Q D1 -> Pi RX):
-// S,<armed 0|1>,<pan_x10>,<tilt_x10>,<sequence>,<gate 1 closed|0 open>,<parking 0|1>\n
+// S,<armed 0|1>,<pan_x10>,<tilt_x10>,<sequence>,<gate 1 closed|0 open>,<parking 0|1>,<latched 0|1>\n
 // with the eased ACTUAL axis positions in tenths of a degree. The Zephyr boot banner also
 // appears on D1 at reset; the Pi ignores any line that does not match.
 
@@ -78,6 +85,7 @@ unsigned long lastCommandMs = 0;
 unsigned long buttonChangedMs = 0;
 bool armed = false;
 bool parking = false;  // link lost while armed: gliding home, then detach
+bool needsButton = true;  // fault latch: set at boot and on every fault, cleared only by a D2 press
 unsigned long parkingSinceMs = 0;
 bool lastButtonReading = HIGH;
 bool stableButtonReading = HIGH;
@@ -202,6 +210,7 @@ void updateKillGate() {
   if (millis() - gateDisagreeSinceMs >= (gateClosed ? GATE_OPEN_MS : GATE_CLOSE_MS)) {
     gateClosed = !gateClosed;
     gateDisagreeing = false;
+    if (!gateClosed) needsButton = true;  // A fault: the dashboard cannot re-arm until a press.
     // No servo power: limp at once, mid-park too. Closing never arms: that takes the button.
     if (!gateClosed && (armed || parking)) setArmed(false);
   }
@@ -217,6 +226,7 @@ void updateArmButton() {
     // at home with no jolt (an SG90 cannot report its angle). A press while parking cuts
     // to limp at once; it never re-arms mid-glide. The kill gate still cuts instantly.
     if (stableButtonReading == LOW) {
+      needsButton = false;  // The human reset; loop() sets it again if the fault still holds.
       if (parking) setArmed(false);
       else if (armed) startParking();
       else setArmed(true);
@@ -228,8 +238,9 @@ void updateArmButton() {
 void applyArmRequest(bool arm) {
   // The dashboard's switch (A line): the button's transitions, except that it never cuts a
   // glide home short and never arms mid-glide. setArmed() keeps its gate and heartbeat checks.
+  // After a fault (needsButton) the dashboard cannot arm at all: only the physical button.
   if (arm) {
-    if (!armed && !parking) setArmed(true);
+    if (!armed && !parking && !needsButton) setArmed(true);
   } else if (armed) {
     startParking();
   }
@@ -280,9 +291,9 @@ long tenths(float degrees) {
 
 void sendStatus() {
   char status[40];
-  snprintf(status, sizeof(status), "S,%d,%ld,%ld,%lu,%d,%d\n", armed ? 1 : 0,
+  snprintf(status, sizeof(status), "S,%d,%ld,%ld,%lu,%d,%d,%d\n", armed ? 1 : 0,
            tenths(pan.position), tenths(tilt.position), ++statusSequence, gateClosed ? 1 : 0,
-           parking ? 1 : 0);
+           parking ? 1 : 0, needsButton ? 1 : 0);
   Serial1.print(status);
 }
 
@@ -294,6 +305,7 @@ void setup() {
   pinMode(TILT_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
   setArmed(false);  // Boot disarmed and detached: the servos get no pulses at all.
+  needsButton = true;  // Boot is a reset: the first arm takes the physical button.
   Serial1.begin(115200);
 }
 
@@ -313,9 +325,12 @@ void loop() {
     }
   }
 
+  // Fault latch: no live heartbeat (link loss, at boot too) or the kill gate open.
+  if (!gateClosed || millis() - lastCommandMs > HEARTBEAT_TIMEOUT_MS) needsButton = true;
   if (armed && millis() - lastCommandMs > HEARTBEAT_TIMEOUT_MS) {
     // A lost QNX heartbeat: glide home, then disarm. A physical button press is
     // needed before movement can resume; this prevents a surprise re-arm after a restart.
+    needsButton = true;
     startParking();
   }
   if (parking && ((reachedHome(pan) && reachedHome(tilt)) || millis() - parkingSinceMs >= PARK_TIMEOUT_MS)) {

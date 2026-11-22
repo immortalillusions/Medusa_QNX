@@ -62,6 +62,7 @@ type Control = {
   ai_alive?: boolean;
   arduino?: {
     link_ok?: boolean; armed?: boolean; parking?: boolean; gate_closed?: boolean | null;
+    needs_button?: boolean | null;
     pan?: number; tilt?: number; age_s?: number;
   };
   stress?: { running?: boolean; seconds_left?: number };
@@ -431,6 +432,7 @@ function useArm(c: Control | null, controlUrl: ControlUrl) {
     : arduino?.link_ok !== true ? "Arduino link down"
     : arduino.gate_closed === false ? "kill gate open: insert the tab to arm"
     : parking ? "gliding home, then limp; arm again once it stops"
+    : arduino.needs_button === true && !armed ? "press the turret's button (safety reset after a fault)"
     : null;
   const pending = sending || awaiting !== null;
   const label = sending ? "Sending…" : awaiting ? (awaiting.target ? "Arming…" : "Switching off…")
