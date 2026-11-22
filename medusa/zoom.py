@@ -2,8 +2,11 @@
 
 FaceLandmarker's own detector is BlazeFace short-range at 128x128 on the whole frame, so a
 face 3-4 m from a 1920x1080 camera is a few pixels there and is never found. Here the
-256x256 BlazeFace "back" model runs on overlapping tiles (left and right halves by default)
-to find faces down to ~50 px wide. Each face the full-frame landmarker did not already
+256x256 BlazeFace "back" model runs on native-resolution tiles instead: a 2x1 grid finds
+faces down to ~30 px (7 m), a 4x2 grid down to ~23 px (10 m). The tiles are shared out
+round-robin, ``tiles_per_frame`` a frame, and a face once found is followed by re-cropping
+around its last landmarks every frame, so a new face is found within a few frames while the
+cost per frame stays bounded. Each face the full-frame landmarker did not already
 return is cut out as a square ``margin`` times its box, upscaled to ``crop_size``, cleaned
 up by the switchable ``enhance`` steps (see ENHANCE_STEPS / PRESETS), and run through a
 FaceLandmarker in IMAGE mode with num_faces=1. Its landmarks are mapped back to full-frame normalized coordinates and its
@@ -24,6 +27,8 @@ from dataclasses import dataclass, field
 DEFAULT_CROP_SIZE = 256
 DEFAULT_MARGIN = 1.8
 DEFAULT_TILES = (2, 1)
+DEFAULT_GRIDS = ((2, 1), (4, 2))  # 2x1 finds >= ~30 px faces, 4x2 >= ~23 px (10 m at 1080p)
+DEFAULT_TILES_PER_FRAME = 3       # of the 10 tiles: a full sweep every 4 frames
 DEFAULT_OVERLAP = 0.1
 DEFAULT_SCORE = 0.5
 ZOOM_MODES = ("off", "far", "all")
@@ -213,15 +218,26 @@ def merge_boxes(boxes: Sequence[tuple[float, float, float, float, float]],
     return kept
 
 
-def detect_tiled(detector, frame, tiles: tuple[int, int] = DEFAULT_TILES,
-                 overlap: float = DEFAULT_OVERLAP) -> list[tuple[float, float, float, float, float]]:
-    """Run a TFLiteFaceDetector per tile; boxes in full-frame pixels, merged across tiles."""
-    height, width = frame.shape[:2]
+def detect_in(detector, frame, windows) -> list[tuple[float, float, float, float, float]]:
+    """Run a TFLiteFaceDetector per (x0, y0, x1, y1) tile; full-frame pixel boxes, merged."""
     found = []
-    for x0, y0, x1, y1 in tile_windows(width, height, tiles, overlap):
+    for x0, y0, x1, y1 in windows:
         for b in detector.detect(frame[y0:y1, x0:x1]):
             found.append((b.left + x0, b.top + y0, b.right + x0, b.bottom + y0, b.score))
     return merge_boxes(found)
+
+
+def detect_tiled(detector, frame, tiles: tuple[int, int] = DEFAULT_TILES,
+                 overlap: float = DEFAULT_OVERLAP) -> list[tuple[float, float, float, float, float]]:
+    """Run a TFLiteFaceDetector on every tile of one grid."""
+    height, width = frame.shape[:2]
+    return detect_in(detector, frame, tile_windows(width, height, tiles, overlap))
+
+
+def grid_schedule(width: int, height: int, grids=DEFAULT_GRIDS,
+                  overlap: float = DEFAULT_OVERLAP) -> list[tuple[int, int, int, int]]:
+    """Every tile of every grid, coarse grids first: the round-robin order."""
+    return [tile for grid in grids for tile in tile_windows(width, height, grid, overlap)]
 
 
 class FaceZoomer:
@@ -233,18 +249,36 @@ class FaceZoomer:
     """
 
     def __init__(self, crop_landmarker, detector, *, crop_size: int = DEFAULT_CROP_SIZE,
-                 margin: float = DEFAULT_MARGIN, tiles: tuple[int, int] = DEFAULT_TILES,
+                 margin: float = DEFAULT_MARGIN, grids=DEFAULT_GRIDS,
+                 tiles_per_frame: int | None = DEFAULT_TILES_PER_FRAME,
                  enhance: Sequence[str] = (), max_faces: int = 4,
                  whole_frame: bool = False) -> None:
         self.crop_landmarker, self.detector = crop_landmarker, detector
         self.whole_frame = whole_frame  # also detect on the whole frame (big faces split by tiles)
-        self.crop_size, self.margin, self.tiles, self.max_faces = crop_size, margin, tiles, max_faces
+        self.crop_size, self.margin, self.max_faces = crop_size, margin, max_faces
+        self.grids, self.tiles_per_frame = tuple(grids), tiles_per_frame  # None = every tile
+        self._schedule: list = []
+        self._schedule_shape = None
+        self._next_tile = 0
+        self._tracked: list = []  # landmark boxes (pixels) of last frame's zoomed faces
         self.enhance = CropEnhancer(enhance)
         self._lanczos = "lanczos" in self.enhance.steps
         # Earlier frames for "temporal": the current window is cut from each, so they align
         # as long as the face holds still (it barely moves at distance).
         self._previous: list = []
         self.last_crops: list = []  # (raw upscaled crop, enhanced crop) per zoomed face, for debugging
+
+    def _tiles_now(self, width: int, height: int) -> list:
+        """This frame's share of the round-robin tile schedule."""
+        if self._schedule_shape != (width, height):
+            self._schedule = grid_schedule(width, height, self.grids)
+            self._schedule_shape, self._next_tile = (width, height), 0
+        count = len(self._schedule)
+        if self.tiles_per_frame is None or self.tiles_per_frame >= count:
+            return list(self._schedule)
+        start = self._next_tile
+        self._next_tile = (start + self.tiles_per_frame) % count
+        return [self._schedule[(start + i) % count] for i in range(self.tiles_per_frame)]
 
     def crop(self, frame, window: Window):
         """The enhanced, upscaled crop the crop landmarker sees."""
@@ -286,12 +320,16 @@ class FaceZoomer:
                     result.face_landmarks.append(lms)
                     result.facial_transformation_matrixes.append(matrix)
         handled = [landmark_box(lms, width, height) for lms in result.face_landmarks]
-        boxes = detect_tiled(self.detector, frame, self.tiles)
+        boxes = detect_in(self.detector, frame, self._tiles_now(width, height))
         if self.whole_frame:
             boxes = merge_boxes(boxes + [(b.left, b.top, b.right, b.bottom, b.score)
                                          for b in self.detector.detect(frame)])
-        # Largest first, so max_faces keeps the near faces the tracker needs.
-        for box in sorted(boxes, key=lambda b: -(b[2] - b[0])):
+        # Faces zoomed last frame come first (re-cropped on their last landmarks), then new
+        # detections; largest first within each, so max_faces keeps the near faces.
+        tracked, self._tracked = self._tracked, []
+        candidates = (sorted(tracked, key=lambda b: -(b[2] - b[0]))
+                      + sorted(boxes, key=lambda b: -(b[2] - b[0])))
+        for box in candidates:
             if len(result.face_landmarks) >= self.max_faces:
                 break
             if covered(box[:4], handled):
@@ -304,6 +342,7 @@ class FaceZoomer:
             result.facial_transformation_matrixes.append(matrix)
             result.zoomed += 1
             handled.append(landmark_box(lms, width, height))
+            self._tracked.append(handled[-1])
         if "temporal" in self.enhance.steps:
             # A copy: the live loop draws the preview overlay onto ``frame`` afterwards.
             self._previous = ([frame.copy()] + self._previous)[:TEMPORAL_FRAMES - 1]
