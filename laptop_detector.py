@@ -456,6 +456,23 @@ def detect_landmarks(landmarker, frame, timestamp_ms: int):
     return landmarker.detect_for_video(image, timestamp_ms)
 
 
+def _reopen_camera(cv2, camera, index: int, attempts: int = 30, wait_s: float = 1.0, sleep=time.sleep):
+    """macOS can drop the camera (low battery, another app): reopen it instead of quitting.
+
+    Returns (camera, first frame), or (camera, None) after ``attempts`` failed tries.
+    """
+    for attempt in range(1, attempts + 1):
+        camera.release()
+        print(f"Camera {index} stopped delivering frames; reopening ({attempt}/{attempts})", file=sys.stderr)
+        sleep(wait_s)
+        camera = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
+        if camera.isOpened():
+            ok, frame = camera.read()
+            if ok:
+                return camera, frame
+    return camera, None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--camera", type=int, default=0, help="AVFoundation camera index (default: 0)")
@@ -606,8 +623,10 @@ def main(argv: list[str] | None = None) -> int:
             while True:
                 ok, frame = camera.read()
                 if not ok:
-                    print(f"Camera {args.camera} stopped delivering frames.", file=sys.stderr)
-                    return 1
+                    camera, frame = _reopen_camera(cv2, camera, args.camera)
+                    if frame is None:
+                        print(f"Camera {args.camera} stopped delivering frames.", file=sys.stderr)
+                        return 1
                 height, width = frame.shape[:2]
                 if landmarker:
                     # VIDEO mode needs strictly increasing timestamps.

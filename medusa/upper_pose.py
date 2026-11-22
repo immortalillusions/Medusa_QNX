@@ -107,7 +107,10 @@ def upper_face_pose(points: Sequence[tuple[float, float]], width: float, height:
     image = np.array([points[i] for i in indices], np.float64)
     f = focal if focal is not None else FOCAL_PER_WIDTH * width
     camera = np.array([[f, 0, width / 2], [0, f, height / 2], [0, 0, 1]], np.float64)
-    ok, rvec, tvec = cv2.solvePnP(model, image, camera, None, flags=cv2.SOLVEPNP_SQPNP)
+    try:
+        ok, rvec, tvec = cv2.solvePnP(model, image, camera, None, flags=cv2.SOLVEPNP_SQPNP)
+    except cv2.error:
+        return None  # Degenerate points (e.g. a tiny or edge face): SQPnP asserts instead of failing.
     if not ok:
         return None
     rotation, _ = cv2.Rodrigues(rvec)

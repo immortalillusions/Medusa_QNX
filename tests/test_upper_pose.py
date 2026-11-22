@@ -100,3 +100,44 @@ class GazePoseSourceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DegeneratePointsTests(unittest.TestCase):
+    def test_collapsed_landmarks_return_none_instead_of_raising(self) -> None:
+        # Seen live: a tiny/edge face made SQPnP assert and killed the laptop detector.
+        points = [(100.0, 100.0)] * (max(UPPER_FACE) + 1)
+        self.assertIsNone(upper_face_pose(points, 1280, 720))
+
+
+class ReopenCameraTests(unittest.TestCase):
+    def _cv2(self, results):
+        opened = []
+
+        class Capture:
+            def __init__(self, index, backend):
+                self.ok, self.frame = results.pop(0)
+                opened.append(self)
+
+            def isOpened(self):
+                return self.ok
+
+            def read(self):
+                return self.ok, self.frame
+
+            def release(self):
+                pass
+
+        return SimpleNamespace(VideoCapture=Capture, CAP_AVFOUNDATION=1200), opened
+
+    def test_reopens_and_returns_the_first_frame(self) -> None:
+        cv2, opened = self._cv2([(False, None), (True, "frame")])
+        old = SimpleNamespace(release=lambda: None)
+        camera, frame = laptop_detector._reopen_camera(cv2, old, 0, attempts=3, sleep=lambda s: None)
+        self.assertEqual(frame, "frame")
+        self.assertIs(camera, opened[-1])
+
+    def test_gives_up_after_the_attempts(self) -> None:
+        cv2, _opened = self._cv2([(False, None)] * 2)
+        camera, frame = laptop_detector._reopen_camera(
+            cv2, SimpleNamespace(release=lambda: None), 0, attempts=2, sleep=lambda s: None)
+        self.assertIsNone(frame)
