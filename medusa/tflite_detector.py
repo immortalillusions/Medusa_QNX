@@ -84,6 +84,16 @@ def order_output_heads(shapes) -> tuple[list[int], list[int]]:
     return heads(16), heads(1)
 
 
+def load_interpreter():
+    """The TFLite Interpreter class: tflite_runtime (the Pi/QNX build) first, else
+    ai_edge_litert (the Mac's mediapipe venv). Raises ImportError when neither exists."""
+    try:
+        from tflite_runtime.interpreter import Interpreter
+    except ImportError:
+        from ai_edge_litert.interpreter import Interpreter
+    return Interpreter
+
+
 @dataclass(frozen=True)
 class FaceBox:
     left: float
@@ -134,7 +144,7 @@ class TFLiteFaceDetector:
         try:
             import cv2
             import numpy as np
-            from tflite_runtime.interpreter import Interpreter
+            Interpreter = load_interpreter()
         except ImportError as error:
             raise RuntimeError("QNX TFLite runtime, NumPy, and OpenCV are required.") from error
         self.cv2, self.np, self.Interpreter = cv2, np, Interpreter

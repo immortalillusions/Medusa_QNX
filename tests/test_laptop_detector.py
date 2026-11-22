@@ -448,7 +448,8 @@ class MainTests(unittest.TestCase):
     def fake_modules(self, opened):
         camera = MagicMock()
         camera.isOpened.return_value = opened
-        cv2 = SimpleNamespace(CAP_AVFOUNDATION=1200, VideoCapture=MagicMock(return_value=camera))
+        cv2 = SimpleNamespace(CAP_AVFOUNDATION=1200, VideoCapture=MagicMock(return_value=camera),
+                              FaceDetectorYN=MagicMock())  # the default --zoom-finder
         return {"cv2": cv2, "mediapipe": MagicMock()}, camera
 
     def test_camera_open_failure_exits_2_with_permission_hint(self):
@@ -499,6 +500,7 @@ class MainTests(unittest.TestCase):
 
 
     def run_two_frames(self, argv):
+        argv = ["--zoom-faces", "off"] + argv  # the full-frame path; tests/test_zoom.py covers zoom
         modules, camera = self.fake_modules(opened=True)
         frame = MagicMock()
         frame.shape = (720, 1280, 3)
