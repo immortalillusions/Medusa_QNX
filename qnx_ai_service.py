@@ -18,9 +18,15 @@ from medusa.servo import ServoMapper
 from medusa.tflite_detector import TFLiteFaceGazeDetector, draw_face_boxes
 
 
-def send(sock, target, active, target_x, reason):
-    sock.sendto(json.dumps({"type":"medusa-event","active":active,
-                "target_x":target_x,"reason":reason}).encode(), target)
+def send(sock, target, active, target_x, reason, *, scene_clear: bool = False):
+    event = {
+        "type": "medusa-event",
+        "active": active,
+        "target_x": target_x,
+        "reason": reason,
+        "scene_clear": scene_clear,
+    }
+    sock.sendto(json.dumps(event).encode(), target)
 
 
 def main() -> int:
@@ -82,11 +88,13 @@ def main() -> int:
             print(f"Medusa cannot start safely: Arduino serial setup failed: {error}", file=sys.stderr)
             return 2
     selector, target = SnooperSelector(args.hold_frames), (args.event_host, args.event_port)
+    clear_frames = 0
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as events:
         try:
             while True:
                 ok, frame = camera.read()
                 if not ok:
+                    clear_frames = 0
                     send(events, target, False, None, "camera frame unavailable")
                     if arduino:
                         arduino.safe_stop()
@@ -103,18 +111,19 @@ def main() -> int:
                 if arduino:
                     arduino.send(decision.active, decision.target_x)
                 if preview:
-                    snooper = select_snooper(boxes) if boxes is not None else None
+                    snoopers = select_snoopers(boxes) if boxes is not None else []
+                    closest_snooper = snoopers[0] if snoopers else None
                     nose_offset = None
-                    if snooper is not None and snooper.nose is not None:
+                    if closest_snooper is not None and closest_snooper.nose is not None:
                         height, width = frame.shape[:2]
-                        nose_offset = measure_nose_offset(snooper.nose, width, height)
+                        nose_offset = measure_nose_offset(closest_snooper.nose, width, height)
                     if boxes:
-                        draw_face_boxes(frame, boxes, snooper=snooper)
+                        draw_face_boxes(frame, boxes, snoopers=snoopers)
                     preview.state.update_frame(frame)
                     preview.state.update_status(
                         decision.active, decision.reason,
                         face_count=len(boxes) if boxes is not None else None,
-                        snooper_detected=snooper is not None,
+                        snooper_count=len(snoopers),
                         nose_offset=nose_offset,
                     )
         except KeyboardInterrupt:

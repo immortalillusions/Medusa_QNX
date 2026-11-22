@@ -77,11 +77,12 @@ Use `--servo-reversed` if left/right movement is backwards.
 ## Local preview dashboard
 
 The QNX service exposes a LAN-only camera preview and status on port 8080.
-The live video draws boxes around detected faces. With at least two faces,
-it labels the smallest bounding box by area as **SNOOPER** and draws a line
-from the preview center to that person's nose. The dashboard shows the
-center-to-nose distance and horizontal and vertical offsets in camera
-pixels. It uses the middle of the camera frame as the screen center.
+The live video shows the largest detected face box in green and labels every
+other face **SNOOPER**. It uses box area as a proxy for closeness. The
+second-largest face is labeled **SNOOPER (CLOSEST)** and gets a line from the
+preview center to its nose. The dashboard shows the snooper count and the
+closest snooper's center-to-nose distance and offsets in camera pixels. It
+uses the middle of the camera frame as the screen center.
 The privacy alert uses the existing screen-facing and stability criteria.
 
 On the laptop, start the dashboard:

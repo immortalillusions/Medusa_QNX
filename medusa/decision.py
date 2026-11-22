@@ -5,6 +5,18 @@ from dataclasses import dataclass
 from .models import FaceObservation, SnooperDecision
 
 
+SCENE_CLEAR_FRAMES = 30
+
+
+def screen_facing_from_landmarks(nose_x: float, eye_a_x: float, eye_b_x: float) -> bool | None:
+    """Estimate head direction from x coordinates normalized to the face region."""
+    eye_span = abs(eye_b_x - eye_a_x)
+    if eye_span < 0.01:
+        return None
+    yaw = abs(nose_x - (eye_a_x + eye_b_x) / 2) / eye_span
+    return yaw <= 0.20
+
+
 @dataclass
 class SnooperSelector:
     """Selects a sustained farthest screen-facing person.

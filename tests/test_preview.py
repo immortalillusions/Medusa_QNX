@@ -24,8 +24,8 @@ class PreviewTests(unittest.TestCase):
         with patch.dict(sys.modules, {"cv2": fake_cv2}):
             preview.state.update_frame(b"first-frame")
             preview.state.update_status(
-                False, "fewer than two screen-facing faces", face_count=2,
-                snooper_detected=True, nose_offset=NoseOffset(3, -4, 5),
+                False, "fewer than two screen-facing faces", face_count=3,
+                snooper_count=2, nose_offset=NoseOffset(3, -4, 5),
             )
 
             with contextlib.closing(http.client.HTTPConnection("127.0.0.1", port, timeout=2)) as stream:
@@ -41,8 +41,9 @@ class PreviewTests(unittest.TestCase):
                             self.assertEqual(json.load(status_response), {
                                 "active": False,
                                 "reason": "fewer than two screen-facing faces",
-                                "face_count": 2,
+                                "face_count": 3,
                                 "snooper_detected": True,
+                                "snooper_count": 2,
                                 "nose_offset": {"dx_px": 3, "dy_px": -4, "distance_px": 5},
                             })
 

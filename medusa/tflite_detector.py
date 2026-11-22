@@ -13,6 +13,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from .decision import screen_facing_from_landmarks
 from .models import FaceObservation
 
 _NOSE_KEYPOINT_OFFSET = 4 + 2 * 2  # Four box values, then the third x/y keypoint.
@@ -29,25 +30,27 @@ class FaceBox:
 
 
 def draw_face_boxes(
-    frame, boxes: Sequence[FaceBox], *, snooper: FaceBox | None = None,
+    frame, boxes: Sequence[FaceBox], *, snoopers: Sequence[FaceBox] = (),
 ) -> None:
-    """Annotate faces on a BGR frame and label the selected snooper."""
+    """Label the snoopers and draw the nose offset for the first one."""
     import cv2
 
+    snooper_ids = {id(box) for box in snoopers}
+    closest_snooper = snoopers[0] if snoopers else None
     for box in boxes:
-        selected = box is snooper
-        color = (64, 80, 255) if selected else (0, 255, 0)
+        is_snooper = id(box) in snooper_ids
+        color = (64, 80, 255) if is_snooper else (0, 255, 0)
         left, top = int(box.left), int(box.top)
         cv2.rectangle(frame, (left, top), (int(box.right) - 1, int(box.bottom) - 1), color, 2)
-        if selected:
+        if is_snooper:
             height, width = frame.shape[:2]
-            label = "SNOOPER"
+            label = "SNOOPER (CLOSEST)" if box is closest_snooper else "SNOOPER"
             font = cv2.FONT_HERSHEY_SIMPLEX
             (text_width, _), _ = cv2.getTextSize(label, font, 0.6, 2)
             x = min(left, max(0, width - text_width - 2))
             cv2.putText(frame, label, (x, min(height - 1, max(20, top - 6))),
                         font, 0.6, color, 2, cv2.LINE_AA)
-            if box.nose is not None:
+            if box is closest_snooper and box.nose is not None:
                 nose = (round(box.nose[0]), round(box.nose[1]))
                 center = (width // 2, height // 2)
                 cv2.line(frame, center, nose, color, 2, cv2.LINE_AA)
@@ -169,16 +172,15 @@ class TFLiteFaceGazeDetector:
             crop, left, top = self._crop(frame, box)
             points = self._landmarks(crop)
             nose, left_eye, right_eye = points[1], points[33], points[263]
-            eye_span = abs(right_eye[0] - left_eye[0])
-            if eye_span < 0.01:
+            screen_facing = screen_facing_from_landmarks(nose[0], left_eye[0], right_eye[0])
+            if screen_facing is None:
                 continue
-            yaw = abs(nose[0] - (left_eye[0] + right_eye[0]) / 2) / eye_span
             result.append(FaceObservation(
                 source="qnx-fixed-camera",
                 center_x=(box.left + box.right) / (2 * width),
                 center_y=(box.top + box.bottom) / (2 * height),
                 relative_size=(box.right - box.left) / width,
-                screen_facing=yaw <= 0.20,
+                screen_facing=screen_facing,
                 confidence=box.score,
             ))
         return result

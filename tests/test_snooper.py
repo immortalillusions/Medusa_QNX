@@ -1,19 +1,20 @@
 import unittest
 
 from medusa.nose_offset import NoseOffset, measure_nose_offset
-from medusa.snooper import select_snooper
+from medusa.snooper import select_snoopers
 from medusa.tflite_detector import FaceBox
 
 
 class SnooperTests(unittest.TestCase):
-    def test_selection_uses_box_area_and_requires_two_faces(self) -> None:
+    def test_selection_excludes_the_largest_face_and_orders_snoopers_by_area(self) -> None:
         near = FaceBox(0, 10, 120, 150, 0.95)
         narrow = FaceBox(150, 10, 175, 110, 0.92)
         smallest = FaceBox(200, 60, 240, 100, 0.88)
 
-        self.assertIsNone(select_snooper([]))
-        self.assertIsNone(select_snooper([near]))
-        self.assertIs(select_snooper([near, narrow, smallest]), smallest)
+        self.assertEqual(select_snoopers([]), [])
+        self.assertEqual(select_snoopers([near]), [])
+        self.assertEqual(select_snoopers([smallest, near]), [smallest])
+        self.assertEqual(select_snoopers([smallest, near, narrow]), [narrow, smallest])
 
     def test_pixel_distance_and_direction(self) -> None:
         self.assertEqual(measure_nose_offset((83, 41), 160, 90), NoseOffset(3, -4, 5))
