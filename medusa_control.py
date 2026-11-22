@@ -54,6 +54,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="stress status JSON written by medusa_sysmon.py, served as control.json's stress block")
     parser.add_argument("--system-file", default=DEFAULT_SYSTEM_FILE,
                         help="Pi usage JSON written by medusa_sysmon.py, served as control.json's system block")
+    parser.add_argument("--http-priority", type=int, default=0,
+                        help="QNX priority for the HTTP thread only (0: inherit the process's, 21). "
+                             "Priority does not arbitrate the GIL, so this is off by default; see docs")
     parser.add_argument("--switch-interval", type=float, default=0.001,
                         help="sys.setswitchinterval: how long another thread may hold the GIL")
     return parser
@@ -95,7 +98,8 @@ def main(argv=None) -> int:
             yaw_range=(args.servo_min, args.servo_max), pitch_range=(args.tilt_min, args.tilt_max),
             home=(args.servo_home, args.tilt_home), stress=stress,
         )
-        http = ControlHTTPServer(loop, args.http_port, system_file=SystemStatusFile(args.system_file))
+        http = ControlHTTPServer(loop, args.http_port, system_file=SystemStatusFile(args.system_file),
+                                 thread_priority=args.http_priority or None)
         http.start()
         stop = threading.Event()
         for signum in (signal.SIGINT, signal.SIGTERM):

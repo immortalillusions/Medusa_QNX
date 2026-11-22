@@ -18,7 +18,7 @@ import medusa_control
 import qnx_ai_service
 from medusa import trigger as trigger_module
 from medusa.control import (
-    ControlClient, ControlHTTPServer, ControlLoop, StatusReader, TickStats, format_a_line, format_n_line,
+    ControlClient, ControlHTTPServer, ControlLoop, StatusReader, TickStats, TickTiming, set_thread_priority, format_a_line, format_n_line,
     make_target_packet, parse_actual_packet, parse_command_line, parse_status_line, parse_target_packet,
     system_clock,
 )
@@ -312,6 +312,50 @@ class RunLoopTests(unittest.TestCase):
         self.assertEqual(len(serial.written), 60)
 
 
+class TimingTests(unittest.TestCase):
+    def test_summary_p99_and_late_ticks(self) -> None:
+        timing = TickTiming(0.02, window_s=2.0)  # 100 ticks
+        self.assertEqual(timing.summary()["work_ms_p99"], None)
+        for k in range(100):
+            timing.record_tick(0.0004, 0.0001, 0.0002 if k else 0.003)
+            timing.record_late(0.001, False)
+        timing.record_late(0.012, True)   # late while an HTTP request ran
+        timing.record_late(0.007, False)  # late, no HTTP
+        summary = timing.summary()
+        self.assertEqual((summary["work_ms_p99"], summary["serial_ms_p99"], summary["udp_ms_p99"]), (0.4, 0.1, 0.2))
+        self.assertEqual(summary["work_ms_max"], 0.4)
+        self.assertEqual((summary["late_ticks"], summary["late_ticks_http"]), (2, 1))
+
+    def test_run_marks_late_ticks_that_overlapped_an_http_request(self) -> None:
+        clock = FakeClock(0.0)
+        loop = ControlLoop(FakeSerial(), clock=clock.monotonic)
+        wakes = iter([0.001, 0.010, 0.001, 0.008, 0.0])
+
+        def sleep(seconds):
+            clock.now += seconds + next(wakes)
+            if loop.ticks == 2:
+                loop.http_last_end = clock.now - 0.001  # a request ended just before the tick started
+        loop.sleep = sleep
+        loop.run(SimpleNamespace(is_set=lambda: False), max_ticks=5)
+        summary = loop.timing.summary()
+        self.assertEqual((summary["late_ticks"], summary["late_ticks_http"]), (2, 1))
+
+    def test_tick_parses_only_the_newest_valid_target(self) -> None:
+        sock = FakeSock()
+        loop = ControlLoop(FakeSerial(), target_sock=sock)
+        sock.queue += [target(yaw=70, seq=1), target(yaw=75, seq=2), b"junk"]
+        with patch("medusa.control.parse_target_packet", wraps=parse_target_packet) as parse:
+            loop.tick(1.0)
+        self.assertEqual((loop.target.seq, loop.target.yaw), (2, 75.0))  # junk newest: the next newest wins
+        self.assertEqual(parse.call_count, 2)
+        self.assertEqual(sock.queue, [])
+
+    def test_thread_priority_is_a_no_op_off_qnx(self) -> None:
+        with patch("medusa.control.on_qnx", return_value=False):
+            self.assertFalse(set_thread_priority(15))
+        self.assertEqual(medusa_control.parse_args([]).http_priority, 0)
+
+
 class FakeProc:
     def __init__(self, *args, **kwargs) -> None:
         self.args, self.alive = args, True
@@ -436,7 +480,7 @@ class StressServiceTests(StressRunnerFixture, unittest.TestCase):
 
 
 CONTRACT_KEYS = {"state", "safe_reason", "loop_hz", "period_ms_mean", "jitter_ms_p99", "period_ms_max",
-                 "missed_deadlines", "target_age_s", "ai_alive", "arduino", "stress", "system"}
+                 "missed_deadlines", "target_age_s", "ai_alive", "arduino", "stress", "system", "timing"}
 
 class HttpContractTests(StressRunnerFixture, unittest.TestCase):
     def setUp(self) -> None:

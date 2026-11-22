@@ -54,7 +54,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from .stress import StressClient
-from .sysmon import DEFAULT_SYSTEM_FILE, SYSTEM_KEYS
+from .sysmon import DEFAULT_SYSTEM_FILE, SYSTEM_KEYS, on_qnx
 
 SYSTEM_STALE_S = 10.0
 
@@ -71,6 +71,7 @@ LATE_S = 0.005            # a tick starting more than 5 ms after its deadline mi
 WINDOW_S = 10.0
 STRESS_MAX_S = 60
 _MAX_PACKETS_PER_TICK = 64
+_MAX_TARGETS_PER_TICK = 16  # the AI sends <= 30 a second: the loop drains them all at 50 Hz
 _MAX_LINE = 128
 _STATUS_LINE = re.compile(r"S,([01]),(-?\d{1,5}),(-?\d{1,5}),(\d{1,10})(?:,([01])(?:,([01])(?:,([01]))?)?)?")
 _COMMAND_LINE = re.compile(r"([MN]),(-?\d+),(-?\d+),(-?\d+)(?:,(\d+))?")
@@ -325,6 +326,50 @@ class TickStats:
                 "period_ms_max": round(max(periods) * 1000, 3)}
 
 
+class TickTiming:
+    """Where each tick's time goes, for control.json's ``timing`` block (a diagnostic).
+
+    work: the whole tick; serial: reading S lines and writing N/M/A lines; udp: draining AI
+    targets and sending medusa-actual. late: how long after its deadline a tick started (sleep
+    overshoot plus waiting for the GIL). A late tick (> LATE_S) is also counted as
+    ``late_ticks_http`` when an HTTP request was being served between its deadline and its
+    start: then the HTTP thread held the GIL the loop needed.
+    """
+
+    def __init__(self, period_s: float = PERIOD_S, window_s: float = WINDOW_S, late_s: float = LATE_S) -> None:
+        self.late_s = late_s
+        size = max(1, int(round(window_s / period_s)))
+        self._ticks: deque[tuple[float, float, float]] = deque(maxlen=size)  # (work, serial, udp) seconds
+        self._late: deque[tuple[float, bool]] = deque(maxlen=size)  # (lateness, HTTP active meanwhile)
+        self.lock = threading.Lock()
+
+    def record_tick(self, work: float, serial: float, udp: float) -> None:
+        with self.lock:
+            self._ticks.append((work, serial, udp))
+
+    def record_late(self, late: float, http_active: bool) -> None:
+        with self.lock:
+            self._late.append((max(0.0, late), http_active))
+
+    @staticmethod
+    def _p99_ms(values) -> float | None:
+        if not values:
+            return None
+        values = sorted(values)
+        return round(values[max(0, math.ceil(0.99 * len(values)) - 1)] * 1000, 3)
+
+    def summary(self) -> dict:
+        with self.lock:
+            ticks, late = list(self._ticks), list(self._late)
+        late_ticks = [http for value, http in late if value > self.late_s]
+        return {"work_ms_p99": self._p99_ms([t[0] for t in ticks]),
+                "serial_ms_p99": self._p99_ms([t[1] for t in ticks]),
+                "udp_ms_p99": self._p99_ms([t[2] for t in ticks]),
+                "work_ms_max": round(max(t[0] for t in ticks) * 1000, 3) if ticks else None,
+                "late_ms_p99": self._p99_ms([value for value, _ in late]),
+                "late_ticks": len(late_ticks), "late_ticks_http": sum(late_ticks)}
+
+
 # --- Pi usage, sampled by medusa_sysmon.py (a separate priority-10 process) -----------------
 
 class SystemStatusFile:
@@ -381,6 +426,10 @@ class ControlLoop:
         self.yaw_range, self.pitch_range = yaw_range, pitch_range
         self.home_yaw, self.home_pitch = home
         self.stats = TickStats(period_s, window_s)
+        self.timing = TickTiming(period_s, window_s)
+        # Set by the HTTP thread around each request (system_clock times), read by run().
+        self.http_active = False
+        self.http_last_end = -math.inf
         self.stress = stress
         self.clock, self.sleep = clock, sleep
         self.reader = StatusReader()
@@ -421,13 +470,21 @@ class ControlLoop:
 
     def tick(self, now: float) -> bytes:
         """One control step at ``now``; returns the line written to the Arduino."""
+        perf = time.perf_counter
+        t0 = perf()
         for status in self.reader.feed(self.serial.read()):
             self.status, self.status_at = status, now  # Latest wins.
+        t1 = perf()
         if self.target_sock is not None:
-            for payload in _drain(self.target_sock):
+            # Latest wins, so only the newest valid packet is parsed (newest first): no JSON
+            # work for packets that would be overwritten in the same tick.
+            payloads = list(_drain(self.target_sock, _MAX_TARGETS_PER_TICK))
+            for payload in reversed(payloads):
                 target = parse_target_packet(payload)
                 if target is not None:
                     self.target, self.target_at = target, now
+                    break
+        t2 = perf()
         self.sequence += 1
         if self.target_fresh(now) and not self.gate_open(now):
             target = self.target
@@ -444,11 +501,14 @@ class ControlLoop:
             self.sequence += 1
             if not self.serial.write(format_a_line(arm, self.sequence)):
                 self.write_failures += 1
+        t3 = perf()
         if self.actual_sock is not None and self.actual_addr is not None:
             try:
                 self.actual_sock.sendto(self.actual_packet(now), self.actual_addr)
             except OSError:
                 pass  # The AI process is not listening yet; it is optional.
+        t4 = perf()
+        self.timing.record_tick(t4 - t0, (t1 - t0) + (t3 - t2), (t2 - t1) + (t4 - t3))
         self.ticks += 1
         return line
 
@@ -506,6 +566,7 @@ class ControlLoop:
                 "age_s": None if status_at is None else round(now - status_at, 3),
             },
             "stress": self.stress.status() if self.stress else {"running": False, "seconds_left": 0},
+            "timing": self.timing.summary(),
             "write_failures": self.write_failures,
         }
         return result
@@ -517,6 +578,7 @@ class ControlLoop:
         while not stop.is_set() and (max_ticks is None or self.ticks < max_ticks):
             start = self.clock()
             self.stats.record(start, deadline, skipped)
+            self.timing.record_late(start - deadline, self.http_active or self.http_last_end >= deadline)
             self.tick(start)
             deadline += self.period_s
             now = self.clock()
@@ -535,6 +597,25 @@ class ControlLoop:
             self.serial.write(self.park_line())
 
 
+def set_thread_priority(priority: int) -> bool:
+    """Set the CALLING thread's priority (QNX: pthread_setschedprio via ctypes); False if not possible.
+
+    Checked on the Pi (QNX 8, Python 3.14): it returns 0 and changes only that thread.
+    Elsewhere, or if the call fails, the thread keeps the priority it inherited.
+    """
+    if not on_qnx():
+        return False
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None)
+        libc.pthread_self.restype = ctypes.c_ulong
+        libc.pthread_setschedprio.argtypes = [ctypes.c_ulong, ctypes.c_int]
+        return libc.pthread_setschedprio(libc.pthread_self(), int(priority)) == 0
+    except (OSError, AttributeError, ValueError):
+        return False
+
+
 # --- HTTP status server ---------------------------------------------------------------------
 
 class ControlHTTPServer:
@@ -545,7 +626,8 @@ class ControlHTTPServer:
     """
 
     def __init__(self, loop: ControlLoop, port: int = DEFAULT_HTTP_PORT, host: str = "0.0.0.0",
-                 stress_max: int = STRESS_MAX_S, system_file: SystemStatusFile | None = None) -> None:
+                 stress_max: int = STRESS_MAX_S, system_file: SystemStatusFile | None = None,
+                 thread_priority: int | None = None) -> None:
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, _format, *_args):
                 return
@@ -561,6 +643,14 @@ class ControlHTTPServer:
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
+
+            def handle_one_request(self) -> None:
+                loop.http_active = True  # for the late-tick diagnostic (TickTiming)
+                try:
+                    super().handle_one_request()
+                finally:
+                    loop.http_active = False
+                    loop.http_last_end = loop.clock()
 
             def do_OPTIONS(self) -> None:
                 self._reply(HTTPStatus.NO_CONTENT)
@@ -606,7 +696,14 @@ class ControlHTTPServer:
         Handler.timeout = 2.0
         self.server = HTTPServer((host, port), Handler)
         self.port = self.server.server_address[1]
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True, name="control-http")
+        self.thread_priority = thread_priority
+        self.priority_set: bool | None = None  # after start(): did --http-priority apply?
+        self.thread = threading.Thread(target=self._serve, daemon=True, name="control-http")
+
+    def _serve(self) -> None:
+        if self.thread_priority:
+            self.priority_set = set_thread_priority(self.thread_priority)
+        self.server.serve_forever()
 
     def start(self) -> None:
         self.thread.start()
