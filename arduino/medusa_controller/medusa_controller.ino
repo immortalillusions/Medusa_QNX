@@ -83,6 +83,15 @@ bool gateClosed = false;  // open until A2 proves otherwise
 unsigned long gateDisagreeSinceMs = 0;
 bool gateDisagreeing = false;
 unsigned long lastGateSampleMs = 0;
+// Soft start: the SG90 cannot report its angle, so the first command after arming
+// would snap it to the estimate. For SOFT_START_MS after arming, send only one
+// pulse every SOFT_PULSE_MS: an analog servo drives its motor only briefly after
+// each pulse, so it creeps to the estimate instead of jolting. Then normal control.
+const unsigned long SOFT_START_MS = 1500;
+const unsigned long SOFT_PULSE_MS = 100;
+bool softStarting = false;
+unsigned long softStartSinceMs = 0;
+unsigned long lastSoftPulseMs = 0;
 
 int degreesToMicroseconds(float degrees) {
   return MIN_PULSE_WIDTH + (int)(degrees * (MAX_PULSE_WIDTH - MIN_PULSE_WIDTH) / 180.0 + 0.5);
@@ -114,6 +123,13 @@ void detachAxis(Axis& axis) {
   digitalWrite(axis.pin, LOW);  // A detach mid-pulse could leave the pin high.
 }
 
+void softPulse(Axis& axis) {
+  // One hand-made servo pulse on a detached pin (the Servo library is not running).
+  digitalWrite(axis.pin, HIGH);
+  delayMicroseconds(degreesToMicroseconds(axis.position));
+  digitalWrite(axis.pin, LOW);
+}
+
 void attachAxis(Axis& axis) {
   axis.target = axis.position;  // Hold here until a command says otherwise.
   axis.velocity = 0;
@@ -129,9 +145,14 @@ void setArmed(bool shouldArm) {
   parking = false;  // Either way any glide home is over: armed, or detached right here.
   // The UNO Q's red LED is active-low: LOW lights it. Lit means armed.
   digitalWrite(ARM_STATUS_PIN, armed ? LOW : HIGH);
+  softStarting = false;
   if (armed) {
-    attachAxis(pan);
-    attachAxis(tilt);
+    // Creep to the estimate first (see SOFT_START_MS); loop() attaches afterwards.
+    pan.target = pan.position; pan.velocity = 0;
+    tilt.target = tilt.position; tilt.velocity = 0;
+    softStarting = true;
+    softStartSinceMs = millis();
+    lastSoftPulseMs = 0;
   } else {
     detachAxis(pan);
     detachAxis(tilt);
@@ -145,6 +166,7 @@ void startParking() {
   // Disarmed for everything else: commands are ignored and the status says 0.
   armed = false;
   parking = true;
+  softStarting = false;  // Never attach mid-park; a still-detached servo just times out limp.
   parkingSinceMs = millis();
   digitalWrite(ARM_STATUS_PIN, HIGH);  // Red LED off: a button press is needed again.
   digitalWrite(LED_PIN, LOW);
@@ -270,6 +292,18 @@ void loop() {
   }
   if (parking && ((reachedHome(pan) && reachedHome(tilt)) || millis() - parkingSinceMs >= PARK_TIMEOUT_MS)) {
     setArmed(false);  // Home (or out of time): detach and go limp.
+  }
+
+  if (softStarting) {
+    if (millis() - softStartSinceMs >= SOFT_START_MS) {
+      softStarting = false;
+      attachAxis(pan);
+      attachAxis(tilt);
+    } else if (millis() - lastSoftPulseMs >= SOFT_PULSE_MS) {
+      lastSoftPulseMs = millis();
+      softPulse(pan);
+      softPulse(tilt);
+    }
   }
 
   if (millis() - lastMotionMs >= MOTION_STEP_MS) {
