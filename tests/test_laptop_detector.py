@@ -391,7 +391,8 @@ class RuntimeSettingsTests(unittest.TestCase):
         camera = MagicMock()
         camera.isOpened.return_value = True
         camera.read.side_effect = KeyboardInterrupt
-        modules = {"cv2": SimpleNamespace(CAP_AVFOUNDATION=1200, VideoCapture=MagicMock(return_value=camera)),
+        modules = {"cv2": SimpleNamespace(CAP_AVFOUNDATION=1200, VideoCapture=MagicMock(return_value=camera),
+                                          FaceDetectorYN=MagicMock()),  # the default --zoom-finder
                    "mediapipe": MagicMock()}
         with patch.dict(sys.modules, modules), \
                 patch.object(laptop_detector, "PreviewServer") as preview, \
