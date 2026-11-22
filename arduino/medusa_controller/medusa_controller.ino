@@ -1,10 +1,10 @@
 #include <Servo.h>
 
 // Serial protocol from QNX: N,<yaw_x10>,<pitch_x10>,<led 0|1>,<sequence>\n
-// with angles in tenths of a degree (925 = 92.5), within SERVO_MIN*10..SERVO_MAX*10.
+// with angles in tenths of a degree (925 = 92.5), each within its axis range (PAN_*/TILT_*).
 // Whole-degree M,<yaw>,<pitch>,<led>,<sequence>\n and the old M,<yaw>,<led>,<sequence>\n
-// (pitch = home) are still accepted, within SERVO_MIN..SERVO_MAX.
-// If valid commands stop for 300 ms, disarm, centre both servos, LED off.
+// (pitch = tilt home) are still accepted.
+// If valid commands stop for 300 ms, disarm, park both servos at home, LED off.
 // Status back to QNX about every 100 ms on the same UART (UNO Q D1 -> Pi RX):
 // S,<armed 0|1>,<pan_x10>,<tilt_x10>,<sequence>\n with the eased ACTUAL axis
 // positions in tenths of a degree. The Zephyr boot banner also appears on D1
@@ -15,9 +15,10 @@ const byte TILT_PIN = 10;
 const byte LED_PIN = 5;
 const byte ARM_BUTTON_PIN = 2;
 const byte ARM_STATUS_PIN = LED_BUILTIN;
-const int SERVO_MIN = 55;
-const int SERVO_MAX = 125;
-const int SERVO_HOME = 90;
+// Pan rests at 45 deg, which faces forward on this turret (the horn sits 45 deg off),
+// and tracks +-35 deg around it. Tilt rests at 90.
+const int PAN_MIN = 10, PAN_MAX = 80, PAN_HOME = 45;
+const int TILT_MIN = 55, TILT_MAX = 125, TILT_HOME = 90;
 const unsigned long HEARTBEAT_TIMEOUT_MS = 300;
 const unsigned long BUTTON_DEBOUNCE_MS = 40;
 // Pan and tilt moves are eased: a speed cap plus an acceleration limit stop
@@ -34,10 +35,11 @@ struct Axis {
   float position;
   float velocity;
   float target;
+  int minimum, maximum, home;
 };
 
-Axis pan = {Servo(), SERVO_HOME, 0, SERVO_HOME};
-Axis tilt = {Servo(), SERVO_HOME, 0, SERVO_HOME};
+Axis pan = {Servo(), PAN_HOME, 0, PAN_HOME, PAN_MIN, PAN_MAX, PAN_HOME};
+Axis tilt = {Servo(), TILT_HOME, 0, TILT_HOME, TILT_MIN, TILT_MAX, TILT_HOME};
 char line[40];
 byte lineLength = 0;
 unsigned long lastCommandMs = 0;
@@ -60,7 +62,7 @@ void stepAxis(Axis& axis, float dt) {
   if (error < 0) wanted = -wanted;
   float limit = MAX_ACCEL * dt;
   axis.velocity += constrain(wanted - axis.velocity, -limit, limit);
-  axis.position = constrain(axis.position + axis.velocity * dt, (float)SERVO_MIN, (float)SERVO_MAX);
+  axis.position = constrain(axis.position + axis.velocity * dt, (float)axis.minimum, (float)axis.maximum);
   if (fabsf(error) < 0.05 && fabsf(axis.velocity) < 2) {
     axis.position = axis.target;
     axis.velocity = 0;
@@ -69,8 +71,8 @@ void stepAxis(Axis& axis, float dt) {
 }
 
 void parkSafely() {
-  pan.target = SERVO_HOME;  // both eased back to centre by stepAxis()
-  tilt.target = SERVO_HOME;
+  pan.target = pan.home;  // both eased back home by stepAxis()
+  tilt.target = tilt.home;
   digitalWrite(LED_PIN, LOW);
 }
 
@@ -92,12 +94,12 @@ void updateArmButton() {
   lastButtonReading = reading;
 }
 
-bool inRange(int value, int scale) {
-  return value >= SERVO_MIN * scale && value <= SERVO_MAX * scale;
+bool inRange(const Axis& axis, int value, int scale) {
+  return value >= axis.minimum * scale && value <= axis.maximum * scale;
 }
 
 void applyCommand(char* command) {
-  int yaw, pitch = SERVO_HOME, led;
+  int yaw, pitch = TILT_HOME, led;
   int scale = 1;  // 10 for N lines (tenths of a degree)
   unsigned long sequence;
   // Count commas to pick the format (4 = 5-field N or M line, 3 = old 4-field M line),
@@ -114,7 +116,7 @@ void applyCommand(char* command) {
   } else {
     return;
   }
-  if ((led != 0 && led != 1) || !inRange(yaw, scale) || !inRange(pitch, scale)) return;
+  if ((led != 0 && led != 1) || !inRange(pan, yaw, scale) || !inRange(tilt, pitch, scale)) return;
 
   // Keep receiving heartbeats while disarmed, but never move or light up.
   if (armed) {
@@ -143,8 +145,8 @@ void setup() {
   digitalWrite(LED_PIN, LOW);
   pan.servo.attach(SERVO_PIN);
   tilt.servo.attach(TILT_PIN);
-  pan.servo.writeMicroseconds(degreesToMicroseconds(SERVO_HOME));
-  tilt.servo.writeMicroseconds(degreesToMicroseconds(SERVO_HOME));
+  pan.servo.writeMicroseconds(degreesToMicroseconds(PAN_HOME));
+  tilt.servo.writeMicroseconds(degreesToMicroseconds(TILT_HOME));
   setArmed(false);
   Serial1.begin(115200);
 }

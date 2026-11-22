@@ -129,7 +129,7 @@ class CommandLineTests(unittest.TestCase):
     def test_firmware_parses_n_lines_in_tenths(self) -> None:
         source = INO.read_text()
         self.assertIn('sscanf(command, "N,%d,%d,%d,%lu"', source)
-        self.assertIn("value >= SERVO_MIN * scale && value <= SERVO_MAX * scale", source)
+        self.assertIn("value >= axis.minimum * scale && value <= axis.maximum * scale", source)
         self.assertIn("pan.target = (float)yaw / scale;", source)
 
 
