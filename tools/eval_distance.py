@@ -10,6 +10,8 @@ Per clip and variant it prints:
   track   fraction of frames the subject's track is looking (smoothed, hysteresis)
   active  fraction of frames the detector is ACTIVE (what the Pi would get)
   face/eye  median subject face width and eye width in pixels
+  yawerr  with --ref-dir: median |head yaw - the reference clip's head yaw| over frames where
+          both have a subject; the reference is <ref-dir>/<stem minus _masked>.mp4, same variant
   fps     frames per second of the loop's work: pipeline, tracker, and the preview's JPEG
           encode (camera read excluded)
 A *_look clip wants found/track/active high; a *_away clip wants track/active low.
@@ -56,7 +58,7 @@ def run_clip(path: Path, zoom: str, gaze: GazeConfig, tracking: TrackerConfig, *
     fps_in = capture.get(cv2.CAP_PROP_FPS) or 30.0
     tracker = PeeperTracker(tracking)
     counts = dict(frames=0, found=0, raw=0, track=0, active=0)
-    faces_px, eyes_px = [], []
+    faces_px, eyes_px, yaws = [], [], []
     busy = 0.0
     with LandmarkPipeline(str(MODELS["landmarker"]), str(ZOOM_FINDERS[finder]), zoom=zoom,
                           enhance=enhance, finder=finder) as pipeline:
@@ -78,11 +80,13 @@ def run_clip(path: Path, zoom: str, gaze: GazeConfig, tracking: TrackerConfig, *
             others = [(f, t) for f, t in zip(faces, result.tracks)
                       if t.id != result.user_id or tracking.min_faces <= 1]
             if not others:
+                yaws.append(None)
                 continue
             face, track = max(others, key=lambda pair: pair[0].box[2])
             counts["found"] += 1
             counts["raw"] += bool(face.observation.screen_facing)
             counts["track"] += track.looking
+            yaws.append(face.gaze.head_yaw if face.gaze is not None else None)
             faces_px.append(face.box[2])
             eye = eye_px(face.raw, width, height)
             if eye is not None:
@@ -95,7 +99,14 @@ def run_clip(path: Path, zoom: str, gaze: GazeConfig, tracking: TrackerConfig, *
         "face_px": statistics.median(faces_px) if faces_px else None,
         "eye_px": statistics.median(eyes_px) if eyes_px else None,
         "fps": counts["frames"] / busy if busy else None,
+        "yaws": yaws,
     }
+
+
+def yaw_error(yaws, ref_yaws) -> float | None:
+    """Median |yaw - reference yaw| over the frames where both found the subject."""
+    diffs = [abs(a - b) for a, b in zip(yaws, ref_yaws) if a is not None and b is not None]
+    return statistics.median(diffs) if diffs else None
 
 
 def _fmt(value, spec):
@@ -117,6 +128,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-faces", type=int, default=2,
                         help="1 = a lone face is the subject (clips with nobody else in them)")
     parser.add_argument("--max-frames", type=int)
+    parser.add_argument("--ref-dir", type=Path,
+                        help="unmasked reference clips: adds yawerr for each *_masked clip")
     args = parser.parse_args(argv)
     zooms = [z.strip() for z in args.zoom.split(",") if z.strip()]
     if any(z not in ZOOM_MODES for z in zooms):
@@ -131,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
     if any(f not in FINDERS for f in finders):
         parser.error(f"--finder takes {', '.join(FINDERS)}")
     print(f"{'clip':14} {'zoom':4} {'finder':9} {'enhance':18} {'small':5} {'found':>5} {'raw':>5} {'track':>5} {'active':>6} "
-          f"{'face':>5} {'eye':>5} {'fps':>5}")
+          f"{'face':>5} {'eye':>5} {'yawerr':>6} {'fps':>5}")
     for clip in args.clips:
         for zoom, finder, (enhance_name, enhance), small in (
                 (z, f, e, r) for z in zooms for f in finders for e in enhances for r in rules):
@@ -143,9 +156,15 @@ def main(argv: list[str] | None = None) -> int:
                     tracking = replace(tracking, **tracking_extra)
                 r = run_clip(clip, zoom, gaze, tracking, enhance=enhance,
                              max_frames=args.max_frames, finder=finder)
+                err = None
+                if args.ref_dir is not None:
+                    ref = args.ref_dir / f"{clip.stem.removesuffix('_masked')}{clip.suffix}"
+                    err = yaw_error(r["yaws"], run_clip(
+                        ref, zoom, gaze, tracking, enhance=enhance, max_frames=args.max_frames,
+                        finder=finder)["yaws"])
                 print(f"{clip.stem[:14]:14} {zoom:4} {finder:9} {enhance_name[:18]:18} {'on' if small else 'off':5} "
                       f"{r['found']:5.2f} {r['raw']:5.2f} {r['track']:5.2f} {r['active']:6.2f} "
-                      f"{_fmt(r['face_px'], '5.0f')} {_fmt(r['eye_px'], '5.1f')} "
+                      f"{_fmt(r['face_px'], '5.0f')} {_fmt(r['eye_px'], '5.1f')} {_fmt(err, '6.1f')} "
                       f"{_fmt(r['fps'], '5.1f')}", flush=True)
     return 0
 
