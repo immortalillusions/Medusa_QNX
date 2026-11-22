@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from medusa.arduino_serial import ArduinoController
+from medusa.body_detector import HeadEstimator, HeadFallback, head_status, is_head
 from medusa.control import DEFAULT_ACTUAL_PORT, ControlClient
 from medusa.handoff import DEFAULT_PATH as DEFAULT_HANDOFF_MAP, HandoffLearner, setup_fingerprint
 from medusa.decision import SCENE_CLEAR_FRAMES, SnooperSelector
@@ -102,6 +103,11 @@ def build_parser() -> argparse.ArgumentParser:
                               "before it is aimed at")
     trigger.add_argument("--face-dropout-frames", type=int, default=2,
                          help="frames the last aimed face, and the peeper lock, are kept through a detection dropout")
+    trigger.add_argument("--head-fallback", action="store_true",
+                         help="with no face target, look for the peeper's head (profile face, upper body, "
+                              "HOG person; qnx/cascades) every --head-every frames and aim at it")
+    trigger.add_argument("--head-every", type=int, default=3,
+                         help="frames between head-fallback runs (the last result is reused in between)")
     turret = parser.add_argument_group(
         "camera on turret (laptop-trigger mode only)",
         "the camera pans with the turret, so pan tracks the face's world bearing: the Pi models the "
@@ -272,6 +278,8 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
     confirm = FaceConfirm(args.face_confirm_frames, args.face_dropout_frames)
     matcher = PeeperMatcher(lock_dropout=args.face_dropout_frames)  # The lock rides out the same dropouts.
     rate = FrameRate()
+    heads = HeadFallback(HeadEstimator(), every=args.head_every) if getattr(args, "head_fallback", False) else None
+    aim = None
     handoff = HandoffLearner(
         args.handoff_map, minimum=args.servo_min, maximum=args.servo_max,
         fingerprint=setup_fingerprint(args.servo_home, args.servo_min, args.servo_max, args.servo_reversed,
@@ -330,6 +338,10 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
                 learned = handoff.current() if handoff else None
             # Match the laptop's peeper among the turret's faces: the map's expected image x
             # first, else the laptop's left/right ordering, else the smallest face.
+            # Head fallback: with no face target, add head candidates (HeadBox) for the matcher.
+            faces = boxes
+            if heads:
+                boxes = heads.augment(frame, faces, laptop_active=laptop_active, last_aim=aim)
             aim = decide_aim(laptop_active, laptop_reason, boxes, width, height, confirm=confirm,
                              matcher=matcher, expected_x=_expected_x(pan, learned, laptop_x),
                              laptop_x=laptop_x, user_x=_laptop_user_x(trigger, laptop_active),
@@ -348,8 +360,9 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
                 if handoff:
                     # Learn only from the one face in view, matched as the peeper, on a live turret.
                     handoff.observe(pan.last_update, laptop_x, pan_error, pan.real_pan(),
-                                    faces=len(boxes) if boxes is not None else None,
-                                    match=matcher.match if aim.active and not aim.held else "none",
+                                    faces=len(faces) if faces is not None else None,
+                                    match=matcher.match if aim.active and not aim.held
+                                    and not is_head(aim.target_box) else "none",
                                     armed=actual.armed if actual is not None else None,
                                     gate_closed=actual.gate_closed if actual is not None else None)
                     handoff.maybe_save(pan.last_update)
@@ -368,17 +381,20 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
                 nose_offset = None
                 if aim.target_box is not None and aim.target_box.nose is not None:
                     nose_offset = measure_nose_offset(aim.target_box.nose, width, height)
-                if boxes:
-                    draw_aim_boxes(frame, boxes, aim.target_box)
+                if faces:
+                    draw_aim_boxes(frame, faces, aim.target_box)
+                if heads:
+                    heads.draw(frame, aim.target_box)
                 preview.state.update_frame(frame)
                 preview.state.update_status(
                     light, FALLBACK_REASON if fallback else aim.reason,
-                    face_count=len(boxes) if boxes is not None else None,
+                    face_count=len(faces) if faces is not None else None,
                     snooper_count=1 if aim.active else 0,
                     nose_offset=nose_offset,
                     extra=_trigger_status(trigger, laptop_active, aim, pan, pan_error, fps=rate.fps(),
                                           learned_points=handoff.learned_points if handoff else None,
-                                          matcher=matcher, learner=handoff),
+                                          matcher=matcher, learner=handoff,
+                                          ) | head_status(aim, fallback, heads),
                 )
     except KeyboardInterrupt:
         pass
