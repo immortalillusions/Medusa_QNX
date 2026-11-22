@@ -163,6 +163,35 @@ class FaceZoomerTests(unittest.TestCase):
             result = zoomer(np.zeros((H, W, 3), np.uint8))
         self.assertEqual(result.face_landmarks, [])
 
+    def test_a_big_face_the_full_frame_landmarker_missed_is_zoomed_too(self):
+        # A masked face close up: no size limit on what the finder hands the crop landmarker.
+        zoomer = self.zoomer([FaceBox(700, 200, 1100, 700, 0.4)])
+        with patch.dict(sys.modules, {"mediapipe": fake_mediapipe()}):
+            result = zoomer(np.zeros((H, W, 3), np.uint8))
+        self.assertEqual(result.zoomed, 1)
+        self.assertGreater(result.face_landmarks[0][1].x - result.face_landmarks[0][0].x, 0.1)
+
+    def test_crop_tries_a_frame_are_capped(self):
+        boxes = [FaceBox(100 * i, 50, 100 * i + 40, 100, 0.35) for i in range(10)]
+        zoomer = self.zoomer(boxes, found=False, max_tries=4)
+        with patch.dict(sys.modules, {"mediapipe": fake_mediapipe()}):
+            zoomer(np.zeros((H, W, 3), np.uint8))
+        self.assertEqual(zoomer.crop_landmarker.calls, 4)
+
+    def test_an_unsure_box_with_no_face_waits_before_it_is_tried_again(self):
+        zoomer = self.zoomer([FaceBox(1000, 500, 1040, 550, 0.35)], found=False, fail_hold=3)
+        with patch.dict(sys.modules, {"mediapipe": fake_mediapipe()}):
+            for _ in range(4):
+                zoomer(np.zeros((H, W, 3), np.uint8))
+        self.assertEqual(zoomer.crop_landmarker.calls, 2)  # frames 1 and 4
+
+    def test_a_sure_box_is_tried_every_frame(self):
+        zoomer = self.zoomer([FaceBox(1000, 500, 1040, 550, 0.9)], found=False, fail_hold=3)
+        with patch.dict(sys.modules, {"mediapipe": fake_mediapipe()}):
+            for _ in range(4):
+                zoomer(np.zeros((H, W, 3), np.uint8))
+        self.assertEqual(zoomer.crop_landmarker.calls, 4)
+
     def test_round_robin_runs_tiles_per_frame_tiles(self):
         zoomer = self.zoomer([], grids=((2, 1), (4, 2)), tiles_per_frame=3)
         with patch.dict(sys.modules, {"mediapipe": fake_mediapipe()}):

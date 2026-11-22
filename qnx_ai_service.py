@@ -44,7 +44,11 @@ _DEPRECATED_PAN_FLAGS = ("--pan-gain", "--pan-deadband", "--pan-max-step")
 FACE_MODELS = {
     "short": Path("qnx/blaze_face_short_range.tflite"),
     "back": Path("qnx/face_detector.tflite"),
+    # back first every frame; OpenCV YuNet only when back finds no face, every 3rd frame at
+    # most (masked faces BlazeFace misses). TFLite stays the primary model.
+    "back+yunet": Path("qnx/face_detector.tflite"),
 }
+YUNET_MODEL = Path("qnx/face_detection_yunet_2023mar.onnx")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -421,6 +425,11 @@ def main() -> int:
         import cv2
         detector = TFLiteFaceGazeDetector(str(args.face_detector), str(args.face_landmarker),
                                           score_threshold=args.face_score, num_threads=args.tflite_threads)
+        if args.face_model.endswith("+yunet"):
+            from medusa.yunet_detector import FallbackFaceDetector, YuNetFaceDetector
+
+            detector.face_detector = FallbackFaceDetector(
+                detector.face_detector, YuNetFaceDetector(str(YUNET_MODEL), scale=1.0), want=1)
         if args.qnx_camera_unit is None:
             camera = cv2.VideoCapture(args.camera)
             if not camera.isOpened():

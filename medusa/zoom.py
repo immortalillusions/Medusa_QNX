@@ -35,6 +35,18 @@ FINDERS = ("yunet", "blazeface")
 DEFAULT_FINDER = "yunet"
 DEFAULT_OVERLAP = 0.1
 DEFAULT_SCORE = 0.5
+# YuNet's score for the zoom finder. A mask over the nose and mouth drops a 45 px face's
+# score from ~0.9 to ~0.4, so 0.6 lost every masked face from 5 m. Each extra candidate
+# only costs one crop-landmarker run, which rejects what is not a face.
+YUNET_ZOOM_SCORE = 0.3
+MAX_CROP_TRIES = 6  # crop-landmarker runs a frame at most (bounds the cost of false boxes)
+# A box under SURE_SCORE whose crop held no face is not tried again for FAIL_HOLD frames:
+# without this a lasting false box cost a crop-landmarker run every frame (49 -> 17 fps).
+SURE_SCORE = 0.6
+FAIL_HOLD = 10
+# Masked faces under ~40 px (7 m) are out of reach: half resolution never finds them, and a
+# full-resolution YuNet sweep over 4x2 tiles every frame found 57% of m7 frames at 12 fps
+# (15% at one tile a frame) because the crop landmarker itself fails on them.
 ZOOM_MODES = ("off", "far", "all")
 
 # Cheap per-crop steps, applied in this order whatever order they are named in:
@@ -256,7 +268,11 @@ class FaceZoomer:
                  margin: float = DEFAULT_MARGIN, grids=DEFAULT_GRIDS,
                  tiles_per_frame: int | None = DEFAULT_TILES_PER_FRAME,
                  enhance: Sequence[str] = (), max_faces: int = 4,
-                 whole_frame: bool = False) -> None:
+                 whole_frame: bool = False, max_tries: int = MAX_CROP_TRIES,
+                 fail_hold: int = FAIL_HOLD) -> None:
+        self.max_tries, self.fail_hold = max_tries, fail_hold
+        self._failed: list = []  # (box, frame number) of unsure boxes whose crop had no face
+        self._frame = 0
         self.crop_landmarker, self.detector = crop_landmarker, detector
         self.whole_frame = whole_frame  # also detect on the whole frame (big faces split by tiles)
         self.crop_size, self.margin, self.max_faces = crop_size, margin, max_faces
@@ -333,13 +349,22 @@ class FaceZoomer:
         tracked, self._tracked = self._tracked, []
         candidates = (sorted(tracked, key=lambda b: -(b[2] - b[0]))
                       + sorted(boxes, key=lambda b: -(b[2] - b[0])))
+        tries = 0
+        self._frame += 1
+        self._failed = [(old, at) for old, at in self._failed if self._frame - at < self.fail_hold]
         for box in candidates:
-            if len(result.face_landmarks) >= self.max_faces:
+            if len(result.face_landmarks) >= self.max_faces or tries >= self.max_tries:
                 break
             if covered(box[:4], handled):
                 continue
+            unsure = len(box) > 4 and box[4] < SURE_SCORE  # a detection, not a followed face
+            if unsure and any(_iou(box, old) >= 0.3 for old, _ in self._failed):
+                continue
+            tries += 1
             found = self.landmarks_in(frame, square_window(box[:4], self.margin))
             if found is None:
+                if unsure:
+                    self._failed.append((box, self._frame))
                 continue
             lms, matrix = found
             result.face_landmarks.append(lms)
@@ -390,8 +415,9 @@ class LandmarkPipeline:
             if finder == "yunet":
                 from .yunet_detector import YuNetFaceDetector
 
-                # One half-resolution pass over the whole frame finds 23 px faces.
-                detector = YuNetFaceDetector(str(detector_model))
+                # One half-resolution pass over the whole frame finds 23 px faces, and any
+                # face the full-frame landmarker missed whatever its size (e.g. masked).
+                detector = YuNetFaceDetector(str(detector_model), score_threshold=YUNET_ZOOM_SCORE)
                 grids, whole = ((1, 1),), False
             elif finder == "blazeface":
                 from .tflite_detector import TFLiteFaceDetector

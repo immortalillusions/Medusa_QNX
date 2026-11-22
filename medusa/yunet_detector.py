@@ -54,3 +54,44 @@ class YuNetFaceDetector:
 
     def detect(self, frame) -> list[FaceBox]:
         return [face.box for face in self.faces(frame)]
+
+
+def _overlaps(a: FaceBox, b: FaceBox) -> bool:
+    """True when a's centre lies inside b or b's inside a (the same face)."""
+    def inside(p, q):
+        cx, cy = (p.left + p.right) / 2, (p.top + p.bottom) / 2
+        return q.left <= cx <= q.right and q.top <= cy <= q.bottom
+    return inside(a, b) or inside(b, a)
+
+
+class FallbackFaceDetector:
+    """TFLite first, YuNet second: the Pi turret's detector with a masked-face fallback.
+
+    ``primary`` (TFLiteFaceDetector, BlazeFace) runs every frame and stays the main AI
+    module. When it finds fewer than ``want`` faces, ``fallback`` (YuNetFaceDetector) runs,
+    at most once every ``every`` frames; its boxes that are not already a primary face are
+    added, and held for the frames in between so a masked face does not flicker. Same
+    ``detect(frame) -> list[FaceBox]`` as the primary; other attributes pass through.
+    """
+
+    def __init__(self, primary, fallback, *, want: int = 2, every: int = 3) -> None:
+        self.primary, self.fallback, self.want, self.every = primary, fallback, want, every
+        self._since = every  # frames since the fallback last ran; run on the first chance
+        self._held: list[FaceBox] = []
+        self.fallback_runs = 0
+
+    def __getattr__(self, name):
+        return getattr(self.primary, name)
+
+    def detect(self, frame) -> list[FaceBox]:
+        boxes = list(self.primary.detect(frame))
+        self._since += 1
+        if len(boxes) >= self.want:
+            self._held = []
+            return boxes
+        if self._since >= self.every:
+            self._since = 0
+            self.fallback_runs += 1
+            self._held = list(self.fallback.detect(frame))
+        return boxes + [extra for extra in self._held
+                        if not any(_overlaps(extra, box) for box in boxes)]
