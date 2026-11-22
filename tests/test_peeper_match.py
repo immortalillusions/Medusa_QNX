@@ -1,11 +1,13 @@
 """PeeperMatcher: aim at the laptop's peeper among the turret camera's faces, not at the user."""
 
 import json
+import sys
 import unittest
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock, patch
 
 import qnx_ai_service
-from medusa.handoff import HandoffMap
+from medusa.handoff import HandoffLearner, HandoffMap
 from medusa.tflite_detector import FaceBox
 from medusa.trigger import (
     MATCH_REASONS, NO_MATCH_REASON, FaceConfirm, LaptopTrigger, PanTracker, PeeperMatcher, decide_aim,
@@ -173,6 +175,106 @@ class NoMapTests(unittest.TestCase):
         self.assertEqual((aim.active, round(aim.target_x, 4)), (True, 0.7))
         aim = decide_aim(True, "", [face(0.3)], W, H, confirm=confirm, matcher=matcher)  # Peeper dropout.
         self.assertEqual((aim.active, aim.held, round(aim.target_x, 4)), (True, True, 0.7))
+
+
+class NoMapPriorTests(unittest.TestCase):
+    """Live bug: no map, the laptop saw the user (x 0.17) and the peeper (x 0.93), the turret
+    saw only the user, and "single" aimed at (and learned) the user."""
+
+    LAPTOP_X, USER_X = 0.93, 0.17
+
+    def setUp(self) -> None:
+        self.pan = PanTracker(15, 165, 90, reversed=True)  # At home: peeper prior ~0.97, user ~0.14.
+
+    def prior(self, user_x=USER_X):
+        return qnx_ai_service._default_prior(self.pan, None, self.LAPTOP_X, user_x)
+
+    def test_user_only_in_view_is_not_picked_aimed_at_or_learned(self) -> None:
+        matcher, confirm = PeeperMatcher(), FaceConfirm(confirm_frames=2, dropout_frames=2)
+        for _ in range(5):
+            aim = decide_aim(True, "", [face(0.2)], W, H, confirm=confirm, matcher=matcher,
+                             laptop_x=self.LAPTOP_X, user_x=self.USER_X, prior=self.prior())
+            self.assertFalse(aim.active)
+            self.assertEqual((aim.reason, matcher.match), (NO_MATCH_REASON, "none"))
+            self.assertNotIn(matcher.match, HandoffLearner.LEARN_MATCHES)
+
+    def test_user_centred_after_the_turret_panned_to_them_is_still_refused(self) -> None:
+        self.pan.observe_actual(110.0, 0.0)  # Turned 20 deg toward the user (higher pan = left).
+        self.pan.update(None, now=0.0)
+        self.assertEqual(self.pan.current_pan(), 110.0)
+        matcher = PeeperMatcher()
+        self.assertIsNone(matcher.pick([face(0.5)], W, H, laptop_x=self.LAPTOP_X, user_x=self.USER_X,
+                                       prior=self.prior()))
+        self.assertEqual(matcher.match, "none")
+
+    def test_peeper_only_in_view_is_picked(self) -> None:
+        matcher = PeeperMatcher()
+        aim = decide_aim(True, "", [face(0.85)], W, H, matcher=matcher, laptop_x=self.LAPTOP_X,
+                         user_x=self.USER_X, prior=self.prior())
+        self.assertEqual((aim.active, round(aim.target_x, 4), matcher.match), (True, 0.85, "single"))
+
+    def test_one_person_mode_without_user_x_is_unchanged(self) -> None:
+        self.assertIsNone(self.prior(user_x=None))
+        matcher = PeeperMatcher()
+        picked = matcher.pick([face(0.2)], W, H, laptop_x=self.LAPTOP_X, prior=self.prior(user_x=None))
+        self.assertEqual((picked_x(picked), matcher.match), (0.2, "single"))
+
+    def test_no_prior_with_a_map_a_close_user_or_no_turret_pan(self) -> None:
+        self.assertIsNone(qnx_ai_service._default_prior(self.pan, 0.6, self.LAPTOP_X, self.USER_X))
+        self.assertIsNone(qnx_ai_service._default_prior(self.pan, None, 0.5, 0.45))
+        self.assertIsNone(qnx_ai_service._default_prior(None, None, self.LAPTOP_X, self.USER_X))
+        peeper, user = self.prior()
+        self.assertGreater(peeper, user)  # Peeper right of the user in both images.
+        self.assertAlmostEqual(peeper, 0.5 + 55 * 0.43 / 50)
+
+    def test_a_single_lock_on_the_user_is_dropped_once_the_prior_arrives(self) -> None:
+        matcher = PeeperMatcher()
+        # One laptop packet without user_x (flicker): one-person mode locks the only face.
+        self.assertEqual(picked_x(matcher.pick([face(0.2)], W, H, laptop_x=self.LAPTOP_X)), 0.2)
+        self.assertIsNone(matcher.pick([face(0.2)], W, H, laptop_x=self.LAPTOP_X, user_x=self.USER_X,
+                                       prior=self.prior()))
+        self.assertEqual((matcher.match, matcher.lock_x), ("none", None))
+
+    def test_the_service_loop_passes_the_prior_and_never_aims_at_the_user(self) -> None:
+        frame = SimpleNamespace(shape=(H, W, 3))
+        script, index, pending = [[face(0.2)]] * 6, {"i": -1}, []
+        packet = {"type": "medusa-peeper", "active": True, "target_x": self.LAPTOP_X, "user_x": self.USER_X}
+
+        def read():
+            index["i"] += 1
+            if index["i"] == len(script):
+                raise KeyboardInterrupt
+            pending.append((json.dumps(packet).encode(), ("172.20.10.4", 50000)))
+            return True, frame
+
+        def recvfrom(_size):
+            if pending:
+                return pending.pop(0)
+            raise BlockingIOError
+
+        sock = MagicMock()
+        sock.recvfrom.side_effect = recvfrom
+        camera, detector, preview = Mock(), Mock(), Mock()
+        camera.read.side_effect = read
+        detector.face_detector.detect.side_effect = lambda _frame: script[index["i"]]
+        args = qnx_ai_service.parse_args(["--trigger-udp-port", "8767", "--camera-on-turret", "--no-search",
+                                          "--servo-reversed", "--servo-min", "15", "--servo-max", "165",
+                                          "--face-confirm-frames", "1"])
+        with (
+            patch.dict(sys.modules, {"cv2": SimpleNamespace(error=RuntimeError)}),
+            patch.object(qnx_ai_service, "draw_aim_boxes"),
+            patch.object(qnx_ai_service.LaptopTrigger, "bind", return_value=LaptopTrigger(sock)),
+        ):
+            self.assertEqual(qnx_ai_service.run_laptop_trigger(args, camera, detector, preview, None), 0)
+        calls = preview.state.update_status.call_args_list
+        self.assertEqual(len(calls), len(script))
+        self.assertEqual({(c.args[0], c.kwargs["extra"]["aim_match"]) for c in calls}, {(False, "none")})
+
+    def test_two_faces_still_use_order_with_a_prior(self) -> None:
+        matcher = PeeperMatcher()
+        picked = matcher.pick([face(0.3), face(0.6)], W, H, laptop_x=self.LAPTOP_X, user_x=self.USER_X,
+                              prior=self.prior())
+        self.assertEqual((picked_x(picked), matcher.match), (0.6, "order"))
 
 
 class PeeperSwitchTests(unittest.TestCase):

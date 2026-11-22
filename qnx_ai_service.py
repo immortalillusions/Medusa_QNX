@@ -279,6 +279,27 @@ def _expected_x(pan: PanTracker | None, learned, laptop_x: float | None) -> floa
     return pan.expected_image_x(expected_pan) if expected_pan is not None else None
 
 
+PRIOR_SLOPE_DEG = 55.0  # measured |d pan / d laptop_x|; pan falls as laptop_x rises on the reversed servo
+PRIOR_MIN_SEPARATION = 0.1  # laptop_x gap between peeper and user below which the prior is not used
+
+
+def _default_prior(pan: PanTracker | None, expected_x: float | None, laptop_x: float | None,
+                   user_x: float | None) -> tuple[float, float] | None:
+    """(peeper, user) turret-image x from a default laptop_x -> pan line, or None.
+
+    Only with no map (``expected_x`` None) and the laptop reporting a user apart from the
+    peeper: the line is home at laptop_x 0.5 with PRIOR_SLOPE_DEG per unit (sign follows
+    the servo direction), seen from the turret's current pan. PeeperMatcher then refuses
+    a lone face nearer the user's prior, so it does not lock on (or learn) the user.
+    """
+    if (pan is None or expected_x is not None or laptop_x is None or user_x is None
+            or abs(laptop_x - user_x) < PRIOR_MIN_SEPARATION):
+        return None
+    def image_x(x: float) -> float:
+        return pan.expected_image_x(pan.home + pan.sign * PRIOR_SLOPE_DEG * (x - 0.5))
+    return image_x(laptop_x), image_x(user_x)
+
+
 def _trigger_status(trigger: LaptopTrigger, laptop_active: bool, aim, pan=None, pan_error=None,
                     fps: float | None = None, learned_points: int | None = None,
                     matcher: PeeperMatcher | None = None, learner: HandoffLearner | None = None,
@@ -408,10 +429,12 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
             faces = boxes
             if heads:
                 boxes = heads.augment(frame, faces, laptop_active=laptop_active, last_aim=aim)
+            expected_x = _expected_x(pan, learned, laptop_x)
+            user_x = _laptop_user_x(trigger, laptop_active)
             aim = decide_aim(laptop_active, laptop_reason, boxes, width, height, confirm=confirm,
-                             matcher=matcher, expected_x=_expected_x(pan, learned, laptop_x),
-                             laptop_x=laptop_x, user_x=_laptop_user_x(trigger, laptop_active),
-                             peeper_id=_laptop_peeper_id(trigger, laptop_active))
+                             matcher=matcher, expected_x=expected_x, laptop_x=laptop_x, user_x=user_x,
+                             peeper_id=_laptop_peeper_id(trigger, laptop_active),
+                             prior=_default_prior(pan, expected_x, laptop_x, user_x))
             if pan:
                 # A held target is a stale image position on a camera that has since moved: the
                 # tracker coasts on its own prediction instead.

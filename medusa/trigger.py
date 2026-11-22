@@ -175,7 +175,11 @@ class PeeperMatcher:
       of map(laptop target_x)). The face whose centre x is nearest it wins if within
       ``gate`` (frame widths); with none inside the gate there is no match ("none"),
       so the tracker falls back to aiming at the map instead of at the user.
-    * "single": no map, one face: that face.
+    * "single": no map, one face: that face. With a ``prior`` (peeper and user image x
+      from a default laptop_x -> pan slope, passed only when the laptop sent a separate
+      ``user_x``) the face is taken only if it is nearer the peeper's prior than the
+      user's; else "none", so the tracker searches toward the peeper instead of
+      locking on the user. A lock taken by "single" is re-checked the same way.
     * "order": no map, 2+ faces, the laptop sent ``user_x``: the peeper's side of the
       user in the laptop image picks the rightmost or leftmost turret face. This
       assumes both cameras look at the people from the same side, unmirrored.
@@ -201,15 +205,17 @@ class PeeperMatcher:
         self.missed = 0
         self.match = "none"
         self.expected_x: float | None = None
+        self.prior: tuple[float, float] | None = None
         self.peeper_id: int | None = None
 
     def pick(
         self, boxes: Sequence[FaceBox] | None, width: int, height: int, *, laptop_active: bool = True,
         expected_x: float | None = None, laptop_x: float | None = None, user_x: float | None = None,
-        peeper_id: int | None = None,
+        peeper_id: int | None = None, prior: tuple[float, float] | None = None,
     ) -> tuple[FaceBox, float, float] | None:
         """This frame's face (box, x, y normalized 0..1), or None."""
         self.expected_x = expected_x if laptop_active else None
+        self.prior = prior if laptop_active and self.expected_x is None else None
         if not laptop_active:
             self.lock_x, self.missed = None, 0
         elif peeper_id is not None:
@@ -221,10 +227,13 @@ class PeeperMatcher:
             near = [f for f in faces if abs(f[1] - self.lock_x) <= self.lock_radius]
             if near:
                 face = min(near, key=lambda f: abs(f[1] - self.lock_x))
-                if self.expected_x is None or abs(face[1] - self.expected_x) <= self.gate:
+                if self.match == "single" and not self._peeper_side(face[1]):
+                    self.lock_x = None  # A "single" lock nearer the user's prior: re-match.
+                elif self.expected_x is None or abs(face[1] - self.expected_x) <= self.gate:
                     self.lock_x, self.missed = face[1], 0
                     return face
-                self.lock_x = None  # The locked face is not where the map puts the peeper: re-match.
+                else:
+                    self.lock_x = None  # The locked face is not where the map puts the peeper: re-match.
             else:
                 self.missed += 1
                 if self.missed <= self.lock_dropout:
@@ -243,12 +252,16 @@ class PeeperMatcher:
             face = min(faces, key=lambda f: abs(f[1] - self.expected_x))
             return (face, "map") if abs(face[1] - self.expected_x) <= self.gate else (None, "none")
         if len(faces) == 1:
-            return faces[0], "single"
+            return (faces[0], "single") if self._peeper_side(faces[0][1]) else (None, "none")
         if laptop_x is not None and user_x is not None and laptop_x != user_x:
             pick = max if laptop_x > user_x else min  # Peeper right of the user: the rightmost face.
             return pick(faces, key=lambda f: f[1]), "order"
         area = lambda f: ((f[0].right - f[0].left) * (f[0].bottom - f[0].top), -f[0].score)
         return min(faces, key=area), "smallest"  # The same rule as pick_aim_target.
+
+    def _peeper_side(self, x: float) -> bool:
+        """True without a prior, else whether image x is nearer the peeper's prior than the user's."""
+        return self.prior is None or abs(x - self.prior[0]) < abs(x - self.prior[1])
 
 
 class FaceConfirm:
@@ -335,18 +348,18 @@ def decide_aim(
     laptop_active: bool, laptop_reason: str, boxes: Sequence[FaceBox] | None,
     width: int, height: int, *, confirm: FaceConfirm | None = None, matcher: PeeperMatcher | None = None,
     expected_x: float | None = None, laptop_x: float | None = None, user_x: float | None = None,
-    peeper_id: int | None = None,
+    peeper_id: int | None = None, prior: tuple[float, float] | None = None,
 ) -> AimDecision:
     """Aim only while the laptop is active and the turret camera has a face to aim at.
 
-    With ``matcher`` the face is the PeeperMatcher's pick (``expected_x``, ``laptop_x``
-    and ``user_x`` are its inputs); without it, pick_aim_target's smallest face.
+    With ``matcher`` the face is the PeeperMatcher's pick (``expected_x``, ``laptop_x``,
+    ``user_x`` and ``prior`` are its inputs); without it, pick_aim_target's smallest face.
     With ``confirm`` the face must pass FaceConfirm; it is fed every frame, laptop
     active or not, so a face already in view is aimed at as soon as the laptop fires.
     """
     if matcher is not None:
         picked = matcher.pick(boxes, width, height, laptop_active=laptop_active, expected_x=expected_x,
-                              laptop_x=laptop_x, user_x=user_x, peeper_id=peeper_id)
+                              laptop_x=laptop_x, user_x=user_x, peeper_id=peeper_id, prior=prior)
     else:
         picked = pick_aim_target(boxes, width, height) if boxes else None
     if confirm is not None:
