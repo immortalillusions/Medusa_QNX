@@ -80,13 +80,53 @@ On the Pi:
 
 - `:8080/status.json` and `:8080/stream.mjpg`: the AI decision and the turret
   camera view.
-- `:8082/control.json`: loop timing, Arduino link, arm and gate state, and
-  `safe_reason`.
-- `POST :8082/stress?seconds=N`: CPU hog workers at the AI's priority, for
-  the real-time demo.
+- `:8082/control.json`: loop timing, Arduino link, arm and gate state,
+  `arduino.needs_button` (the firmware's fault latch), `safe_reason`, and a
+  `timing` block (see below).
+- `POST :8082/stress?seconds=N` (0 stops): CPU hog workers at the AI's priority,
+  for the real-time demo. Returns 202. The control process only sends a UDP
+  datagram to `medusa_sysmon.py` (127.0.0.1:8770), which spawns the workers with
+  `on -p 10` and writes `/tmp/medusa_stress.json`; control.json's `stress` block
+  reads that file. Returns 503 if `medusa_sysmon.py` is not running.
 - `POST :8082/arm` and `POST :8082/disarm`: the dashboard's arm / switch-off
   button. Returns 202; the loop sends one `A` line on its next tick and the
-  firmware decides (kill gate and heartbeat still apply).
+  firmware decides (kill gate, heartbeat and the fault latch still apply).
+
+### Process layout
+
+| Process | Priority | Job |
+| --- | --- | --- |
+| `medusa_control.py` | 21 | 50 Hz loop, sole UART writer, HTTP :8082. Never forks or execs. |
+| `medusa_sysmon.py` | 10 | Pi usage samples (`/tmp/medusa_system.json`) and the stress workers (`/tmp/medusa_stress.json`). |
+| `qnx_ai_service.py` | 10 | Camera, face models, targets to the control process over UDP :8768. |
+
+### Fault latch
+
+The firmware sets `needsButton` at boot, while the heartbeat is stale (no N/M
+line for 300 ms, including the park that link loss causes) and while the kill
+gate is open. Only a D2 press clears it, and loop() sets it again at once if the
+fault still holds. While it is set, `A,1` is ignored: the dashboard disables Arm
+with "press the turret's button (safety reset after a fault)". A dashboard or
+button switch-off is not a fault and leaves it clear. A restart of
+`medusa_control.py` stops the heartbeat, so it needs a button press afterwards.
+
+### Reading the `timing` block
+
+Per 10 s window: `work_ms_p99` / `work_ms_max` (one tick's own work),
+`serial_ms_p99` (reading S lines, writing N/M/A lines), `udp_ms_p99` (draining AI
+targets, sending medusa-actual), `late_ms_p99` (how long after its deadline a tick
+started: sleep overshoot plus waiting for the GIL), `late_ticks` (ticks more than
+5 ms late) and `late_ticks_http` (those of them that overlapped an HTTP request,
+meaning the HTTP thread held the GIL the loop needed). Jitter comes from late
+starts, not from tick work, unless work approaches 20 ms. If `late_ticks_http` is
+a small part of `late_ticks`, the cause is outside this process: try
+`slay` on `medusa_sysmon.py` for a minute (its `pidin` queries touch every
+process) and compare.
+
+`--http-priority N` puts only the HTTP thread at priority N (pthread_setschedprio
+through ctypes; verified on the Pi). It is off by default: thread priority does
+not decide who gets Python's GIL, so a lower HTTP priority does not make the loop
+get the GIL sooner, and a preempted HTTP thread holding the GIL would delay it.
 
 ## Pre-demo checks
 
@@ -94,7 +134,8 @@ On the Pi:
   few ms.
 - With the kill plug out, the turret will not arm. With it in, the D2 button
   arms it and the red LED lights.
-- Stopping `medusa_control.py` makes the turret glide home and go limp.
+- Stopping `medusa_control.py` makes the turret glide home and go limp, and
+  the dashboard's Arm then says to press the turret's button until D2 is pressed.
 - Unplugging the turret camera sends the turret home.
 - A stress run drops the AI frame rate, but the control loop period stays at
   20 ms.

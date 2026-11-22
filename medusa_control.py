@@ -4,9 +4,10 @@ Start it at a higher priority than the AI process (QNX):
 
     on -p 21 python3 -u medusa_control.py --port /dev/ser1
 
-``on -p 21`` sets the process's priority; threads Python starts here (the
-HTTP server, the stress timer) inherit it, and the 50 Hz loop runs in the main
-thread. The AI process stays at the default priority 10 and sends targets with
+``on -p 21`` sets the process's priority; the one thread Python starts here (the
+HTTP server) inherits it, and the 50 Hz loop runs in the main thread. This process
+never forks or execs: POST /stress asks medusa_sysmon.py (priority 10) to spawn the
+CPU stress workers. The AI process stays at the default priority 10 and sends targets with
 ``qnx_ai_service.py --control-port 8768``. See medusa/control.py.
 
 The servo defaults (65..115, home 90) predate the current turret. Pass the
@@ -24,8 +25,9 @@ import threading
 from medusa.sysmon import DEFAULT_SYSTEM_FILE
 from medusa.control import (
     DEFAULT_ACTUAL_PORT, DEFAULT_HTTP_PORT, DEFAULT_TARGET_PORT, PERIOD_S, STRESS_MAX_S, TARGET_TIMEOUT_S,
-    ControlHTTPServer, ControlLoop, SerialPort, StressTest, SystemStatusFile, _udp_socket,
+    ControlHTTPServer, ControlLoop, SerialPort, SystemStatusFile, _udp_socket,
 )
+from medusa.stress import DEFAULT_STRESS_FILE, DEFAULT_STRESS_PORT, StressClient
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -46,11 +48,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tilt-min", type=int, default=65)
     parser.add_argument("--tilt-max", type=int, default=115)
     parser.add_argument("--tilt-home", type=int, default=90)
-    parser.add_argument("--stress-workers", type=int, default=4, help="busy-loop processes for POST /stress")
-    parser.add_argument("--stress-priority", type=int, default=10,
-                        help="QNX priority for stress workers (started with `on -p`)")
+    parser.add_argument("--stress-port", type=int, default=DEFAULT_STRESS_PORT,
+                        help="localhost UDP port of medusa_sysmon.py's stress runner (POST /stress)")
+    parser.add_argument("--stress-file", default=DEFAULT_STRESS_FILE,
+                        help="stress status JSON written by medusa_sysmon.py, served as control.json's stress block")
     parser.add_argument("--system-file", default=DEFAULT_SYSTEM_FILE,
                         help="Pi usage JSON written by medusa_sysmon.py, served as control.json's system block")
+    parser.add_argument("--http-priority", type=int, default=0,
+                        help="QNX priority for the HTTP thread only (0: inherit the process's, 21). "
+                             "Priority does not arbitrate the GIL, so this is off by default; see docs")
     parser.add_argument("--switch-interval", type=float, default=0.001,
                         help="sys.setswitchinterval: how long another thread may hold the GIL")
     return parser
@@ -63,8 +69,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         low, high, home = (getattr(args, f"{name}_{k}") for k in ("min", "max", "home"))
         if not 0 <= low <= home <= high <= 180:
             parser.error(f"--{name}-min <= --{name}-home <= --{name}-max must hold within 0..180")
-    if args.period_ms <= 0 or args.target_timeout <= 0 or args.stress_workers < 1:
-        parser.error("--period-ms, --target-timeout and --stress-workers must be positive")
+    if args.period_ms <= 0 or args.target_timeout <= 0:
+        parser.error("--period-ms and --target-timeout must be positive")
     return args
 
 
@@ -77,7 +83,7 @@ def main(argv=None) -> int:
         print(f"medusa_control cannot start: serial {args.port}: {error}", file=sys.stderr)
         return 2
     sockets, http = [], None
-    stress = StressTest(args.stress_workers, args.stress_priority)
+    stress = StressClient(args.stress_port, args.stress_file)
     loop = None
     try:
         target_sock = _udp_socket(args.target_port)
@@ -92,7 +98,8 @@ def main(argv=None) -> int:
             yaw_range=(args.servo_min, args.servo_max), pitch_range=(args.tilt_min, args.tilt_max),
             home=(args.servo_home, args.tilt_home), stress=stress,
         )
-        http = ControlHTTPServer(loop, args.http_port, system_file=SystemStatusFile(args.system_file))
+        http = ControlHTTPServer(loop, args.http_port, system_file=SystemStatusFile(args.system_file),
+                                 thread_priority=args.http_priority or None)
         http.start()
         stop = threading.Event()
         for signum in (signal.SIGINT, signal.SIGTERM):
@@ -104,7 +111,7 @@ def main(argv=None) -> int:
         print(f"medusa_control cannot start: {error}", file=sys.stderr)
         return 2
     finally:
-        stress.stop()
+        stress.close()
         if loop is not None:
             loop.shutdown()  # Park lines: home, LED off; the firmware disarms 300 ms later.
         serial.close()

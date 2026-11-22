@@ -63,8 +63,13 @@ saturates the CPU with busy loops at priority 10, the AI drops from 13.7 to
 | AI frame rate, idle → under the CPU hog | 13.7 → 0.5 fps |
 
 The loop runs on absolute deadlines, so a late tick does not push the next one
-later. Its threads inherit priority 21, and the GIL switch interval is set to
-1 ms. `/control.json` reports the live period, jitter and missed deadlines.
+later. Its one HTTP thread inherits priority 21, and the GIL switch interval is set to
+1 ms. The control process never forks or execs: the stress workers are spawned by
+`medusa_sysmon.py` at priority 10 (POST /stress only sends it a localhost UDP
+datagram), because spawning them from the priority-21 process stalled the loop for
+140–165 ms at every stress start. `/control.json` reports the live period, jitter
+and missed deadlines, plus a `timing` block (per-tick work, serial and UDP time,
+and how late ticks start) that shows where the loop's time goes.
 The two processes talk over localhost UDP. QNX message passing would be the
 production choice, but stock Python has no binding for it.
 
@@ -81,6 +86,14 @@ production choice, but stock Python has no binding for it.
 - **Heartbeat watchdog.** If no valid command arrives for 300 ms while armed,
   the firmware glides home and then goes limp (2 s cap). Re-arming takes a
   button press.
+- **Fault latch: after any fault, a human presses the button.** The firmware
+  latches `needsButton` at boot, whenever the heartbeat is stale (link loss, and
+  the park it causes), and whenever the kill gate is open. Only a press of the D2
+  button clears it, and a press during the fault does not count. While it is set
+  the dashboard's Arm (`A,1`) is refused and its button says to press the
+  turret's button. Switching off from the dashboard or the button is not a fault,
+  so the dashboard can re-arm after its own switch-off. The S status line reports
+  the latch as its 8th field, and `/control.json` as `arduino.needs_button`.
 - **Pi faults go home.** A failed camera frame or a face-model error commands
   exactly home. A stale AI target makes the control loop send park lines.
 - **Home is pan 90, tilt 0.** Pan rests facing forward and tracks 15 to 165
@@ -103,8 +116,8 @@ arduino-cli compile --fqbn arduino:zephyr:unoq arduino/medusa_controller
 arduino-cli upload -p <port> --fqbn arduino:zephyr:unoq arduino/medusa_controller
 ```
 
-It always boots disarmed. Press the D2 button to arm; the red LED is lit while
-armed. Pins and power are in [docs/wiring-diagram.md](docs/wiring-diagram.md).
+It always boots disarmed and latched: the first arm after boot (or after any
+fault) takes the D2 button, not the dashboard. The red LED is lit while armed. Pins and power are in [docs/wiring-diagram.md](docs/wiring-diagram.md).
 
 ### 2. Start the Pi (QNX 8)
 

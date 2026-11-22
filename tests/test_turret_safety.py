@@ -43,7 +43,13 @@ class StatusLineGateTests(unittest.TestCase):
         parking, idle = parse_status_line("S,0,350,900,10,1,1"), parse_status_line("S,1,350,900,11,1,0")
         self.assertEqual((parking.armed, parking.gate_closed, parking.parking), (False, True, True))
         self.assertEqual((idle.armed, idle.parking), (True, False))
-        for line in ("S,1,450,900,8,2", "S,1,450,900,8,", "S,1,450,900,8,1,2", "S,1,450,900,8,1,1,1"):
+        self.assertIsNone(idle.latched)  # no latched field: unknown (older firmware)
+        latched = parse_status_line("S,0,900,0,12,1,0,1")
+        self.assertEqual((latched.armed, latched.gate_closed, latched.parking, latched.latched),
+                         (False, True, False, True))
+        self.assertFalse(parse_status_line("S,1,900,0,13,1,0,0").latched)
+        for line in ("S,1,450,900,8,2", "S,1,450,900,8,", "S,1,450,900,8,1,2", "S,1,450,900,8,1,1,2",
+                     "S,1,450,900,8,1,1,1,1"):
             with self.subTest(line=line):
                 self.assertIsNone(parse_status_line(line))
 

@@ -6,10 +6,11 @@ priority (QNX: ``on -p 21 python3 -u medusa_control.py ...``; every thread it
 starts inherits that priority) so the Arduino heartbeat never depends on the
 AI loop. Each tick it:
 
-1. reads the firmware's ``S,<armed>,<pan_x10>,<tilt_x10>,<seq>[,<gate>[,<parking>]]``
+1. reads the firmware's ``S,<armed>,<pan_x10>,<tilt_x10>,<seq>[,<gate>[,<parking>[,<latched>]]]``
    status lines (gate 1: kill gate closed, servo power on; parking 1: the firmware
-   lost the heartbeat while armed and is gliding home before it goes limp; older
-   firmware sends neither; latest wins; anything else, such as the Zephyr boot
+   lost the heartbeat while armed and is gliding home before it goes limp; latched 1:
+   a fault happened and only the turret's physical button can re-arm it, A,1 is
+   refused; older firmware sends fewer fields; latest wins; anything else, such as the Zephyr boot
    banner, is ignored);
 2. drains ``medusa-target`` packets from the AI process (latest wins);
 3. sends ``N,yaw_x10,pitch_x10,led,seq`` (tenths of a degree) with the AI's
@@ -28,11 +29,12 @@ IPC is localhost UDP JSON: simple and works on QNX's io-sock today. QNX native
 message passing (MsgSend/MsgReceive, priority-inheriting) would be the
 production choice, but has no binding in the stock Python build.
 
-The loop runs in the main thread; the HTTP status server, the stress-test
-timer run in daemon threads that are almost always blocked. Pi usage (CPU,
-memory, temperature) is sampled by medusa_sysmon.py, a separate priority-10
-process; /control.json only reads the file it writes. The GIL switch
-interval is shortened so a waking loop thread gets the interpreter quickly.
+The loop runs in the main thread; the HTTP status server runs in one daemon
+thread that is almost always blocked. This process never forks or execs: Pi
+usage (CPU, memory, temperature) is sampled by medusa_sysmon.py, a separate
+priority-10 process, and the CPU stress workers are spawned by that process too
+(POST /stress only sends it a UDP datagram; see medusa/stress.py). The GIL
+switch interval is shortened so a waking loop thread gets the interpreter quickly.
 """
 
 from __future__ import annotations
@@ -41,18 +43,17 @@ import json
 import math
 import os
 import re
-import shutil
 import socket
-import subprocess
 import sys
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from .stress import StressClient
 from .sysmon import DEFAULT_SYSTEM_FILE, SYSTEM_KEYS, on_qnx
 
 SYSTEM_STALE_S = 10.0
@@ -70,8 +71,9 @@ LATE_S = 0.005            # a tick starting more than 5 ms after its deadline mi
 WINDOW_S = 10.0
 STRESS_MAX_S = 60
 _MAX_PACKETS_PER_TICK = 64
+_MAX_TARGETS_PER_TICK = 16  # the AI sends <= 30 a second: the loop drains them all at 50 Hz
 _MAX_LINE = 128
-_STATUS_LINE = re.compile(r"S,([01]),(-?\d{1,5}),(-?\d{1,5}),(\d{1,10})(?:,([01])(?:,([01]))?)?")
+_STATUS_LINE = re.compile(r"S,([01]),(-?\d{1,5}),(-?\d{1,5}),(\d{1,10})(?:,([01])(?:,([01])(?:,([01]))?)?)?")
 _COMMAND_LINE = re.compile(r"([MN]),(-?\d+),(-?\d+),(-?\d+)(?:,(\d+))?")
 
 
@@ -138,17 +140,20 @@ class ArduinoStatus:
     seq: int
     gate_closed: bool | None = None  # None: a 5-field line from firmware without the kill-gate sense
     parking: bool = False  # link lost while armed: gliding home, then limp (7-field line only)
+    latched: bool | None = None  # fault latch: only the physical button re-arms (8-field line only)
 
 
 def parse_status_line(line: str) -> ArduinoStatus | None:
     """``S,armed,pan_x10,tilt_x10,seq``, the 6-field form with ``,gate`` (1 closed, 0 open),
-    or the 7-field form with ``,gate,parking`` (1: gliding home after a lost heartbeat)."""
+    the 7-field form with ``,gate,parking`` (1: gliding home after a lost heartbeat), or the
+    8-field form with ``,gate,parking,latched`` (1: a fault latched; the button must be pressed)."""
     match = _STATUS_LINE.fullmatch(line.strip())
     if match is None:
         return None
-    armed, pan, tilt, seq, gate, parking = match.groups()
+    armed, pan, tilt, seq, gate, parking, latched = match.groups()
     return ArduinoStatus(armed == "1", int(pan) / 10, int(tilt) / 10, int(seq),
-                         None if gate is None else gate == "1", parking == "1")
+                         None if gate is None else gate == "1", parking == "1",
+                         None if latched is None else latched == "1")
 
 
 class StatusReader:
@@ -321,61 +326,48 @@ class TickStats:
                 "period_ms_max": round(max(periods) * 1000, 3)}
 
 
-# --- CPU stress test ------------------------------------------------------------------------
+class TickTiming:
+    """Where each tick's time goes, for control.json's ``timing`` block (a diagnostic).
 
-_BUSY_LOOP = "import sys, time\nend = time.monotonic() + float(sys.argv[1])\nwhile time.monotonic() < end:\n    pass\n"
-
-
-class StressTest:
-    """Busy-loop worker processes at NORMAL priority, to show the control loop is not disturbed.
-
-    The workers would inherit this process's priority (21), so on QNX they are
-    started through ``on -p <priority>`` (default 10, the AI process's level).
+    work: the whole tick; serial: reading S lines and writing N/M/A lines; udp: draining AI
+    targets and sending medusa-actual. late: how long after its deadline a tick started (sleep
+    overshoot plus waiting for the GIL). A late tick (> LATE_S) is also counted as
+    ``late_ticks_http`` when an HTTP request was being served between its deadline and its
+    start: then the HTTP thread held the GIL the loop needed.
     """
 
-    def __init__(self, workers: int = 4, priority: int = 10, *, clock=time.monotonic,
-                 popen=subprocess.Popen) -> None:
-        self.workers, self.priority = workers, priority
-        self.clock, self.popen = clock, popen
-        self.procs: list = []
-        self.ends_at: float | None = None
-        self._timer: threading.Timer | None = None
+    def __init__(self, period_s: float = PERIOD_S, window_s: float = WINDOW_S, late_s: float = LATE_S) -> None:
+        self.late_s = late_s
+        size = max(1, int(round(window_s / period_s)))
+        self._ticks: deque[tuple[float, float, float]] = deque(maxlen=size)  # (work, serial, udp) seconds
+        self._late: deque[tuple[float, bool]] = deque(maxlen=size)  # (lateness, HTTP active meanwhile)
         self.lock = threading.Lock()
 
-    def command(self, seconds: float) -> list[str]:
-        command = [sys.executable, "-c", _BUSY_LOOP, str(seconds)]
-        if on_qnx() and shutil.which("on"):
-            command = ["on", "-p", str(self.priority)] + command
-        return command
-
-    def start(self, seconds: float) -> None:
-        self.stop()
+    def record_tick(self, work: float, serial: float, udp: float) -> None:
         with self.lock:
-            self.procs = [self.popen(self.command(seconds), stdin=subprocess.DEVNULL,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                          for _ in range(self.workers)]
-            self.ends_at = self.clock() + seconds
-            self._timer = threading.Timer(seconds, self.stop)
-            self._timer.daemon = True
-            self._timer.start()
+            self._ticks.append((work, serial, udp))
 
-    def stop(self) -> None:
+    def record_late(self, late: float, http_active: bool) -> None:
         with self.lock:
-            procs, self.procs, self.ends_at = self.procs, [], None
-            if self._timer is not None and self._timer is not threading.current_thread():
-                self._timer.cancel()
-            self._timer = None
-        for proc in procs:
-            if proc.poll() is None:
-                proc.kill()
-            proc.wait()
+            self._late.append((max(0.0, late), http_active))
 
-    def status(self) -> dict:
+    @staticmethod
+    def _p99_ms(values) -> float | None:
+        if not values:
+            return None
+        values = sorted(values)
+        return round(values[max(0, math.ceil(0.99 * len(values)) - 1)] * 1000, 3)
+
+    def summary(self) -> dict:
         with self.lock:
-            ends_at = self.ends_at
-            running = ends_at is not None and any(p.poll() is None for p in self.procs)
-        left = max(0, math.ceil(ends_at - self.clock())) if running else 0
-        return {"running": running, "seconds_left": left, "workers": self.workers if running else 0}
+            ticks, late = list(self._ticks), list(self._late)
+        late_ticks = [http for value, http in late if value > self.late_s]
+        return {"work_ms_p99": self._p99_ms([t[0] for t in ticks]),
+                "serial_ms_p99": self._p99_ms([t[1] for t in ticks]),
+                "udp_ms_p99": self._p99_ms([t[2] for t in ticks]),
+                "work_ms_max": round(max(t[0] for t in ticks) * 1000, 3) if ticks else None,
+                "late_ms_p99": self._p99_ms([value for value, _ in late]),
+                "late_ticks": len(late_ticks), "late_ticks_http": sum(late_ticks)}
 
 
 # --- Pi usage, sampled by medusa_sysmon.py (a separate priority-10 process) -----------------
@@ -425,7 +417,7 @@ class ControlLoop:
         self, serial, *, target_sock=None, actual_sock=None, actual_addr=None,
         period_s: float = PERIOD_S, target_timeout: float = TARGET_TIMEOUT_S,
         link_timeout: float = LINK_TIMEOUT_S, yaw_range=(65, 115), pitch_range=(65, 115),
-        home=(90, 90), window_s: float = WINDOW_S, stress: StressTest | None = None,
+        home=(90, 90), window_s: float = WINDOW_S, stress: StressClient | None = None,
         clock=system_clock, sleep=time.sleep,
     ) -> None:
         self.serial, self.target_sock = serial, target_sock
@@ -434,6 +426,10 @@ class ControlLoop:
         self.yaw_range, self.pitch_range = yaw_range, pitch_range
         self.home_yaw, self.home_pitch = home
         self.stats = TickStats(period_s, window_s)
+        self.timing = TickTiming(period_s, window_s)
+        # Set by the HTTP thread around each request (system_clock times), read by run().
+        self.http_active = False
+        self.http_last_end = -math.inf
         self.stress = stress
         self.clock, self.sleep = clock, sleep
         self.reader = StatusReader()
@@ -474,13 +470,21 @@ class ControlLoop:
 
     def tick(self, now: float) -> bytes:
         """One control step at ``now``; returns the line written to the Arduino."""
+        perf = time.perf_counter
+        t0 = perf()
         for status in self.reader.feed(self.serial.read()):
             self.status, self.status_at = status, now  # Latest wins.
+        t1 = perf()
         if self.target_sock is not None:
-            for payload in _drain(self.target_sock):
+            # Latest wins, so only the newest valid packet is parsed (newest first): no JSON
+            # work for packets that would be overwritten in the same tick.
+            payloads = list(_drain(self.target_sock, _MAX_TARGETS_PER_TICK))
+            for payload in reversed(payloads):
                 target = parse_target_packet(payload)
                 if target is not None:
                     self.target, self.target_at = target, now
+                    break
+        t2 = perf()
         self.sequence += 1
         if self.target_fresh(now) and not self.gate_open(now):
             target = self.target
@@ -497,11 +501,14 @@ class ControlLoop:
             self.sequence += 1
             if not self.serial.write(format_a_line(arm, self.sequence)):
                 self.write_failures += 1
+        t3 = perf()
         if self.actual_sock is not None and self.actual_addr is not None:
             try:
                 self.actual_sock.sendto(self.actual_packet(now), self.actual_addr)
             except OSError:
                 pass  # The AI process is not listening yet; it is optional.
+        t4 = perf()
+        self.timing.record_tick(t4 - t0, (t1 - t0) + (t3 - t2), (t2 - t1) + (t4 - t3))
         self.ticks += 1
         return line
 
@@ -529,6 +536,7 @@ class ControlLoop:
         armed = bool(link_ok and status and status.armed)
         parking = bool(link_ok and status and status.parking)
         gate_closed = status.gate_closed if link_ok and status else None
+        needs_button = status.latched if link_ok and status else None
         if not link_ok:
             reason = "Arduino link lost" if status_at is not None else "no Arduino status yet"
         elif gate_closed is False:
@@ -553,10 +561,12 @@ class ControlLoop:
             "ai_alive": target_age is not None and target_age < AI_ALIVE_S,
             "arduino": {
                 "link_ok": link_ok, "armed": armed, "parking": parking, "gate_closed": gate_closed,
+                "needs_button": needs_button,
                 "pan": status.pan if status else None, "tilt": status.tilt if status else None,
                 "age_s": None if status_at is None else round(now - status_at, 3),
             },
             "stress": self.stress.status() if self.stress else {"running": False, "seconds_left": 0},
+            "timing": self.timing.summary(),
             "write_failures": self.write_failures,
         }
         return result
@@ -568,6 +578,7 @@ class ControlLoop:
         while not stop.is_set() and (max_ticks is None or self.ticks < max_ticks):
             start = self.clock()
             self.stats.record(start, deadline, skipped)
+            self.timing.record_late(start - deadline, self.http_active or self.http_last_end >= deadline)
             self.tick(start)
             deadline += self.period_s
             now = self.clock()
@@ -586,6 +597,25 @@ class ControlLoop:
             self.serial.write(self.park_line())
 
 
+def set_thread_priority(priority: int) -> bool:
+    """Set the CALLING thread's priority (QNX: pthread_setschedprio via ctypes); False if not possible.
+
+    Checked on the Pi (QNX 8, Python 3.14): it returns 0 and changes only that thread.
+    Elsewhere, or if the call fails, the thread keeps the priority it inherited.
+    """
+    if not on_qnx():
+        return False
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None)
+        libc.pthread_self.restype = ctypes.c_ulong
+        libc.pthread_setschedprio.argtypes = [ctypes.c_ulong, ctypes.c_int]
+        return libc.pthread_setschedprio(libc.pthread_self(), int(priority)) == 0
+    except (OSError, AttributeError, ValueError):
+        return False
+
+
 # --- HTTP status server ---------------------------------------------------------------------
 
 class ControlHTTPServer:
@@ -596,7 +626,8 @@ class ControlHTTPServer:
     """
 
     def __init__(self, loop: ControlLoop, port: int = DEFAULT_HTTP_PORT, host: str = "0.0.0.0",
-                 stress_max: int = STRESS_MAX_S, system_file: SystemStatusFile | None = None) -> None:
+                 stress_max: int = STRESS_MAX_S, system_file: SystemStatusFile | None = None,
+                 thread_priority: int | None = None) -> None:
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, _format, *_args):
                 return
@@ -612,6 +643,14 @@ class ControlHTTPServer:
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
+
+            def handle_one_request(self) -> None:
+                loop.http_active = True  # for the late-tick diagnostic (TickTiming)
+                try:
+                    super().handle_one_request()
+                finally:
+                    loop.http_active = False
+                    loop.http_last_end = loop.clock()
 
             def do_OPTIONS(self) -> None:
                 self._reply(HTTPStatus.NO_CONTENT)
@@ -643,16 +682,28 @@ class ControlHTTPServer:
                 if not 0 <= seconds <= stress_max:  # Also rejects NaN.
                     self._reply(HTTPStatus.BAD_REQUEST, {"error": f"seconds must be 0..{stress_max}"})
                     return
-                if seconds == 0:
-                    loop.stress.stop()
-                else:
-                    loop.stress.start(seconds)
-                self._reply(HTTPStatus.OK, {"stress": loop.stress.status()})
+                # One datagram to medusa_sysmon.py (priority 10), which spawns or kills the
+                # workers: no fork/exec here. control.json's stress block shows the outcome.
+                if not loop.stress.available() or not loop.stress.request(seconds):
+                    self._reply(HTTPStatus.SERVICE_UNAVAILABLE,
+                                {"error": "stress runner (medusa_sysmon.py) is not running"})
+                    return
+                self._reply(HTTPStatus.ACCEPTED, {"requested": {"stress_seconds": seconds}})
 
-        self.server = ThreadingHTTPServer((host, port), Handler)
-        self.server.daemon_threads = True
+        # One thread serves every request in turn: no thread is created per request in this
+        # priority-21 process (the threading server made one per dashboard poll, ~5 Hz).
+        # Each request is tiny; a client that stalls is cut off by the handler's timeout.
+        Handler.timeout = 2.0
+        self.server = HTTPServer((host, port), Handler)
         self.port = self.server.server_address[1]
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True, name="control-http")
+        self.thread_priority = thread_priority
+        self.priority_set: bool | None = None  # after start(): did --http-priority apply?
+        self.thread = threading.Thread(target=self._serve, daemon=True, name="control-http")
+
+    def _serve(self) -> None:
+        if self.thread_priority:
+            self.priority_set = set_thread_priority(self.thread_priority)
+        self.server.serve_forever()
 
     def start(self) -> None:
         self.thread.start()
