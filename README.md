@@ -40,8 +40,8 @@ to face them. It was built at Hack Western 13 for the QNX track.
 
 | Piece | File | Job |
 | --- | --- | --- |
-| Laptop detector | `laptop_detector.py`, `medusa/gaze.py`, `medusa/peeper_tracker.py` | Tracks faces across frames, smooths gaze per face, and decides when a peeper is looking. With several peepers it picks the most recent steady look and ignores glances and feints. Sends a UDP heartbeat to the Pi every frame. Switches the Mac to a Google Docs tab, but only while the turret is armed. |
-| Pi AI service | `qnx_ai_service.py`, `medusa/trigger.py`, `medusa/handoff.py`, `medusa/tflite_detector.py` | Finds faces in the turret camera and matches the laptop's peeper against them, so the turret aims at the peeper and not the user. Tracks with proportional pan. If the turret loses the face, it aims from the laptop's view through a pan map it learns as it tracks, then sweeps. |
+| Laptop detector | `laptop_detector.py`, `medusa/gaze.py`, `medusa/peeper_tracker.py`, `medusa/zoom.py` | Finds small, distant and masked faces with OpenCV YuNet, then reads zoomed crops with MediaPipe (faces found out to ~10 m on downscaled clips). Tracks faces across frames, smooths gaze per face, and decides when a peeper is looking. With several peepers it picks the most recent steady look and ignores glances and feints. Sends a UDP heartbeat to the Pi every frame. Switches the Mac to a Google Docs tab, but only while the turret is armed. |
+| Pi AI service | `qnx_ai_service.py`, `medusa/trigger.py`, `medusa/handoff.py`, `medusa/tflite_detector.py` | Finds faces in the turret camera with TensorFlow Lite (BlazeFace) and matches the laptop's peeper against them, so the turret aims at the peeper and not the user. Tracks with proportional pan. If the turret loses the face, it keeps aiming from the laptop's view through a pan map it learns as it tracks: it glides there without a jump, leads a moving peeper, searches around the map's guess when the map is wrong, and holds 1 s before heading home. Opt-in extras: `--face-model back+yunet` (OpenCV YuNet as a fallback behind TFLite for masked and small faces), `--head-fallback` (head from profile, upper-body and HOG person detectors), `--fusion` (one Kalman bearing from both cameras, map per distance band). |
 | Pi control process | `medusa_control.py`, `medusa/control.py` | The only owner of the serial port. Runs a fixed 50 Hz loop on absolute deadlines. It forwards fresh AI targets (under 0.3 s old) and otherwise sends a park line, so the Arduino heartbeat never depends on the AI. |
 | UNO Q firmware | `arduino/medusa_controller/medusa_controller.ino` | Eases the servos (speed and acceleration limits) and enforces angle limits. Arming, disarming, the watchdog and the kill gate all live here. |
 | Dashboard | `dashboard/` | Both camera views, the decision, and a safety panel: link lights, loop rate and jitter, arm and gate state, and a CPU stress button. |
@@ -53,14 +53,17 @@ and run on the device.
 
 The control process runs at priority 21 (`on -p 21`) and the AI process at the
 default 10. When the dashboard's stress test (`POST :8082/stress?seconds=N`)
-saturates the CPU with busy loops at priority 10, the AI drops from 13.7 to
-0.5 fps. The control loop is unaffected:
+saturates the CPU with four busy loops at priority 10, the AI drops from about
+13 fps to 1 fps. The control loop is unaffected. Measured on the Pi on 22 Nov
+(the latest run had the Arduino unplugged; see `docs/qnx-criteria.md`):
 
-| Measurement | Result |
-| --- | --- |
-| Control loop period | 20.00 ms (50 Hz) |
-| p99 jitter, idle and under the CPU hog | 1–2 ms |
-| AI frame rate, idle → under the CPU hog | 13.7 → 0.5 fps |
+| Measurement | Idle | Under the CPU hog (20 s) |
+| --- | --- | --- |
+| Control loop rate | 50.0 Hz | 50.0 Hz |
+| p99 period jitter | 0.06–0.6 ms | 2.0 ms |
+| Worst period | 20.7 ms | 22.0 ms |
+| Missed deadlines | 0 | 0 |
+| AI frame rate | ~13 fps | ~1 fps |
 
 The loop runs on absolute deadlines, so a late tick does not push the next one
 later. Its one HTTP thread inherits priority 21, and the GIL switch interval is set to
