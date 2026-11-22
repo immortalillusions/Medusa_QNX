@@ -13,28 +13,27 @@ to face them. It was built at Hack Western 13 for the QNX track.
   centred.
 - **An Arduino UNO Q moves the servos** and holds the safety rules: an arm
   button, a kill gate, a heartbeat watchdog, and a glide home on any fault.
-- **A hard real-time control loop** runs at 50 Hz and keeps its timing while
+- **A real-time control loop on QNX** runs at 50 Hz and keeps its timing while
   the AI process is starved of CPU.
 
 ## Architecture
 
 ```text
- MacBook                               Raspberry Pi 5, QNX 8
- ───────                               ─────────────────────
- webcam → laptop_detector.py           qnx_ai_service.py   (priority 10)
-   MediaPipe landmarks + gaze            C270 on the pan turret
-   peeper tracker                        TFLite BlazeFace "back" model + OpenCV
-   Google Docs switch ─────┐             peeper matching, pan tracking,
-        │                  │             laptop-guided fallback, learned pan map
-        │ UDP 8767         │                    │ UDP 8768 targets  ▲ UDP 8769 actual angles
-        │ medusa-peeper    │                    ▼                   │
-        └──────────────────┼──────────▶ medusa_control.py   (on -p 21, 50 Hz)
-                           │             owns /dev/ser1, heartbeat, /control.json
-     armed? (GET :8082) ◀──┘                    │ UART 115200: N/M lines out, S status in
+ MacBook                                  Raspberry Pi 5, QNX 8
+ ───────                                  ─────────────────────
+ laptop_detector.py ─── UDP 8767 ───────▶ qnx_ai_service.py        (priority 10)
+   webcam, MediaPipe     medusa-peeper      C270 on the pan turret, BlazeFace "back"
+   landmarks + gaze                         peeper matching, pan tracking,
+   peeper tracker                           laptop-guided fallback, learned pan map
+   Google Docs switch                           │ UDP 8768 target   ▲ UDP 8769 actual angle
+        ▲                                       ▼                   │
+        └──── armed? GET :8082 ──────────  medusa_control.py        (on -p 21, 50 Hz)
+                                            owns /dev/ser1, heartbeat, /control.json
+                                                │ UART 115200: N/M lines out, S status in
                                                 ▼
-                                       Arduino UNO Q: medusa_controller.ino
-                                         eased pan/tilt servos, arm button,
-                                         A2 kill gate, 300 ms watchdog
+                                           Arduino UNO Q: medusa_controller.ino
+                                            eased servos, arm button, A2 kill gate,
+                                            300 ms watchdog
 
  dashboard/ (Next.js, :3000) reads laptop :8081, Pi AI :8080, Pi control :8082
 ```
