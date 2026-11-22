@@ -73,9 +73,10 @@ class HeartbeatTests(unittest.TestCase):
         first, address = sock.sent[0]
         self.assertEqual(address, ("10.0.0.2", 8767))
         self.assertEqual(first, {"type": "medusa-peeper", "active": False,
-                                 "target_x": None, "target_y": None, "seq": 1})
+                                 "target_x": None, "target_y": None, "seq": 1,
+                                 "user_x": (400 + 200) / 1280})
         last, _ = sock.sent[-1]
-        self.assertEqual(set(last), {"type", "active", "target_x", "target_y", "seq"})
+        self.assertEqual(set(last), {"type", "active", "target_x", "target_y", "seq", "user_x"})
         self.assertTrue(last["active"])
         self.assertEqual(last["seq"], frames)
         self.assertAlmostEqual(last["target_x"], (1000 + 60) / 1280)
@@ -87,6 +88,15 @@ class HeartbeatTests(unittest.TestCase):
         detector.step([], 1280, 720)
         detector.step([], 1280, 720)
         self.assertEqual([p["active"] for p, _ in sock.sent], [False, False])
+        self.assertNotIn("user_x", sock.sent[-1][0])  # optional: only sent with a user face
+
+    def test_user_x_is_the_largest_face_wherever_it_sits(self):
+        detector, sock, _, _ = make_detector()
+        detector.step([PEEPER, USER], 1280, 720)  # order in the frame does not matter
+        self.assertAlmostEqual(sock.sent[-1][0]["user_x"], (400 + 200) / 1280)
+        alone, sock, _, _ = make_detector()
+        alone.step([PEEPER], 1280, 720)  # alone, the small face is the user
+        self.assertAlmostEqual(sock.sent[-1][0]["user_x"], (1000 + 60) / 1280)
 
     def test_send_errors_do_not_raise(self):
         sock = MagicMock()
@@ -115,6 +125,7 @@ class DecisionTests(unittest.TestCase):
 
     def test_rising_edge_triggers_docs_once(self):
         detector, _, _, _ = make_detector()
+        detector.docs_always = True
         detector.action = laptop_detector.PrivacyAction(enabled=True)
         with patch("medusa.actions._switch_to_docs", return_value="focused chrome") as switch, \
                 patch("medusa.actions.webbrowser.open_new_tab") as browser:
@@ -428,6 +439,234 @@ class MainTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
             laptop_detector.main(["--no-pi", "--gaze-pitch-range", "10", "-35"])
         self.assertEqual(raised.exception.code, 2)
+
+    def run_until_ctrl_c(self, argv):
+        modules, camera = self.fake_modules(opened=True)
+        camera.read.side_effect = KeyboardInterrupt
+        with patch.dict(sys.modules, modules), \
+                patch.object(laptop_detector, "PiLink"), \
+                patch.object(laptop_detector, "PreviewServer"), \
+                patch.object(laptop_detector, "PrivacyAction"), \
+                patch.object(laptop_detector, "TurretPoller") as poller, \
+                patch.object(laptop_detector, "LaptopDetector", wraps=LaptopDetector) as made:
+            self.assertEqual(laptop_detector.main(argv), 0)
+        return poller, made
+
+    def test_turret_is_polled_on_the_pi_by_default_and_gates_docs(self):
+        poller, made = self.run_until_ctrl_c(["--pi-host", "10.0.0.2"])
+        poller.assert_called_once_with("http://10.0.0.2:8082/control.json")
+        poller.return_value.start.assert_called_once()
+        poller.return_value.stop.assert_called_once()
+        self.assertIs(made.call_args.kwargs["turret"], poller.return_value)
+        self.assertFalse(made.call_args.kwargs["docs_always"])
+
+    def test_control_url_and_docs_always_flags(self):
+        poller, made = self.run_until_ctrl_c(["--no-pi", "--docs-always",
+                                              "--control-url", "http://pi.local:9/c.json"])
+        poller.assert_called_once_with("http://pi.local:9/c.json")
+        self.assertTrue(made.call_args.kwargs["docs_always"])
+
+    def test_no_pi_without_control_url_polls_nothing(self):
+        poller, made = self.run_until_ctrl_c(["--no-pi"])
+        poller.assert_not_called()
+        self.assertIsNone(made.call_args.kwargs["turret"])
+
+
+class FakeResponse(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def control(link_ok=True, armed=True, **gate):
+    return {"state": "SAFE", "arduino": {"link_ok": link_ok, "armed": armed, "pan": 90, **gate}}
+
+
+class TurretPollerTests(unittest.TestCase):
+    def poller(self, *answers):
+        """answers: dicts (served as JSON), bytes (served raw) or exceptions (raised)."""
+        self.now = 0.0
+        self.calls = []
+        queue = list(answers)
+
+        def opener(url, timeout):
+            self.calls.append((url, timeout))
+            answer = queue.pop(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            return FakeResponse(answer if isinstance(answer, bytes) else json.dumps(answer).encode())
+
+        return laptop_detector.TurretPoller("http://pi:8082/control.json", opener=opener,
+                                            clock=lambda: self.now)
+
+    def test_armed_with_gate_closed_is_on(self):
+        poller = self.poller(control(gate_closed=True))
+        self.assertTrue(poller.poll_once())
+        self.assertEqual(poller.status(), (True, "armed, gate closed"))
+        self.assertEqual(self.calls, [("http://pi:8082/control.json", 1.0)])
+
+    def test_gate_open_disarmed_or_link_down_is_off(self):
+        poller = self.poller(control(gate_closed=False), control(armed=False, gate_closed=True),
+                             control(link_ok=False, gate_closed=True))
+        for reason in ("gate open", "disarmed", "Arduino link down"):
+            self.assertFalse(poller.poll_once())
+            self.assertEqual(poller.status(), (False, reason))
+
+    def test_missing_or_null_gate_counts_as_closed_only_when_armed(self):
+        poller = self.poller(control(), control(gate_closed=None), control(armed=False),
+                             control(armed=None))
+        self.assertEqual([poller.poll_once() for _ in range(4)], [True, True, False, False])
+
+    def test_unreachable_or_malformed_turns_it_off_at_once(self):
+        import urllib.error
+        poller = self.poller(control(gate_closed=True), urllib.error.URLError("timed out"),
+                             control(gate_closed=True), b"<html>", control(True, True)["arduino"],
+                             control(gate_closed=True), OSError("refused"))
+        results = []
+        for _ in range(7):
+            poller.poll_once()
+            results.append(poller.status()[0])
+        self.assertEqual(results, [True, False, True, False, False, True, False])
+        self.assertIn("refused", poller.status()[1])
+
+    def test_a_good_read_older_than_two_seconds_is_off(self):
+        poller = self.poller(control(gate_closed=True))
+        poller.poll_once()
+        self.now = 2.0
+        self.assertTrue(poller.status()[0])
+        self.now = 2.01
+        self.assertEqual(poller.status(), (False, "control.json stale"))
+
+    def test_off_before_the_first_read(self):
+        self.assertEqual(self.poller().status(), (False, "no control.json read yet"))
+
+    def test_daemon_thread_polls_until_stopped(self):
+        import threading
+        polled = threading.Event()
+        answers = [control(gate_closed=True)] * 1000
+        poller = self.poller(*answers)
+        poller.interval_s = 0.001
+        original = poller.poll_once
+
+        def poll():
+            result = original()
+            if len(self.calls) >= 3:
+                polled.set()
+            return result
+
+        poller.poll_once = poll
+        poller.start()
+        self.assertTrue(poller._thread.daemon)
+        self.assertTrue(polled.wait(2))
+        poller.stop()
+        poller._thread.join(2)
+        self.assertFalse(poller._thread.is_alive())
+        self.assertTrue(poller.status()[0])
+
+
+class FakeTurret:
+    def __init__(self, on=False):
+        self.on = on
+
+    def status(self):
+        return self.on, "armed, gate closed" if self.on else "disarmed"
+
+
+class DocsGateTests(unittest.TestCase):
+    def setUp(self):
+        self.turret = FakeTurret()
+        self.detector, _, _, self.preview = make_detector()
+        self.detector.turret = self.turret
+        self.detector.action = laptop_detector.PrivacyAction(enabled=True)
+        switch = patch("medusa.actions._switch_to_docs", return_value="focused chrome")
+        browser = patch("medusa.actions.webbrowser.open_new_tab")
+        self.switch, self.browser = switch.start(), browser.start()
+        self.addCleanup(switch.stop)
+        self.addCleanup(browser.stop)
+
+    def frames(self, n, peeper=True):
+        for _ in range(n):
+            self.detector.step([USER, PEEPER] if peeper else [USER], 1280, 720)
+        pending = getattr(self.detector.action, "_pending", None)
+        if pending is not None:
+            pending.result(timeout=2)
+        return self.switch.call_count + self.browser.call_count
+
+    def test_turret_on_then_peeper_switches_once(self):
+        self.turret.on = True
+        self.assertEqual(self.frames(ENTER_FRAMES - 1), 0)
+        self.assertEqual(self.frames(1), 1)
+        self.assertEqual(self.frames(10), 1)
+
+    def test_peeper_while_off_does_not_switch_until_the_turret_turns_on(self):
+        self.assertEqual(self.frames(ENTER_FRAMES + 10), 0)
+        self.assertTrue(self.detector.active)
+        self.turret.on = True
+        self.assertEqual(self.frames(1), 1)
+        self.assertEqual(self.frames(10), 1)
+
+    def test_turret_flicker_mid_encounter_does_not_switch_again(self):
+        self.turret.on = True
+        self.assertEqual(self.frames(ENTER_FRAMES), 1)
+        self.turret.on = False
+        self.frames(3)
+        self.turret.on = True
+        self.assertEqual(self.frames(10), 1)
+
+    def test_turret_on_after_the_peeper_left_waits_for_the_next_encounter(self):
+        self.assertEqual(self.frames(ENTER_FRAMES), 0)
+        self.assertEqual(self.frames(AWAY_FRAMES, peeper=False), 0)
+        self.assertFalse(self.detector.active)
+        self.turret.on = True
+        self.assertEqual(self.frames(5, peeper=False), 0)
+        self.assertEqual(self.frames(ENTER_FRAMES), 1)
+        self.assertEqual(self.frames(AWAY_FRAMES, peeper=False), 1)
+        self.assertEqual(self.frames(ENTER_FRAMES), 2)  # a new encounter switches again
+
+    def test_no_turret_poll_means_off(self):
+        self.detector.turret = None
+        self.assertEqual(self.frames(ENTER_FRAMES + 5), 0)
+
+    def test_docs_always_bypasses_the_gate(self):
+        self.detector.docs_always = True
+        self.assertEqual(self.frames(ENTER_FRAMES), 1)
+        self.assertEqual(self.preview.update_status.call_args[1]["extra"]["docs_enabled"], True)
+        self.assertEqual(self.preview.update_status.call_args[1]["extra"]["turret_on"], False)
+
+    def test_no_browser_wins_over_docs_always_and_turret_on(self):
+        self.detector.action = laptop_detector.PrivacyAction(enabled=False)
+        self.detector.docs_always = True
+        self.turret.on = True
+        self.assertEqual(self.frames(ENTER_FRAMES + 5), 0)
+        self.assertFalse(self.preview.update_status.call_args[1]["extra"]["docs_enabled"])
+
+    def test_detection_and_heartbeats_run_while_the_turret_is_off(self):
+        detector, sock, _, _ = make_detector()
+        detector.turret = self.turret
+        for _ in range(ENTER_FRAMES):
+            detector.step([USER, PEEPER], 1280, 720)
+        self.assertEqual(len(sock.sent), ENTER_FRAMES)
+        self.assertTrue(sock.sent[-1][0]["active"])
+
+    def test_status_reports_turret_and_docs_and_logs_each_change(self):
+        with self.assertLogs("laptop_detector", "INFO") as logs:
+            self.frames(2, peeper=False)
+            extra = self.preview.update_status.call_args[1]["extra"]
+            self.assertEqual((extra["turret_on"], extra["docs_enabled"]), (False, False))
+            self.turret.on = True
+            self.frames(3, peeper=False)
+            extra = self.preview.update_status.call_args[1]["extra"]
+            self.assertEqual((extra["turret_on"], extra["docs_enabled"]), (True, True))
+            self.turret.on = False
+            self.frames(3, peeper=False)
+        lines = [line for line in logs.output if "turret" in line]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("turret ON (armed, gate closed): docs switching enabled", lines[0])
+        self.assertIn("turret OFF (disarmed): docs switching paused", lines[1])
+        json.dumps(extra)
+
 
 if __name__ == "__main__":
     unittest.main()

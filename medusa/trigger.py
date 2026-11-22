@@ -472,8 +472,10 @@ class PanTracker:
     Real angle: observe_actual() feeds the pan angle the firmware reports. While
     that report is fresh (``actual_timeout``), the turret's position at frame
     capture is the real angle carried forward by the model's motion since the
-    report, instead of the model alone. A report that the turret is disarmed
-    resets to home every frame, so nothing winds up while the firmware ignores us.
+    report, instead of the model alone. A report that the turret is disarmed, or
+    that its kill gate is open, resets to home every frame, so nothing winds up
+    (and fallback does not run) while the firmware ignores us; its servos are
+    detached then, so the reset itself moves nothing.
     """
 
     def __init__(
@@ -506,7 +508,7 @@ class PanTracker:
         self.search_speed, self.handoff_timeout, self.actual_timeout = search_speed, handoff_timeout, actual_timeout
         self.servo = FirmwareAxisModel(self.home, self.minimum, self.maximum)
         self._last_now: float | None = None
-        self.actual: tuple[float, float, bool] | None = None  # (time, real pan, armed)
+        self.actual: tuple[float, float, bool] | None = None  # (time, real pan, live: armed, gate not open)
         self.reset()
 
     def reset(self) -> None:
@@ -527,9 +529,14 @@ class PanTracker:
     def _clamp(self, angle: float) -> float:
         return max(self.minimum, min(self.maximum, angle))
 
-    def observe_actual(self, pan: float | None, at: float | None, armed: bool | None = True) -> None:
-        """Record the firmware's reported pan angle (degrees) and when it was read."""
-        self.actual = None if pan is None or at is None else (at, float(pan), armed is not False)
+    def observe_actual(self, pan: float | None, at: float | None, armed: bool | None = True,
+                       gate_closed: bool | None = None) -> None:
+        """Record the firmware's reported pan angle (degrees) and when it was read.
+
+        The turret is live unless the report says disarmed or the kill gate open.
+        """
+        live = armed is not False and gate_closed is not False
+        self.actual = None if pan is None or at is None else (at, float(pan), live)
 
     def _actual_fresh(self, now: float) -> bool:
         return self.actual is not None and now - self.actual[0] <= self.actual_timeout
@@ -540,7 +547,7 @@ class PanTracker:
         return self._last_now
 
     def real_pan(self) -> float | None:
-        """The firmware's reported pan if it was fresh and armed at the last update, else None."""
+        """The firmware's reported pan if it was fresh and live at the last update, else None."""
         if self._last_now is None or not self._actual_fresh(self._last_now) or not self.actual[2]:
             return None
         return self.actual[1]
@@ -580,7 +587,7 @@ class PanTracker:
         self._last_now = now
         captured = now - self.latency_s
         if self._actual_fresh(now) and not self.actual[2]:
-            self.reset()  # Disarmed: the firmware ignores commands, so do not wind up.
+            self.reset()  # Disarmed or gate open: the firmware ignores commands, so do not wind up.
             return None
         if target_x is None:
             coasting = self.state in ("tracking", "coasting") and self._still_coasting(now)

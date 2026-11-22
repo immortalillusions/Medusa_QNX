@@ -6,11 +6,14 @@ priority (QNX: ``on -p 21 python3 -u medusa_control.py ...``; every thread it
 starts inherits that priority) so the Arduino heartbeat never depends on the
 AI loop. Each tick it:
 
-1. reads the firmware's ``S,<armed>,<pan_x10>,<tilt_x10>,<seq>`` status lines
-   (latest wins; anything else, such as the Zephyr boot banner, is ignored);
+1. reads the firmware's ``S,<armed>,<pan_x10>,<tilt_x10>,<seq>[,<gate>]`` status
+   lines (gate 1: kill gate closed, servo power on; older firmware sends no gate;
+   latest wins; anything else, such as the Zephyr boot banner, is ignored);
 2. drains ``medusa-target`` packets from the AI process (latest wins);
 3. sends ``N,yaw_x10,pitch_x10,led,seq`` (tenths of a degree) with the AI's
-   target while it is fresh, otherwise an ``M`` park line (home angles, LED off);
+   target while it is fresh and the kill gate is not reported open, otherwise an
+   ``M`` park line (home angles, LED off) that only keeps the heartbeat: the
+   firmware ignores motion while disarmed, and its servos are detached then;
 4. sends a ``medusa-actual`` packet back to the AI process, so its pan tracker
    can use where the turret really points.
 
@@ -55,7 +58,7 @@ WINDOW_S = 10.0
 STRESS_MAX_S = 60
 _MAX_PACKETS_PER_TICK = 64
 _MAX_LINE = 128
-_STATUS_LINE = re.compile(r"S,([01]),(-?\d{1,5}),(-?\d{1,5}),(\d{1,10})")
+_STATUS_LINE = re.compile(r"S,([01]),(-?\d{1,5}),(-?\d{1,5}),(\d{1,10})(?:,([01]))?")
 _COMMAND_LINE = re.compile(r"([MN]),(-?\d+),(-?\d+),(-?\d+)(?:,(\d+))?")
 
 
@@ -115,14 +118,17 @@ class ArduinoStatus:
     pan: float   # degrees, eased actual position
     tilt: float
     seq: int
+    gate_closed: bool | None = None  # None: a 5-field line from firmware without the kill-gate sense
 
 
 def parse_status_line(line: str) -> ArduinoStatus | None:
+    """``S,armed,pan_x10,tilt_x10,seq`` or the 6-field form with ``,gate`` (1 closed, 0 open)."""
     match = _STATUS_LINE.fullmatch(line.strip())
     if match is None:
         return None
-    armed, pan, tilt, seq = match.groups()
-    return ArduinoStatus(armed == "1", int(pan) / 10, int(tilt) / 10, int(seq))
+    armed, pan, tilt, seq, gate = match.groups()
+    return ArduinoStatus(armed == "1", int(pan) / 10, int(tilt) / 10, int(seq),
+                         None if gate is None else gate == "1")
 
 
 class StatusReader:
@@ -218,6 +224,7 @@ class ActualStatus:
     pan: float | None
     tilt: float | None
     t: float | None  # when the S line was read, on the receiver's clock (ControlClient converts)
+    gate_closed: bool | None = None  # kill gate: True closed, False open, None unknown
 
 
 def parse_actual_packet(payload: bytes) -> ActualStatus | None:
@@ -227,11 +234,11 @@ def parse_actual_packet(payload: bytes) -> ActualStatus | None:
         return None
     if not isinstance(message, dict) or message.get("type") != ACTUAL_MESSAGE_TYPE:
         return None
-    link_ok, armed = message.get("link_ok"), message.get("armed")
-    if not isinstance(link_ok, bool) or not (armed is None or isinstance(armed, bool)):
+    link_ok, armed, gate = message.get("link_ok"), message.get("armed"), message.get("gate_closed")
+    if not isinstance(link_ok, bool) or not all(v is None or isinstance(v, bool) for v in (armed, gate)):
         return None
     return ActualStatus(link_ok, armed, _number(message.get("pan")), _number(message.get("tilt")),
-                        _number(message.get("t")))
+                        _number(message.get("t")), gate)
 
 
 def _drain(sock, limit: int = _MAX_PACKETS_PER_TICK):
@@ -389,6 +396,10 @@ class ControlLoop:
     def target_fresh(self, now: float) -> bool:
         return self.target_at is not None and now - self.target_at < self.target_timeout
 
+    def gate_open(self, now: float) -> bool:
+        """The firmware's fresh status says the kill gate is open (no servo power)."""
+        return self.link_ok(now) and self.status is not None and self.status.gate_closed is False
+
     def tick(self, now: float) -> bytes:
         """One control step at ``now``; returns the line written to the Arduino."""
         for status in self.reader.feed(self.serial.read()):
@@ -399,12 +410,12 @@ class ControlLoop:
                 if target is not None:
                     self.target, self.target_at = target, now
         self.sequence += 1
-        if self.target_fresh(now):
+        if self.target_fresh(now) and not self.gate_open(now):
             target = self.target
             line = format_n_line(self._clamp(target.yaw, self.yaw_range),
                                  self._clamp(target.pitch, self.pitch_range), target.active, self.sequence)
         else:
-            line = self.park_line()  # The heartbeat continues without the AI: home, LED off.
+            line = self.park_line()  # Heartbeat only (no AI target, or the kill gate open): LED off.
         if not self.serial.write(line):
             self.write_failures += 1
         if self.actual_sock is not None and self.actual_addr is not None:
@@ -424,6 +435,7 @@ class ControlLoop:
             "type": ACTUAL_MESSAGE_TYPE, "link_ok": self.link_ok(now),
             "armed": status.armed if status else None, "pan": status.pan if status else None,
             "tilt": status.tilt if status else None, "seq": status.seq if status else None,
+            "gate_closed": status.gate_closed if status else None,
             "t": self.status_at,  # on this loop's clock: system_clock() in production
         }).encode()
 
@@ -436,8 +448,11 @@ class ControlLoop:
         target_age = None if target_at is None else round(now - target_at, 3)
         fresh = self.target_fresh(now)
         armed = bool(link_ok and status and status.armed)
+        gate_closed = status.gate_closed if link_ok and status else None
         if not link_ok:
             reason = "Arduino link lost" if status_at is not None else "no Arduino status yet"
+        elif gate_closed is False:
+            reason = "kill gate open"
         elif not armed:
             reason = "turret disarmed"
         elif target is None:
@@ -455,7 +470,7 @@ class ControlLoop:
             "target_age_s": target_age,
             "ai_alive": target_age is not None and target_age < AI_ALIVE_S,
             "arduino": {
-                "link_ok": link_ok, "armed": armed,
+                "link_ok": link_ok, "armed": armed, "gate_closed": gate_closed,
                 "pan": status.pan if status else None, "tilt": status.tilt if status else None,
                 "age_s": None if status_at is None else round(now - status_at, 3),
             },
@@ -611,7 +626,8 @@ class ControlClient:
                 if actual is not None:
                     if actual.t is not None:  # Control-process time -> this process's clock.
                         actual = ActualStatus(actual.link_ok, actual.armed, actual.pan, actual.tilt,
-                                              actual.t + (self.clock() - self.remote_clock()))
+                                              actual.t + (self.clock() - self.remote_clock()),
+                                              actual.gate_closed)
                     self.latest_actual = actual
         actual = self.latest_actual
         if actual is None or not actual.link_ok or actual.t is None or actual.pan is None:

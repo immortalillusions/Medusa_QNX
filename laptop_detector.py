@@ -7,6 +7,10 @@ turret with its own camera; target_x/target_y here are informational only.
 
 The decision comes from medusa.peeper_tracker: faces keep an id across frames, gaze is
 smoothed per face, and ACTIVE needs --enter-s of looking and ends after --exit-s away.
+
+The Google Docs switch is gated on the turret being ON (armed, gate closed), read from the
+Pi's /control.json; --docs-always skips the gate. Detection, heartbeats and the preview run
+either way.
 """
 
 from __future__ import annotations
@@ -16,7 +20,9 @@ import json
 import logging
 import socket
 import sys
+import threading
 import time
+import urllib.request
 from collections import deque
 from dataclasses import dataclass
 from functools import partial
@@ -42,6 +48,10 @@ PEEPER_COLOR = (0, 0, 255)  # BGR red
 USER_COLOR = (0, 255, 0)
 AWAY_COLOR = (160, 160, 160)
 DEBUG_GAZE_INTERVAL_S = 1.0
+CONTROL_PORT = 8082
+CONTROL_POLL_S = 0.5
+CONTROL_TIMEOUT_S = 1.0
+CONTROL_STALE_S = 2.0
 
 
 @dataclass(frozen=True)
@@ -135,14 +145,86 @@ def face_status(face: TrackedFace, track: Track, now: float) -> dict:
     }
 
 
-def heartbeat(decision: SnooperDecision, seq: int) -> bytes:
-    return json.dumps({
+def heartbeat(decision: SnooperDecision, seq: int, user_x: float | None = None) -> bytes:
+    message = {
         "type": "medusa-peeper",
         "active": decision.active,
         "target_x": decision.target_x if decision.active else None,
         "target_y": decision.target_y if decision.active else None,
         "seq": seq,
-    }).encode()
+    }
+    if user_x is not None:
+        message["user_x"] = user_x  # optional: the user's (largest track's) x, for the Pi's matcher
+    return json.dumps(message).encode()
+
+
+def turret_on_from_control(payload) -> tuple[bool, str]:
+    """/control.json -> (on, why). ON = Arduino link up, armed, and the gate not open.
+
+    A missing or null ``gate_closed`` (older firmware) counts as closed, but only when armed.
+    Raises ValueError when there is no "arduino" object.
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("arduino"), dict):
+        raise ValueError("no arduino object")
+    arduino = payload["arduino"]
+    if arduino.get("link_ok") is not True:
+        return False, "Arduino link down"
+    if arduino.get("armed") is not True:
+        return False, "disarmed"
+    if arduino.get("gate_closed") is False:
+        return False, "gate open"
+    return True, "armed, gate closed"
+
+
+class TurretPoller:
+    """Polls the Pi's /control.json on a daemon thread. Fails safe: any doubt reads OFF.
+
+    A failed or malformed read is OFF at once; a good read older than ``stale_s`` is OFF too
+    (covers a wedged poll thread).
+    """
+
+    def __init__(self, url: str, *, interval_s: float = CONTROL_POLL_S,
+                 timeout_s: float = CONTROL_TIMEOUT_S, stale_s: float = CONTROL_STALE_S,
+                 opener=urllib.request.urlopen, clock=time.monotonic) -> None:
+        self.url = url
+        self.interval_s, self.timeout_s, self.stale_s = interval_s, timeout_s, stale_s
+        self.opener, self.clock = opener, clock
+        self._lock = threading.Lock()
+        self._on, self._reason, self._good_at = False, "no control.json read yet", None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def poll_once(self) -> bool:
+        try:
+            with self.opener(self.url, timeout=self.timeout_s) as response:
+                payload = json.loads(response.read(65536))
+            on, reason = turret_on_from_control(payload)
+        except Exception as error:  # unreachable, timeout, HTTP error, bad JSON: all OFF
+            with self._lock:
+                self._on, self._reason = False, f"control.json unreadable: {error}"
+            return False
+        with self._lock:
+            self._on, self._reason, self._good_at = on, reason, self.clock()
+        return on
+
+    def status(self) -> tuple[bool, str]:
+        with self._lock:
+            on, reason, good_at = self._on, self._reason, self._good_at
+        if on and (good_at is None or self.clock() - good_at > self.stale_s):
+            return False, "control.json stale"
+        return on, reason
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self.poll_once()
+            self._stop.wait(self.interval_s)
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="medusa-turret-poll", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
 
 
 class PiLink:
@@ -154,10 +236,10 @@ class PiLink:
         self.seq = 0
         self._failing = False
 
-    def send(self, decision: SnooperDecision) -> None:
+    def send(self, decision: SnooperDecision, user_x: float | None = None) -> None:
         self.seq += 1
         try:
-            self.sock.sendto(heartbeat(decision, self.seq), self.address)
+            self.sock.sendto(heartbeat(decision, self.seq, user_x), self.address)
         except OSError as error:
             if not self._failing:
                 _LOG.warning("UDP send to %s:%d failed: %s", *self.address, error)
@@ -176,11 +258,15 @@ class LaptopDetector:
 
     ``extract`` turns the raw detector output into TrackedFaces (BlazeFace by default).
     ``clock`` must advance between frames: every dwell and timeout is in seconds.
+    ``turret`` (a TurretPoller) gates the docs switch: it fires once per encounter, when the
+    peeper is active and the turret is ON, whichever came second. No turret = OFF, unless
+    ``docs_always``.
     """
 
     def __init__(self, action: PrivacyAction, link: PiLink | None, preview_state=None,
                  tracker: PeeperTracker | None = None, extract=face_observations,
-                 debug_gaze: bool = False, clock=time.monotonic) -> None:
+                 debug_gaze: bool = False, clock=time.monotonic,
+                 turret: TurretPoller | None = None, docs_always: bool = False) -> None:
         self.tracker = tracker or PeeperTracker()
         self.action = action
         self.link = link
@@ -188,7 +274,11 @@ class LaptopDetector:
         self.extract = extract
         self.debug_gaze = debug_gaze
         self.clock = clock
+        self.turret = turret
+        self.docs_always = docs_always
         self.active = False
+        self.turret_on = False
+        self._docs_latched = False  # this encounter has met the gate; cleared when it ends
         self.faces: list[TrackedFace] = []
         self.face_tracks: list[Track] = []  # aligned with self.faces
         self._frame_times: deque[float] = deque(maxlen=30)
@@ -223,17 +313,33 @@ class LaptopDetector:
         if self.debug_gaze and now - self._last_debug >= DEBUG_GAZE_INTERVAL_S:
             self._last_debug = now
             self._log_gaze(faces, tracks, now, result.user_id)
-        self.action.update(decision.active)
+        docs_enabled = self._update_gate()
+        # Latched for the whole encounter, so a turret flicker cannot re-fire the switch and
+        # PrivacyAction's own rising edge stays once per encounter.
+        self._docs_latched = decision.active and (self._docs_latched or docs_enabled)
+        self.action.update(self._docs_latched)
         if self.link is not None:
-            self.link.send(decision)
+            user = next((face for face, track in zip(faces, tracks)
+                         if track.id == result.user_id), None)
+            self.link.send(decision, None if user is None else user.observation.center_x)
         if self.preview_state is not None:
             self.preview_state.update_status(
                 decision.active, decision.reason, face_count=len(faces),
                 snooper_count=1 if decision.active else 0,
                 extra={"faces": [face_status(face, track, now) for face, track in zip(faces, tracks)],
-                       "fps": self.fps(), "peeper_id": result.peeper_id},
+                       "fps": self.fps(), "peeper_id": result.peeper_id,
+                       "turret_on": self.turret_on, "docs_enabled": docs_enabled},
             )
         return decision, peeper
+
+    def _update_gate(self) -> bool:
+        """Refresh turret_on (logging changes); True when a docs switch is allowed now."""
+        on, reason = self.turret.status() if self.turret is not None else (False, "no turret poll")
+        if on != self.turret_on:
+            _LOG.info("turret %s (%s): docs switching %s", "ON" if on else "OFF", reason,
+                      "enabled" if on or self.docs_always else "paused")
+            self.turret_on = on
+        return bool(self.action.enabled) and (on or self.docs_always)
 
     def _log_gaze(self, faces: list[TrackedFace], tracks: list[Track], now: float,
                   user_id: int | None) -> None:
@@ -303,6 +409,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pi-port", type=int, default=8767)
     parser.add_argument("--no-pi", action="store_true", help="do not send heartbeats")
     parser.add_argument("--no-browser", action="store_true", help="do not switch to Google Docs")
+    parser.add_argument("--docs-always", action="store_true",
+                        help="switch to Google Docs even when the turret is off (bench use)")
+    parser.add_argument("--control-url",
+                        help="the Pi's control status, polled to gate the docs switch "
+                             f"(default: http://<pi-host>:{CONTROL_PORT}/control.json)")
     parser.add_argument("--preview-port", type=int, default=8081)
     parser.add_argument("--detector", choices=sorted(MODELS), default="landmarker",
                         help="landmarker = gaze (head + iris, default); blazeface = head direction only")
@@ -374,6 +485,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     link = None if args.no_pi else PiLink(args.pi_host, args.pi_port)
+    control_url = args.control_url or (
+        f"http://{args.pi_host}:{CONTROL_PORT}/control.json" if args.pi_host else None)
+    turret = None if control_url is None else TurretPoller(control_url)
+    if turret is None and not args.docs_always and not args.no_browser:
+        _LOG.warning("No --pi-host or --control-url: the turret reads OFF, so Docs never "
+                     "switches (pass --docs-always on the bench).")
     preview = None
     detector = None
     vision = mp.tasks.vision
@@ -383,11 +500,17 @@ def main(argv: list[str] | None = None) -> int:
         preview.start()
         tracker = PeeperTracker(tracker_config)
         extract = partial(landmarker_faces, config=gaze_config) if landmarker else face_observations
+        if turret is not None:
+            turret.start()
         detector = LaptopDetector(PrivacyAction(enabled=not args.no_browser), link, preview.state,
-                                  tracker=tracker, extract=extract, debug_gaze=args.debug_gaze)
-        _LOG.info("Camera %d open, %s. Preview http://localhost:%d/stream.mjpg . Heartbeats to %s.",
-                  args.camera, args.detector, args.preview_port,
-                  "nobody (--no-pi)" if link is None else f"{args.pi_host}:{args.pi_port}")
+                                  tracker=tracker, extract=extract, debug_gaze=args.debug_gaze,
+                                  turret=turret, docs_always=args.docs_always)
+        _LOG.info("Camera %d open, %s. Preview http://localhost:%d/stream.mjpg . Heartbeats to %s. "
+                  "Docs switch: %s.", args.camera, args.detector, args.preview_port,
+                  "nobody (--no-pi)" if link is None else f"{args.pi_host}:{args.pi_port}",
+                  "off (--no-browser)" if args.no_browser else
+                  "always (--docs-always)" if args.docs_always else
+                  "never (no control URL)" if turret is None else f"when the turret is on ({control_url})")
         base = mp.tasks.BaseOptions(model_asset_path=str(model))
         if landmarker:
             options = vision.FaceLandmarkerOptions(
@@ -429,6 +552,8 @@ def main(argv: list[str] | None = None) -> int:
         if link is not None:
             link.close()
         camera.release()
+        if turret is not None:
+            turret.stop()
         if preview is not None:
             preview.stop()
 

@@ -71,7 +71,10 @@ the QNX OSS TensorFlow Lite runtime—not the full MediaPipe runtime.
 
 Before this command, upload `arduino/medusa_controller/medusa_controller.ino`
 to the UNO Q. It accepts `M,yaw,pitch,led,sequence` commands at 115200 baud and
-parks the servo plus turns off the LED if the heartbeat stops for 300 ms.
+disarms if the heartbeat stops for 300 ms. Disarmed (boot, button, heartbeat
+loss, or the kill gate open on A2) means the servos are detached: no pulses, no
+motion, LED off. The arm button re-attaches them where they stopped, and only
+while the kill gate is closed and the heartbeat is live.
 Use `--servo-reversed` if left/right movement is backwards.
 
 When the camera is clipped on the turret's pan stage, add `--camera-on-turret`
@@ -94,16 +97,24 @@ straight away without a map, sweeps the pan range at `--search-speed`
 (60 deg/s), starting toward the laptop's side. The light stays off until the
 turret camera itself sees a face. `--no-search` restores coast-then-home. Edit
 the map with `python3 -m medusa.handoff record <laptop_x> <pan_deg>`, `show`,
-`clear`, or `record-now` (stand in place, let the turret centre on you, run it).
+`clear` (writes a timestamped backup beside the file first), or `record-now`
+(stand in place, let the turret centre on you, run it). The service learns only
+from exactly one turret face matched as the peeper, on an armed turret with the
+gate closed, uses a monotonic fit of the bins (`status.json`: `map_direction`,
+`map_rejected`), and discards a file whose setup fingerprint (pan home/min/max,
+`--servo-reversed`, `--camera-hfov`) does not match, including files without one.
 
 ### Real-time control process
 
 `medusa_control.py` owns `/dev/ser1` and runs a fixed 50 Hz loop on absolute
 deadlines: it forwards the AI's latest target while it is fresh (< 0.3 s) and
 otherwise sends a park line, so the Arduino heartbeat never depends on the AI
-loop. It reads the firmware's `S,<armed>,<pan_x10>,<tilt_x10>,<seq>` status
-(every 100 ms on UNO Q D1 -> Pi RX pin 10), forwards it to the AI process
-(UDP 8769) so the pan tracker uses the real angle and resets while disarmed,
+loop. It reads the firmware's `S,<armed>,<pan_x10>,<tilt_x10>,<seq>,<gate>` status
+(every 100 ms on UNO Q D1 -> Pi RX pin 10; gate 1 = kill gate closed; the old
+5-field line is still accepted), sends only the park heartbeat while the gate is
+open (`control.json`: `arduino.gate_closed`, `safe_reason` "kill gate open"),
+forwards the status to the AI process (UDP 8769) so the pan tracker uses the real
+angle and resets while disarmed or gated,
 and serves `GET /control.json` and `POST /stress?seconds=N` on port 8082.
 Start it at priority 21 (its threads inherit it), then the AI process at the
 default priority 10 with `--control-port`; the AI process then never opens the

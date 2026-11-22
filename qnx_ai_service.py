@@ -10,7 +10,7 @@ from pathlib import Path
 
 from medusa.arduino_serial import ArduinoController
 from medusa.control import DEFAULT_ACTUAL_PORT, ControlClient
-from medusa.handoff import DEFAULT_PATH as DEFAULT_HANDOFF_MAP, HandoffLearner
+from medusa.handoff import DEFAULT_PATH as DEFAULT_HANDOFF_MAP, HandoffLearner, setup_fingerprint
 from medusa.decision import SCENE_CLEAR_FRAMES, SnooperSelector
 from medusa.models import SnooperDecision
 from medusa.nose_offset import measure_nose_offset
@@ -197,7 +197,7 @@ def _expected_x(pan: PanTracker | None, learned, laptop_x: float | None) -> floa
 
 def _trigger_status(trigger: LaptopTrigger, laptop_active: bool, aim, pan=None, pan_error=None,
                     fps: float | None = None, learned_points: int | None = None,
-                    matcher: PeeperMatcher | None = None) -> dict:
+                    matcher: PeeperMatcher | None = None, learner: HandoffLearner | None = None) -> dict:
     age = trigger.age()
     aiming = aim is not None and aim.active
     status = {
@@ -221,6 +221,10 @@ def _trigger_status(trigger: LaptopTrigger, laptop_active: bool, aim, pan=None, 
         status["pan_actual"] = round(pan.actual[1], 1) if pan.actual is not None else None
         status["fallback_aim"] = pan.state == "fallback"
         status["learned_points"] = learned_points
+        # The learned map's monotonic fit: its direction (None below 3 bins) and the bins it rejected.
+        status["map_direction"] = learner.direction if learner is not None else None
+        status["map_rejected"] = learner.rejected_points if learner is not None else None
+        status["map_fingerprint"] = learner.fingerprint if learner is not None else None  # for record-now
     return status
 
 
@@ -246,8 +250,11 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
     confirm = FaceConfirm(args.face_confirm_frames, args.face_dropout_frames)
     matcher = PeeperMatcher(lock_dropout=args.face_dropout_frames)  # The lock rides out the same dropouts.
     rate = FrameRate()
-    handoff = HandoffLearner(args.handoff_map, minimum=args.servo_min, maximum=args.servo_max) if (
-        pan and pan.search_speed > 0) else None
+    handoff = HandoffLearner(
+        args.handoff_map, minimum=args.servo_min, maximum=args.servo_max,
+        fingerprint=setup_fingerprint(args.servo_home, args.servo_min, args.servo_max, args.servo_reversed,
+                                      args.camera_hfov),
+    ) if pan and pan.search_speed > 0 else None
     try:
         try:
             trigger = LaptopTrigger.bind(
@@ -274,7 +281,7 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
                                                                       fps=rate.fps(), learned_points=(
                                                                           handoff.learned_points
                                                                           if handoff else None),
-                                                                      matcher=matcher))
+                                                                      matcher=matcher, learner=handoff))
                 continue
             rate.tick()
             height, width = frame.shape[:2]
@@ -287,7 +294,7 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
             if pan:
                 actual = arduino.poll_actual() if arduino else None
                 if actual is not None:
-                    pan.observe_actual(actual.pan, actual.t, actual.armed)
+                    pan.observe_actual(actual.pan, actual.t, actual.armed, actual.gate_closed)
                 else:
                     pan.observe_actual(None, None)
                 learned = handoff.current() if handoff else None
@@ -306,7 +313,12 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
                     fallback_map=learned.angle if learned else None,
                 )
                 if handoff:
-                    handoff.observe(pan.last_update, laptop_x, pan_error, pan.real_pan())
+                    # Learn only from the one face in view, matched as the peeper, on a live turret.
+                    handoff.observe(pan.last_update, laptop_x, pan_error, pan.real_pan(),
+                                    faces=len(boxes) if boxes is not None else None,
+                                    match=matcher.match if aim.active and not aim.held else "none",
+                                    armed=actual.armed if actual is not None else None,
+                                    gate_closed=actual.gate_closed if actual is not None else None)
                     handoff.maybe_save(pan.last_update)
             # The light is on for a turret-camera face and in laptop-guided fallback (user decision),
             # and through the short coast in between when fallback is ready, so it does not blink.
@@ -333,7 +345,7 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
                     nose_offset=nose_offset,
                     extra=_trigger_status(trigger, laptop_active, aim, pan, pan_error, fps=rate.fps(),
                                           learned_points=handoff.learned_points if handoff else None,
-                                          matcher=matcher),
+                                          matcher=matcher, learner=handoff),
                 )
     except KeyboardInterrupt:
         pass

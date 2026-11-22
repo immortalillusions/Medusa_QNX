@@ -20,7 +20,7 @@ from medusa.control import (
     make_target_packet, parse_actual_packet, parse_command_line, parse_status_line, parse_target_packet,
     system_clock,
 )
-from medusa.handoff import HandoffMap, HandoffMapFile, main as handoff_main, record_now
+from medusa.handoff import HandoffMap, HandoffMapFile, main as handoff_main, record_now, setup_fingerprint
 from medusa.servo import ServoMapper
 from medusa.tflite_detector import FaceBox
 from medusa.trigger import LaptopTrigger, PanTracker
@@ -173,7 +173,8 @@ class ControlTickTests(unittest.TestCase):
         self.loop.tick(1.0)
         self.assertEqual((self.loop.status.armed, self.loop.status.pan, self.loop.status_at), (True, 100.0, 1.0))
         self.assertEqual(self.loop.snapshot(1.2)["arduino"],
-                         {"link_ok": True, "armed": True, "pan": 100.0, "tilt": 90.0, "age_s": 0.2})
+                         {"link_ok": True, "armed": True, "gate_closed": None, "pan": 100.0, "tilt": 90.0,
+                          "age_s": 0.2})  # A 5-field S line: the gate is unknown.
         self.assertEqual(self.loop.snapshot(1.6)["arduino"]["link_ok"], False)
 
     def test_each_tick_forwards_the_actual_angle(self) -> None:
@@ -362,7 +363,7 @@ class HttpContractTests(unittest.TestCase):
         self.assertLessEqual(CONTRACT_KEYS, set(data))
         self.assertIn(data["state"], ("SAFE", "ACTIVE"))
         self.assertEqual(data["safe_reason"], "no AI target")
-        self.assertEqual(set(data["arduino"]), {"link_ok", "armed", "pan", "tilt", "age_s"})
+        self.assertEqual(set(data["arduino"]), {"link_ok", "armed", "gate_closed", "pan", "tilt", "age_s"})
         self.assertEqual((data["arduino"]["armed"], data["arduino"]["pan"]), (True, 100.0))
         self.assertEqual(set(data["stress"]) >= {"running", "seconds_left"}, True)
         for key in ("loop_hz", "period_ms_mean", "jitter_ms_p99", "period_ms_max"):
@@ -615,9 +616,10 @@ class FirmwareStatusTests(unittest.TestCase):
     def test_firmware_sends_s_lines_every_100_ms_in_the_parsed_format(self) -> None:
         source = INO.read_text()
         self.assertIn("const unsigned long STATUS_PERIOD_MS = 100;", source)
-        self.assertIn('"S,%d,%ld,%ld,%lu\\n"', source)
+        self.assertIn('"S,%d,%ld,%ld,%lu,%d\\n"', source)
         self.assertIn("Serial1.print(status);", source)
-        self.assertIsNotNone(parse_status_line("S,%d,%ld,%ld,%lu" % (1, 1015, 900, 4294967295)))
+        status = parse_status_line("S,%d,%ld,%ld,%lu,%d" % (1, 1015, 900, 4294967295, 1))
+        self.assertEqual((status.seq, status.gate_closed), (4294967295, True))
 
 
 class ControlFlagTests(unittest.TestCase):
@@ -667,7 +669,8 @@ class ControlModeServiceTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         handoff = Path(tmp.name) / "handoff.json"
-        HandoffMap(map_points).save(handoff)
+        # The service's setup (default --servo-* and --camera-hfov): a file for another one is discarded.
+        HandoffMap(map_points, fingerprint=setup_fingerprint(90, 65, 115, False, 50.0)).save(handoff)
         frame = SimpleNamespace(shape=(480, 640, 3))
         pending, index, clients, states = [], {"i": -1}, [], []
 
@@ -790,6 +793,25 @@ class ControlModeServiceTests(unittest.TestCase):
         steps = [b - a for a, b in zip([102] + yaws, yaws)]
         self.assertTrue(all(-12 <= step < 0 for step in steps), yaws)  # heading for 78, rate-limited
         self.assertGreater(yaws[-1], 78)  # smoothed (tau 0.25 s): not there in three frames
+
+    def test_learner_gets_face_count_match_and_turret_flags(self) -> None:
+        face, other = FaceBox(300, 220, 340, 260, 0.9), FaceBox(500, 220, 540, 260, 0.9)
+        calls = []
+        real_observe = qnx_ai_service.HandoffLearner.observe
+
+        def observe(learner, *args, **kwargs):
+            calls.append(kwargs)
+            return real_observe(learner, *args, **kwargs)
+
+        with patch.object(qnx_ai_service.HandoffLearner, "observe", observe):
+            self.run_service([
+                (0.8, [face], False),          # one face, no usable map: "single"
+                (0.8, [face, other], False),   # two faces (locked on the first)
+                (0.8, [face], True),           # the Arduino reports disarmed
+            ], [[0.5, 90]])
+        self.assertEqual([(c["faces"], c["match"]) for c in calls], [(1, "single"), (2, "single"), (1, "single")])
+        self.assertEqual([(c["armed"], c["gate_closed"]) for c in calls], [(None, None), (None, None),
+                                                                            (False, None)])
 
     def test_no_search_turns_fallback_off(self) -> None:
         sent, states = self.run_service([(0.8, [], False)] * 2, [[0.0, 70], [1.0, 110]], ["--no-search"])

@@ -14,6 +14,7 @@ from medusa.trigger import LaptopTrigger, PanTracker
 
 FPS = 13.0
 DT = 1 / FPS
+LIVE = {"faces": 1, "match": "single", "armed": True, "gate_closed": True}  # learning allowed
 
 
 def turret(**kwargs) -> PanTracker:
@@ -137,7 +138,7 @@ class LearnerTests(unittest.TestCase):
     def feed(self, learner, frames, start=0.0, laptop_x=0.42, error=0.0, pan=lambda k: 97.0):
         recorded = []
         for k in range(frames):
-            recorded.append(learner.observe(start + k * DT, laptop_x, error, pan(k)))
+            recorded.append(learner.observe(start + k * DT, laptop_x, error, pan(k), **LIVE))
         return recorded
 
     def test_records_only_when_laptop_active_centred_and_steady_for_0_4_s(self) -> None:
@@ -148,7 +149,7 @@ class LearnerTests(unittest.TestCase):
         self.assertFalse(any(self.feed(learner, 20, start=6.0, pan=lambda k: None)))  # no real pan
         self.assertFalse(any(self.feed(learner, 20, start=8.0, pan=lambda k: 90 + 0.3 * k)))  # moving
         self.assertEqual(learner.learned_points, 0)
-        learner.observe(9.9, None, None, None)  # end the moving run
+        learner.observe(9.9, None, None, None, **LIVE)  # end the moving run
         recorded = self.feed(learner, 10, start=10.0)
         first = recorded.index(True)
         self.assertGreaterEqual(first * DT, 0.4 - 1e-9)
@@ -156,8 +157,8 @@ class LearnerTests(unittest.TestCase):
         self.assertTrue(all(recorded[first:]))
         self.assertEqual(learner.learned_points, 1)
         # Any frame off centre restarts the 0.4 s wait.
-        learner.observe(15.0, 0.42, 0.05, 97.0)
-        self.assertFalse(learner.observe(15.0 + DT, 0.42, 0.0, 97.0))
+        learner.observe(15.0, 0.42, 0.05, 97.0, **LIVE)
+        self.assertFalse(learner.observe(15.0 + DT, 0.42, 0.0, 97.0, **LIVE))
         # Jitter below 0.5 deg over the window still counts as steady.
         self.assertTrue(any(self.feed(learner, 10, start=20.0, pan=lambda k: 97 + 0.2 * (k % 2))))
 
@@ -168,7 +169,7 @@ class LearnerTests(unittest.TestCase):
         self.assertFalse(learner.current().usable)
         before = learner.bins[8]
         self.assertEqual(before, (0.42, 100.0))
-        learner.observe(5.0, 0.44, 0.0, 104.0)  # same bin (0.40..0.45), but a fresh 0.4 s wait
+        learner.observe(5.0, 0.44, 0.0, 104.0, **LIVE)  # same bin (0.40..0.45), but a fresh 0.4 s wait
         self.feed(learner, 7, start=5.0 + DT, laptop_x=0.44, pan=lambda k: 104.0)
         x, pan = learner.bins[8]
         self.assertTrue(0.42 < x < 0.44 and 100.0 < pan < 104.0)
