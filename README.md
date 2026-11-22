@@ -83,8 +83,8 @@ production choice, but stock Python has no binding for it.
   button press.
 - **Pi faults go home.** A failed camera frame or a face-model error commands
   exactly home. A stale AI target makes the control loop send park lines.
-- **Home is pan 0, tilt 90.** Pan rests facing forward and tracks 0 to 70
-  degrees. Tilt is held at 90. Out-of-range commands are rejected.
+- **Home is pan 90, tilt 90.** Pan rests facing forward and tracks 15 to 165
+  degrees, 75 each side. Tilt is held at 90. Out-of-range commands are rejected.
 - **Docs only while armed.** The laptop switches to Google Docs only when
   `/control.json` reports the turret armed with the gate closed.
   `--docs-always` overrides this for bench testing.
@@ -114,10 +114,10 @@ UART (`/dev/ser1`) and run both processes, control first:
 
 ```sh
 on -p 21 python3 -u medusa_control.py --port /dev/ser1 \
-    --servo-min 0 --servo-max 70 --servo-home 0 --tilt-min 90 --tilt-max 90 --tilt-home 90 &
+    --servo-min 15 --servo-max 165 --servo-home 90 --tilt-min 90 --tilt-max 90 --tilt-home 90 &
 python3 -u qnx_ai_service.py --qnx-camera-unit 5 --control-port 8768 \
     --trigger-udp-port 8767 --trigger-from <mac-ip> --camera-on-turret --servo-reversed \
-    --servo-min 0 --servo-max 70 --servo-home 0 --tilt-min 90 --tilt-max 90 --tilt-home 90
+    --servo-min 15 --servo-max 165 --servo-home 90 --tilt-min 90 --tilt-max 90 --tilt-home 90
 ```
 
 The pan and tilt ranges must match `PAN_*` and `TILT_*` in the firmware, or the

@@ -5,8 +5,8 @@
 1. Put the pan servo in the printed yoke on the base plate.
 2. Clip the C270 on the pan stage so the camera turns with the turret. Plug it
    into a Pi USB port.
-3. Seat the servo horn so pan 0 degrees faces forward. The turret tracks from
-   0 to 70 degrees, which is one side of forward.
+3. Seat the servo horn so pan 90 degrees faces forward. The turret tracks from
+   15 to 165 degrees, 75 each side of forward.
 
 ## 2. Power
 
@@ -55,6 +55,6 @@ pins.
 1. With the kill plug out, confirm the button will not arm.
 2. Put the plug in, start `medusa_control.py`, and arm. Over about 1.5 s the
    servos should creep to their last position, not jump.
-3. Stop `medusa_control.py`. The turret should glide home (pan 0,
+3. Stop `medusa_control.py`. The turret should glide home (pan 90,
    tilt 90), then go limp.
 4. Arm again and pull the kill plug. The servos must lose power at once.

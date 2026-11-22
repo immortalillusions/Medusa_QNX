@@ -129,27 +129,27 @@ class ControlParkLineTests(unittest.TestCase):
             patch("builtins.print"),
         ):
             self.assertEqual(medusa_control.main([
-                "--servo-min", "0", "--servo-max", "70", "--servo-home", "0", "--tilt-min", "55",
+                "--servo-min", "15", "--servo-max", "165", "--servo-home", "90", "--tilt-min", "55",
                 "--tilt-max", "125", "--tilt-home", "90", "--target-port", "0", "--actual-port", "0",
                 "--http-port", "0"]), 0)
         # One tick with no AI target, then shutdown's three park lines.
-        self.assertEqual(lines(serial), ["M,0,90,0,1", "M,0,90,0,2", "M,0,90,0,3", "M,0,90,0,4"])
+        self.assertEqual(lines(serial), ["M,90,90,0,1", "M,90,90,0,2", "M,90,90,0,3", "M,90,90,0,4"])
 
     def test_stale_target_parks_at_home_inside_the_firmware_range(self) -> None:
         serial, sock = FakeSerial(), FakeSock()
-        loop = ControlLoop(serial, target_sock=sock, yaw_range=(0, 70), pitch_range=(55, 125), home=(0, 90),
+        loop = ControlLoop(serial, target_sock=sock, yaw_range=(15, 165), pitch_range=(55, 125), home=(90, 90),
                            clock=FakeClock().monotonic)
         serial.incoming += [b"S,1,500,1000,1,1,0\n"]
         sock.queue += [target(True, 50, 100, 1)]
         loop.tick(1.0)
         loop.tick(1.5)  # target 0.5 s old: stale
-        self.assertEqual(lines(serial), ["N,500,1000,1,1", "M,0,90,0,2"])
+        self.assertEqual(lines(serial), ["N,500,1000,1,1", "M,90,90,0,2"])
         # The firmware's own range check (applyCommand) accepts the park line, so an armed turret moves.
         source = INO.read_text()
         pan = [firmware_constant(source, k) for k in ("PAN_MIN", "PAN_MAX", "PAN_HOME")]
         tilt = [firmware_constant(source, k) for k in ("TILT_MIN", "TILT_MAX", "TILT_HOME")]
-        self.assertEqual((pan[2], tilt[2]), (0, 90))
-        yaw, pitch, led, _seq = parse_command_line("M,0,90,0,2", 0, 180)
+        self.assertEqual((pan[2], tilt[2]), (90, 90))
+        yaw, pitch, led, _seq = parse_command_line("M,90,90,0,2", 0, 180)
         self.assertTrue(pan[0] <= yaw <= pan[1] and tilt[0] <= pitch <= tilt[1])
         self.assertFalse(led)
 

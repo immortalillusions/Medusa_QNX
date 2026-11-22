@@ -34,9 +34,9 @@ const byte LED_PIN = 5;
 const byte ARM_BUTTON_PIN = 2;
 const byte ARM_STATUS_PIN = LED_BUILTIN;
 const byte KILL_SENSE_PIN = A2;
-// Pan rests at 0 deg, which faces forward on this turret (set on the bench 22 Nov),
-// so it can only track to one side of forward (0..70). Tilt rests at 90.
-const int PAN_MIN = 0, PAN_MAX = 70, PAN_HOME = 0;
+// Pan rests at 90 deg, which faces forward on this turret (set on the bench 22 Nov),
+// and tracks 75 deg each side (15..165, clear of the servo's end stops). Tilt rests at 90.
+const int PAN_MIN = 15, PAN_MAX = 165, PAN_HOME = 90;
 const int TILT_MIN = 55, TILT_MAX = 125, TILT_HOME = 90;
 const unsigned long HEARTBEAT_TIMEOUT_MS = 300;
 const unsigned long PARK_TIMEOUT_MS = 2000;  // longest glide home before going limp anyway
