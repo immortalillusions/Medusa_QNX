@@ -650,7 +650,8 @@ function Metrics({ laptop, turret, control, latency }: {
   const aimValue = !aim ? "—" : aim.ms >= 1000 ? (aim.ms / 1000).toFixed(2) : aim.ms.toFixed(0);
   const aimUnit = aim && aim.ms >= 1000 ? "s" : "ms";
 
-  const panError = t?.pan_error;
+  const HFOV_DEG = 50; // turret camera's horizontal field of view: pan_error is in frame widths
+  const panError = isNum(t?.pan_error) ? t.pan_error * HFOV_DEG : t?.pan_error;
   const errTone: Tone = !isNum(panError) ? "idle" : Math.abs(panError) > 8 ? "warn" : "ok";
 
   const jitter = c?.jitter_ms_p99;
@@ -857,7 +858,7 @@ export default function Home() {
     <Cap k="fps" v={fmt(t.fps, 1)} />
     <Cap k="aim" v={t.fallback_aim ? `${t.aim_match ?? "—"} (fallback)` : t.aim_match ?? "—"} />
     <Cap k="pan" v={fmt(t.pan_angle ?? t.pan_actual, 1, "°")} />
-    <Cap k="error" v={isNum(t.pan_error) ? `${t.pan_error.toFixed(1)}°` : "—"} />
+    <Cap k="error" v={isNum(t.pan_error) ? `${(t.pan_error * 50).toFixed(1)}°` : "—"} />
     <span className="cap-reason">{t.reason}</span>
   </>;
 

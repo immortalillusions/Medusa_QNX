@@ -15,7 +15,7 @@ import numpy as np
 # The C270 was unit 5 before the replug, so try it first.
 AUTO_UNITS = (5, 1, 2, 3, 4, 6, 7, 8, 9, 10)
 SETTLE_S = 0.5
-FRAMES = 5
+FRAMES = 40  # ~2-3 s at the C270's rate: black frames while exposure settles must not reject it
 # A column is "constant" when its vertical spread is under this (0-255 scale, worst channel).
 # Probed on the Pi: QNX's test patterns read exactly 0; sensor noise alone is well above 1.
 COLUMN_STD_MAX = 1.0

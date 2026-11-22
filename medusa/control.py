@@ -693,7 +693,7 @@ class ControlHTTPServer:
         # One thread serves every request in turn: no thread is created per request in this
         # priority-21 process (the threading server made one per dashboard poll, ~5 Hz).
         # Each request is tiny; a client that stalls is cut off by the handler's timeout.
-        Handler.timeout = 2.0
+        Handler.timeout = 0.25
         self.server = HTTPServer((host, port), Handler)
         self.port = self.server.server_address[1]
         self.thread_priority = thread_priority

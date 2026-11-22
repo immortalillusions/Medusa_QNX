@@ -36,8 +36,13 @@ packages already installed).
 5. Start the laptop side: `open -a Terminal ~/medusa-demo/run_laptop_detector.command`
    (it must be launched through Terminal: that's where macOS grants the camera).
 6. Start the dashboard: `cd ~/medusa-demo/dashboard && npx next dev -p 3000`, open http://localhost:3000.
-7. Press the turret's **D2 button** once (the firmware boots latched: a human press is the safety reset).
+7. Wait until the dashboard shows Control at 50 Hz and the Arduino chip live, step out of the turret's
+   view, then press the turret's **D2 button** once (the firmware boots latched: a human press is the
+   safety reset; arming with nobody in view avoids an overshoot while the servos soft-start).
    The red LED lights = armed. After that the dashboard's Arm/Switch off works.
+8. **Relearn the pan map for this table layout** (2 minutes; the map learned at home is wrong once the
+   laptop or turret moves): `cd ~/medusa-demo && tools/relearn_map.sh`, follow its three steps with one
+   person, then `tools/relearn_map.sh --done`.
 
 ## 3. Checks before judges arrive (dashboard)
 
@@ -52,6 +57,8 @@ packages already installed).
 2. Two peepers: the newest one takes the turret; a quick glance doesn't steal it.
 3. Walk out of the turret camera's view → it keeps aiming from the laptop's view (badge "Following from laptop").
 4. CPU stress button → AI fps collapses to ~1, control loop stays at 50 Hz with zero missed deadlines.
+   If someone is in the turret's view, it parks home between the slow AI frames: that is the safety
+   design (stale AI targets are refused), say so.
 5. Safety: pull the kill plug → servos go limp at once; the dashboard can't re-arm until D2 is pressed.
 
 ## 5. If something goes wrong
@@ -65,7 +72,10 @@ packages already installed).
 | Arm greyed "kill gate open" | Push the kill plug in fully. |
 | Laptop doesn't switch to Docs | Turret must be armed; Screen switching On; launched via Terminal. |
 | Turret aims beside a peeper who left its view | The map learns as it tracks; let the turret centre on them a few times. |
-| Anything worse on the Pi | Roll back: `cd ~/medusa-demo && tools/deploy_pi.sh demo-safe` (last version verified live), then flash its firmware with the command it prints and press D2. |
+| Turret sees the peeper but aims beside them | The map is from another layout: `tools/relearn_map.sh` (step 8). |
+| Laptop → Pi chip shows no data | Check the Mac is on Eric's hotspot; restart the laptop detector. |
+| Turret cam stuck on "waiting for the turret camera" with the C270 plugged in | On the Pi: `grep "camera unit" /tmp/service.log`; if no unit is "using it", set `--qnx-camera-unit 5` in `~/Medusa_QNX-bench/start_medusa.sh` and run it. |
+| Anything worse on the Pi | Roll back: `cd ~/medusa-demo && tools/deploy_pi.sh demo-safe` (last version verified live). **Then you must flash its firmware** with the command it prints (the rolled-back Pi can't read the newer firmware's status line) and press D2. |
 
 To redeploy the latest after a rollback: `tools/deploy_pi.sh main` (from an up-to-date `~/medusa-demo`).
 Every deploy backs up the Pi folder to `~/Medusa_QNX-bench.bak-<time>` first.
