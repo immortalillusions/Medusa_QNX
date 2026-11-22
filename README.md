@@ -66,8 +66,13 @@ the QNX OSS TensorFlow Lite runtime—not the full MediaPipe runtime.
 3. Start the QNX AI service.
 
    ```sh
-   python3 qnx_ai_service.py --qnx-camera-unit 5 --event-host <laptop-ip>
+   python3 qnx_ai_service.py --qnx-camera-unit 5 --event-host <laptop-ip> --arduino-port /dev/ser1
    ```
+
+Before this command, upload `arduino/medusa_controller/medusa_controller.ino`
+to the UNO Q. It accepts `M,yaw,led,sequence` commands at 115200 baud and
+parks the servo plus turns off the LED if the heartbeat stops for 300 ms.
+Use `--servo-reversed` if left/right movement is backwards.
 
 ## Local preview dashboard
 

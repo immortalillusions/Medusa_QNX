@@ -2,6 +2,7 @@ import unittest
 
 from medusa.decision import SnooperSelector
 from medusa.models import FaceObservation
+from medusa.servo import ServoMapper
 from medusa.tflite_detector import TFLiteFaceDetector
 
 
@@ -28,6 +29,12 @@ class FaceDetectorTests(unittest.TestCase):
 
 
 class SnooperSelectorTests(unittest.TestCase):
+    def test_servo_mapper_bounds_and_parks(self) -> None:
+        mapper = ServoMapper(minimum=35, maximum=145, home=90, smoothing=1.0)
+        self.assertEqual(mapper.command(True, 0.0), (35, True))
+        self.assertEqual(mapper.command(True, 1.0), (145, True))
+        self.assertEqual(mapper.command(False, None), (90, False))
+
     def test_only_one_face_never_triggers(self) -> None:
         selector = SnooperSelector(hold_frames=2)
         self.assertFalse(selector.update([face(0.5, 0.3)]).active)
