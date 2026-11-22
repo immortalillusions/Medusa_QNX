@@ -17,10 +17,11 @@ import medusa_control
 import qnx_ai_service
 from medusa import trigger as trigger_module
 from medusa.control import (
-    ControlClient, ControlHTTPServer, ControlLoop, StatusReader, StressTest, TickStats, format_a_line, format_n_line,
+    ControlClient, ControlHTTPServer, ControlLoop, StatusReader, TickStats, format_a_line, format_n_line,
     make_target_packet, parse_actual_packet, parse_command_line, parse_status_line, parse_target_packet,
     system_clock,
 )
+from medusa.stress import StressClient, StressRunner, StressService, make_stress_request, parse_stress_request
 from medusa.handoff import HandoffMap, HandoffMapFile, main as handoff_main, record_now, setup_fingerprint
 from medusa.servo import ServoMapper
 from medusa.tflite_detector import FaceBox
@@ -328,25 +329,29 @@ class StressTests(unittest.TestCase):
     def test_start_status_stop_with_fake_workers(self) -> None:
         clock = FakeClock(0.0)
         made = []
-        stress = StressTest(4, clock=clock.monotonic, popen=lambda *a, **k: made.append(FakeProc(*a)) or made[-1])
+        stress = StressRunner(4, clock=clock.monotonic, wall=lambda: 1000.0 + clock.now,
+                              popen=lambda *a, **k: made.append(FakeProc(*a)) or made[-1])
         stress.start(20)
         self.addCleanup(stress.stop)
         self.assertEqual(len(made), 4)
         clock.now = 7.5
-        self.assertEqual(stress.status(), {"running": True, "seconds_left": 13, "workers": 4})
-        stress.stop()
+        self.assertEqual(stress.status(), {"running": True, "seconds_left": 13, "workers": 4, "ends_at_wall": 1020.0})
+        stress.expire()
+        self.assertTrue(all(p.alive for p in made))
+        clock.now = 20.0
+        stress.expire()  # time is up: the runner kills them
         self.assertTrue(all(not p.alive for p in made))
-        self.assertEqual(stress.status(), {"running": False, "seconds_left": 0, "workers": 0})
+        self.assertEqual(stress.status(), {"running": False, "seconds_left": 0, "workers": 0, "ends_at_wall": None})
 
     def test_workers_run_at_normal_priority_on_qnx(self) -> None:
-        stress = StressTest(2, priority=10)
+        stress = StressRunner(2, priority=10)
         with patch.object(sys, "platform", "qnx8"), patch("shutil.which", return_value="/usr/bin/on"):
             self.assertEqual(stress.command(5)[:4], ["on", "-p", "10", sys.executable])
         with patch.object(sys, "platform", "darwin"):
             self.assertEqual(stress.command(5)[0], sys.executable)
 
     def test_real_workers_stop_on_their_own(self) -> None:
-        stress = StressTest(1)
+        stress = StressRunner(1)
         stress.start(0.4)
         self.addCleanup(stress.stop)
         self.assertTrue(stress.status()["running"])
@@ -355,17 +360,88 @@ class StressTests(unittest.TestCase):
             time.sleep(0.05)
         self.assertFalse(stress.status()["running"])
 
+    def test_request_parsing(self) -> None:
+        self.assertEqual(parse_stress_request(make_stress_request(20), 60), 20.0)
+        self.assertEqual(parse_stress_request(make_stress_request(0), 60), 0.0)
+        for payload in (make_stress_request(61), b'{"type": "medusa-stress", "seconds": NaN}', b"junk",
+                        b'{"type": "medusa-target", "seconds": 5}', b'{"type": "medusa-stress", "seconds": true}'):
+            with self.subTest(payload=payload):
+                self.assertIsNone(parse_stress_request(payload, 60))
+
+    def test_control_process_never_forks_or_execs(self) -> None:
+        source = (Path(__file__).resolve().parent.parent / "medusa" / "control.py").read_text()
+        for banned in ("import subprocess", "Popen", "os.fork", "os.exec", "os.spawn", "os.system", "os.popen",
+                       "ThreadingHTTPServer"):
+            with self.subTest(banned=banned):
+                self.assertNotIn(banned, source)
+        main = (Path(__file__).resolve().parent.parent / "medusa_control.py").read_text()
+        self.assertNotIn("StressRunner", main)
+        self.assertNotIn("subprocess", main)
+
+
+class StressRunnerFixture:
+    """A real StressService (fake workers) on a free port, as medusa_sysmon.py runs it."""
+
+    def start_runner(self, workers: int = 2) -> None:
+        self.made = []
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.stress_file = str(Path(directory.name) / "stress.json")
+        self.runner = StressRunner(workers, popen=lambda *a, **k: self.made.append(FakeProc(*a)) or self.made[-1])
+        self.service = StressService(self.runner, port=0, out=self.stress_file)
+        self.service.write()
+        stop = threading.Event()
+        thread = threading.Thread(target=self.service.serve, args=(stop,), daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 3)
+        self.addCleanup(stop.set)
+        self.client = StressClient(self.service.port, self.stress_file)
+        self.addCleanup(self.client.close)
+
+    def wait_for(self, predicate, timeout: float = 3.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.02)
+        return predicate()
+
+
+class StressServiceTests(StressRunnerFixture, unittest.TestCase):
+    def test_client_request_reaches_runner_and_status_comes_back(self) -> None:
+        self.start_runner(3)
+        self.assertTrue(self.client.available())
+        self.assertEqual(self.client.status(), {"running": False, "seconds_left": 0, "workers": 0})
+        self.assertTrue(self.client.request(20))
+        self.assertTrue(self.wait_for(lambda: self.client.status()["running"]))
+        self.assertEqual(self.client.status(), {"running": True, "seconds_left": 20, "workers": 3})
+        self.assertEqual(len(self.made), 3)
+        self.client.request(0)
+        self.assertTrue(self.wait_for(lambda: not self.client.status()["running"]))
+        self.assertTrue(all(not p.alive for p in self.made))
+
+    def test_missing_or_stale_status_file_means_no_runner(self) -> None:
+        client = StressClient(9, "/nonexistent/medusa_stress.json")
+        self.addCleanup(client.close)
+        self.assertFalse(client.available())
+        self.assertEqual(client.status(), {"running": False, "seconds_left": 0, "workers": 0})
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump({"running": True, "ends_at_wall": time.time() + 30, "workers": 4}, handle)
+        self.addCleanup(Path(handle.name).unlink)
+        stale = StressClient(9, handle.name, wall=lambda: time.time() + 60)
+        self.addCleanup(stale.close)
+        self.assertFalse(stale.available())
+        self.assertFalse(stale.status()["running"])
+
 
 CONTRACT_KEYS = {"state", "safe_reason", "loop_hz", "period_ms_mean", "jitter_ms_p99", "period_ms_max",
                  "missed_deadlines", "target_age_s", "ai_alive", "arduino", "stress", "system"}
 
-class HttpContractTests(unittest.TestCase):
+class HttpContractTests(StressRunnerFixture, unittest.TestCase):
     def setUp(self) -> None:
         self.serial = FakeSerial()
-        self.made = []
-        self.stress = StressTest(2, popen=lambda *a, **k: self.made.append(FakeProc(*a)) or self.made[-1])
-        self.addCleanup(self.stress.stop)
-        self.loop = ControlLoop(self.serial, stress=self.stress)
+        self.start_runner(2)
+        self.loop = ControlLoop(self.serial, stress=self.client)
         now = system_clock()
         self.serial.incoming += [b"S,1,1000,900,1\n"]
         self.loop.tick(now)
@@ -439,16 +515,27 @@ class HttpContractTests(unittest.TestCase):
         loop.tick(system_clock())
         self.assertEqual(lines(loop.serial), ["M,90,90,0,1", "A,1,2"])
 
-    def test_post_stress_starts_and_stops(self) -> None:
+    def stress_block(self) -> dict:
+        return json.loads(self.request("/control.json")[2])["stress"]
+
+    def test_post_stress_starts_and_stops_through_the_runner(self) -> None:
         status, headers, body = self.request("/stress?seconds=20", "POST")
-        self.assertEqual((status, headers["Access-Control-Allow-Origin"]), (200, "*"))
-        self.assertEqual(json.loads(body)["stress"]["running"], True)
-        self.assertEqual(len(self.made), 2)
-        stress = json.loads(self.request("/control.json")[2])["stress"]
-        self.assertEqual((stress["running"], stress["seconds_left"]), (True, 20))
+        self.assertEqual((status, headers["Access-Control-Allow-Origin"]), (202, "*"))
+        self.assertEqual(json.loads(body), {"requested": {"stress_seconds": 20.0}})
+        self.assertTrue(self.wait_for(lambda: self.stress_block()["running"]))
+        self.assertEqual(self.stress_block(), {"running": True, "seconds_left": 20, "workers": 2})
+        self.assertEqual(len(self.made), 2)  # spawned by the runner (medusa_sysmon.py), not this process
         self.request("/stress?seconds=0", "POST")
+        self.assertTrue(self.wait_for(lambda: not self.stress_block()["running"]))
         self.assertTrue(all(not p.alive for p in self.made))
-        self.assertFalse(json.loads(self.request("/control.json")[2])["stress"]["running"])
+
+    def test_post_stress_without_a_runner_is_503(self) -> None:
+        client = StressClient(9, "/nonexistent/medusa_stress.json")
+        self.addCleanup(client.close)
+        self.loop.stress = client
+        status, headers, body = self.request("/stress?seconds=20", "POST")
+        self.assertEqual((status, headers["Access-Control-Allow-Origin"]), (503, "*"))
+        self.assertIn("medusa_sysmon.py", json.loads(body)["error"])
 
 
 def receive(sock, timeout=2.0):
@@ -686,7 +773,7 @@ class ControlFlagTests(unittest.TestCase):
     def test_control_process_defaults(self) -> None:
         args = medusa_control.parse_args([])
         self.assertEqual((args.port, args.target_port, args.actual_port, args.http_port, args.period_ms,
-                          args.target_timeout, args.stress_workers), ("/dev/ser1", 8768, 8769, 8082, 20.0, 0.3, 4))
+                          args.target_timeout, args.stress_port), ("/dev/ser1", 8768, 8769, 8082, 20.0, 0.3, 8770))
         for argv in (["--tilt-min", "100", "--tilt-home", "90"], ["--period-ms", "0"]):
             with self.subTest(argv=argv), patch("sys.stderr"), self.assertRaises(SystemExit):
                 medusa_control.parse_args(argv)

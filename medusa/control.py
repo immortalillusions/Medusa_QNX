@@ -28,11 +28,12 @@ IPC is localhost UDP JSON: simple and works on QNX's io-sock today. QNX native
 message passing (MsgSend/MsgReceive, priority-inheriting) would be the
 production choice, but has no binding in the stock Python build.
 
-The loop runs in the main thread; the HTTP status server, the stress-test
-timer run in daemon threads that are almost always blocked. Pi usage (CPU,
-memory, temperature) is sampled by medusa_sysmon.py, a separate priority-10
-process; /control.json only reads the file it writes. The GIL switch
-interval is shortened so a waking loop thread gets the interpreter quickly.
+The loop runs in the main thread; the HTTP status server runs in one daemon
+thread that is almost always blocked. This process never forks or execs: Pi
+usage (CPU, memory, temperature) is sampled by medusa_sysmon.py, a separate
+priority-10 process, and the CPU stress workers are spawned by that process too
+(POST /stress only sends it a UDP datagram; see medusa/stress.py). The GIL
+switch interval is shortened so a waking loop thread gets the interpreter quickly.
 """
 
 from __future__ import annotations
@@ -41,19 +42,18 @@ import json
 import math
 import os
 import re
-import shutil
 import socket
-import subprocess
 import sys
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from .sysmon import DEFAULT_SYSTEM_FILE, SYSTEM_KEYS, on_qnx
+from .stress import StressClient
+from .sysmon import DEFAULT_SYSTEM_FILE, SYSTEM_KEYS
 
 SYSTEM_STALE_S = 10.0
 
@@ -321,63 +321,6 @@ class TickStats:
                 "period_ms_max": round(max(periods) * 1000, 3)}
 
 
-# --- CPU stress test ------------------------------------------------------------------------
-
-_BUSY_LOOP = "import sys, time\nend = time.monotonic() + float(sys.argv[1])\nwhile time.monotonic() < end:\n    pass\n"
-
-
-class StressTest:
-    """Busy-loop worker processes at NORMAL priority, to show the control loop is not disturbed.
-
-    The workers would inherit this process's priority (21), so on QNX they are
-    started through ``on -p <priority>`` (default 10, the AI process's level).
-    """
-
-    def __init__(self, workers: int = 4, priority: int = 10, *, clock=time.monotonic,
-                 popen=subprocess.Popen) -> None:
-        self.workers, self.priority = workers, priority
-        self.clock, self.popen = clock, popen
-        self.procs: list = []
-        self.ends_at: float | None = None
-        self._timer: threading.Timer | None = None
-        self.lock = threading.Lock()
-
-    def command(self, seconds: float) -> list[str]:
-        command = [sys.executable, "-c", _BUSY_LOOP, str(seconds)]
-        if on_qnx() and shutil.which("on"):
-            command = ["on", "-p", str(self.priority)] + command
-        return command
-
-    def start(self, seconds: float) -> None:
-        self.stop()
-        with self.lock:
-            self.procs = [self.popen(self.command(seconds), stdin=subprocess.DEVNULL,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                          for _ in range(self.workers)]
-            self.ends_at = self.clock() + seconds
-            self._timer = threading.Timer(seconds, self.stop)
-            self._timer.daemon = True
-            self._timer.start()
-
-    def stop(self) -> None:
-        with self.lock:
-            procs, self.procs, self.ends_at = self.procs, [], None
-            if self._timer is not None and self._timer is not threading.current_thread():
-                self._timer.cancel()
-            self._timer = None
-        for proc in procs:
-            if proc.poll() is None:
-                proc.kill()
-            proc.wait()
-
-    def status(self) -> dict:
-        with self.lock:
-            ends_at = self.ends_at
-            running = ends_at is not None and any(p.poll() is None for p in self.procs)
-        left = max(0, math.ceil(ends_at - self.clock())) if running else 0
-        return {"running": running, "seconds_left": left, "workers": self.workers if running else 0}
-
-
 # --- Pi usage, sampled by medusa_sysmon.py (a separate priority-10 process) -----------------
 
 class SystemStatusFile:
@@ -425,7 +368,7 @@ class ControlLoop:
         self, serial, *, target_sock=None, actual_sock=None, actual_addr=None,
         period_s: float = PERIOD_S, target_timeout: float = TARGET_TIMEOUT_S,
         link_timeout: float = LINK_TIMEOUT_S, yaw_range=(65, 115), pitch_range=(65, 115),
-        home=(90, 90), window_s: float = WINDOW_S, stress: StressTest | None = None,
+        home=(90, 90), window_s: float = WINDOW_S, stress: StressClient | None = None,
         clock=system_clock, sleep=time.sleep,
     ) -> None:
         self.serial, self.target_sock = serial, target_sock
@@ -643,14 +586,19 @@ class ControlHTTPServer:
                 if not 0 <= seconds <= stress_max:  # Also rejects NaN.
                     self._reply(HTTPStatus.BAD_REQUEST, {"error": f"seconds must be 0..{stress_max}"})
                     return
-                if seconds == 0:
-                    loop.stress.stop()
-                else:
-                    loop.stress.start(seconds)
-                self._reply(HTTPStatus.OK, {"stress": loop.stress.status()})
+                # One datagram to medusa_sysmon.py (priority 10), which spawns or kills the
+                # workers: no fork/exec here. control.json's stress block shows the outcome.
+                if not loop.stress.available() or not loop.stress.request(seconds):
+                    self._reply(HTTPStatus.SERVICE_UNAVAILABLE,
+                                {"error": "stress runner (medusa_sysmon.py) is not running"})
+                    return
+                self._reply(HTTPStatus.ACCEPTED, {"requested": {"stress_seconds": seconds}})
 
-        self.server = ThreadingHTTPServer((host, port), Handler)
-        self.server.daemon_threads = True
+        # One thread serves every request in turn: no thread is created per request in this
+        # priority-21 process (the threading server made one per dashboard poll, ~5 Hz).
+        # Each request is tiny; a client that stalls is cut off by the handler's timeout.
+        Handler.timeout = 2.0
+        self.server = HTTPServer((host, port), Handler)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True, name="control-http")
 
