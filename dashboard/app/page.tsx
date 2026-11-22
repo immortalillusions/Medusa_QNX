@@ -242,7 +242,7 @@ function SafetyPanel({ turret, control, controlUrl }: {
   const stateText = !c ? "CONTROL OFFLINE" : c.state ?? "UNKNOWN";
   const stateReason = !c
     ? `No answer from ${controlUrl.url || "(no address)"}/control.json`
-    : c.safe_reason ?? (active ? "armed — light and aim are live" : "");
+    : c.safe_reason ?? (active ? "armed — aim is live" : "");
 
   // Link lights
   const laptopAge = turret.connected ? turret.status.laptop_age_s : undefined;
@@ -382,7 +382,7 @@ export default function Home() {
 
   const deciding = turret.connected ? turret : laptop.connected ? laptop : null;
   const peeper = deciding?.status.active ?? false;
-  const headline = !deciding ? "NO SOURCE CONNECTED" : peeper ? "PEEPER — docs switched, light on" : "CLEAR";
+  const headline = !deciding ? "NO SOURCE CONNECTED" : peeper ? "PEEPER — docs switched, turret aiming" : "CLEAR";
   const decidedBy = deciding === turret ? "turret (QNX)" : deciding === laptop ? "laptop webcam" : "neither source";
 
   return <main>
