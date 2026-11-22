@@ -375,6 +375,7 @@ class MainTests(unittest.TestCase):
 
 
     def run_two_frames(self, argv):
+        argv = ["--zoom-faces", "off"] + argv  # the full-frame path; tests/test_zoom.py covers zoom
         modules, camera = self.fake_modules(opened=True)
         frame = MagicMock()
         frame.shape = (720, 1280, 3)

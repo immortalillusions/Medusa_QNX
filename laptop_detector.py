@@ -24,7 +24,7 @@ import threading
 import time
 import urllib.request
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 
@@ -34,6 +34,7 @@ from medusa.gaze import NOSE_TIP, GazeConfig, GazeEstimate, estimate_gaze
 from medusa.models import FaceObservation, SnooperDecision
 from medusa.peeper_tracker import Detection, PeeperTracker, Track, TrackerConfig
 from medusa.preview import PreviewServer
+from medusa.zoom import DEFAULT_ENHANCE, PRESETS, ZOOM_MODES, LandmarkPipeline, parse_enhance
 from qnx.face_webcam import detect_faces  # lazy cv2/mediapipe imports inside
 
 
@@ -43,6 +44,7 @@ MODELS = {
     "landmarker": Path(__file__).resolve().parent / "qnx" / "face_landmarker.task",
     "blazeface": Path(__file__).resolve().parent / "qnx" / "blaze_face_short_range.tflite",
 }
+ZOOM_DETECTOR = Path(__file__).resolve().parent / "qnx" / "face_detector.tflite"  # BlazeFace back 256
 MAX_FACES = 4
 PEEPER_COLOR = (0, 0, 255)  # BGR red
 USER_COLOR = (0, 255, 0)
@@ -118,6 +120,15 @@ def landmarker_faces(result, width: int, height: int,
             nose=None if nose is None else (round(nose.x * width), round(nose.y * height)),
             gaze=gaze))
     return faces
+
+
+def small_face_defaults() -> tuple[dict, dict]:
+    """(GazeConfig, TrackerConfig) overrides --small-faces turns on. Normal faces are untouched."""
+    return SMALL_FACE_GAZE, SMALL_FACE_TRACKING
+
+
+SMALL_FACE_GAZE: dict = {}
+SMALL_FACE_TRACKING: dict = {}
 
 
 def detection(face: TrackedFace, width: int, height: int) -> Detection:
@@ -448,7 +459,20 @@ def main(argv: list[str] | None = None) -> int:
                              f"(default: {defaults.pitch_min_deg:g} {defaults.pitch_max_deg:g})")
     parser.add_argument("--debug-gaze", action="store_true",
                         help="log every face's id, raw and smoothed gaze angles once per second")
+    parser.add_argument("--zoom-faces", choices=ZOOM_MODES, default="far",
+                        help="landmarker only. far (default) = also find small faces with the "
+                             "long-range detector and zoom in on them; all = zoom every face; "
+                             "off = the full-frame landmarker alone")
+    parser.add_argument("--zoom-enhance", default=DEFAULT_ENHANCE,
+                        help=f"clean-up of zoomed crops: a preset ({', '.join(PRESETS)}) or steps "
+                             f"joined by + (default: {DEFAULT_ENHANCE})")
+    parser.add_argument("--small-faces", action=argparse.BooleanOptionalAction, default=True,
+                        help="size-aware trust for small faces (default: on)")
     args = parser.parse_args(argv)
+    try:
+        enhance = parse_enhance(args.zoom_enhance)
+    except ValueError as error:
+        parser.error(f"--zoom-enhance: {error}")
     if not args.no_pi and not args.pi_host:
         parser.error("--pi-host is required unless --no-pi is given")
     model = args.model or MODELS[args.detector]
@@ -468,6 +492,10 @@ def main(argv: list[str] | None = None) -> int:
         yaw_margin=args.gaze_yaw_margin, pitch_margin=args.gaze_pitch_margin,
         enter_s=args.enter_s, exit_s=args.exit_s, min_faces=args.min_faces,
     )
+    if args.small_faces:
+        small_gaze, small_tracking = small_face_defaults()
+        gaze_config = replace(gaze_config, **small_gaze)
+        tracker_config = replace(tracker_config, **small_tracking)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
                         datefmt="%H:%M:%S")
 
@@ -517,7 +545,11 @@ def main(argv: list[str] | None = None) -> int:
                   "always (--docs-always)" if args.docs_always else
                   "never (no control URL)" if turret is None else f"when the turret is on ({control_url})")
         base = mp.tasks.BaseOptions(model_asset_path=str(model))
-        if landmarker:
+        zooming = landmarker and args.zoom_faces != "off"
+        if zooming:
+            model_context = LandmarkPipeline(str(model), str(ZOOM_DETECTOR), zoom=args.zoom_faces,
+                                             max_faces=MAX_FACES, enhance=enhance)
+        elif landmarker:
             options = vision.FaceLandmarkerOptions(
                 base_options=base, running_mode=vision.RunningMode.VIDEO, num_faces=MAX_FACES,
                 output_facial_transformation_matrixes=True,
@@ -537,7 +569,8 @@ def main(argv: list[str] | None = None) -> int:
                 if landmarker:
                     # VIDEO mode needs strictly increasing timestamps.
                     last_ms = max(last_ms + 1, int(time.monotonic() * 1000))
-                    raw = detect_landmarks(face_model, frame, last_ms)
+                    raw = (face_model(frame, last_ms) if zooming
+                           else detect_landmarks(face_model, frame, last_ms))
                 else:
                     raw = detect_faces(face_model, frame)
                 _, peeper = detector.step(raw, width, height)
