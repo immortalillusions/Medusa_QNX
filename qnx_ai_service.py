@@ -21,7 +21,8 @@ from medusa.tflite_detector import (
     DEFAULT_NUM_THREADS, DEFAULT_SCORE_THRESHOLD, TFLiteFaceGazeDetector, draw_face_boxes,
 )
 from medusa.trigger import (
-    FALLBACK_REASON, FaceConfirm, FrameRate, LaptopTrigger, PanTracker, decide_aim, draw_aim_boxes,
+    FALLBACK_REASON, FaceConfirm, FrameRate, LaptopTrigger, PanTracker, PeeperMatcher, decide_aim,
+    draw_aim_boxes,
 )
 
 
@@ -100,7 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
                          help="consecutive frames a turret face must be seen near the same spot "
                               "before it is aimed at")
     trigger.add_argument("--face-dropout-frames", type=int, default=2,
-                         help="frames the last aimed face is kept through a detection dropout")
+                         help="frames the last aimed face, and the peeper lock, are kept through a detection dropout")
     turret = parser.add_argument_group(
         "camera on turret (laptop-trigger mode only)",
         "the camera pans with the turret, so pan tracks the face's world bearing: the Pi models the "
@@ -184,16 +185,32 @@ def _laptop_x(trigger: LaptopTrigger, laptop_active: bool) -> float | None:
     return trigger.latest.target_x if laptop_active and trigger.latest is not None else None
 
 
+def _laptop_user_x(trigger: LaptopTrigger, laptop_active: bool) -> float | None:
+    return trigger.latest.user_x if laptop_active and trigger.latest is not None else None
+
+
+def _expected_x(pan: PanTracker | None, learned, laptop_x: float | None) -> float | None:
+    """Where the laptop's peeper should appear in the turret image, or None without a usable map."""
+    expected_pan = learned.angle(laptop_x) if pan is not None and learned is not None else None
+    return pan.expected_image_x(expected_pan) if expected_pan is not None else None
+
+
 def _trigger_status(trigger: LaptopTrigger, laptop_active: bool, aim, pan=None, pan_error=None,
-                    fps: float | None = None, learned_points: int | None = None) -> dict:
+                    fps: float | None = None, learned_points: int | None = None,
+                    matcher: PeeperMatcher | None = None) -> dict:
     age = trigger.age()
+    aiming = aim is not None and aim.active
     status = {
         "mode": "laptop-trigger",
         "fps": fps,
         "laptop_active": laptop_active,
         "laptop_age_s": round(age, 3) if age is not None else None,
         "laptop_target_x": _laptop_x(trigger, laptop_active),
-        "aim_target": [aim.target_x, aim.target_y] if aim is not None and aim.active else None,
+        "aim_target": [aim.target_x, aim.target_y] if aiming else None,
+        # How the aimed face was chosen (PeeperMatcher): map, single, order, smallest or none.
+        "aim_match": matcher.match if matcher is not None and aiming else "none",
+        "expected_x": (round(matcher.expected_x, 4)
+                       if matcher is not None and matcher.expected_x is not None else None),
     }
     if pan is not None:
         status["pan_angle"] = round(pan.angle, 1)
@@ -220,12 +237,14 @@ def _pan_tracker(args) -> PanTracker | None:
 
 
 def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
-    """Aim at the turret camera's smallest face while the laptop reports a fresh peeper."""
+    """Aim at the laptop's peeper as the turret camera sees it (PeeperMatcher) while the laptop
+    reports a fresh peeper."""
     import cv2
 
     trigger = None
     pan = _pan_tracker(args)
     confirm = FaceConfirm(args.face_confirm_frames, args.face_dropout_frames)
+    matcher = PeeperMatcher(lock_dropout=args.face_dropout_frames)  # The lock rides out the same dropouts.
     rate = FrameRate()
     handoff = HandoffLearner(args.handoff_map, minimum=args.servo_min, maximum=args.servo_max) if (
         pan and pan.search_speed > 0) else None
@@ -244,6 +263,7 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
             laptop_active, laptop_reason = trigger.status()
             if not ok:
                 confirm.reset()
+                matcher.reset()
                 if pan:
                     pan.reset()  # A camera fault is not a brief detection drop: park, matching safe_stop.
                 if arduino:
@@ -253,7 +273,8 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
                                                 extra=_trigger_status(trigger, laptop_active, None, pan,
                                                                       fps=rate.fps(), learned_points=(
                                                                           handoff.learned_points
-                                                                          if handoff else None)))
+                                                                          if handoff else None),
+                                                                      matcher=matcher))
                 continue
             rate.tick()
             height, width = frame.shape[:2]
@@ -261,16 +282,21 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
                 boxes = detector.face_detector.detect(frame)
             except (RuntimeError, ValueError, cv2.error):
                 boxes = None
-            aim = decide_aim(laptop_active, laptop_reason, boxes, width, height, confirm=confirm)
-            pan_error = learned = laptop_x = None
+            laptop_x = _laptop_x(trigger, laptop_active)
+            pan_error = learned = None
             if pan:
                 actual = arduino.poll_actual() if arduino else None
                 if actual is not None:
                     pan.observe_actual(actual.pan, actual.t, actual.armed)
                 else:
                     pan.observe_actual(None, None)
-                laptop_x = _laptop_x(trigger, laptop_active)
                 learned = handoff.current() if handoff else None
+            # Match the laptop's peeper among the turret's faces: the map's expected image x
+            # first, else the laptop's left/right ordering, else the smallest face.
+            aim = decide_aim(laptop_active, laptop_reason, boxes, width, height, confirm=confirm,
+                             matcher=matcher, expected_x=_expected_x(pan, learned, laptop_x),
+                             laptop_x=laptop_x, user_x=_laptop_user_x(trigger, laptop_active))
+            if pan:
                 # A held target is a stale image position on a camera that has since moved: the
                 # tracker coasts on its own prediction instead.
                 pan_error = pan.update(
@@ -306,7 +332,8 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
                     snooper_count=1 if aim.active else 0,
                     nose_offset=nose_offset,
                     extra=_trigger_status(trigger, laptop_active, aim, pan, pan_error, fps=rate.fps(),
-                                          learned_points=handoff.learned_points if handoff else None),
+                                          learned_points=handoff.learned_points if handoff else None,
+                                          matcher=matcher),
                 )
     except KeyboardInterrupt:
         pass

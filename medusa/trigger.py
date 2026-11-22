@@ -24,6 +24,13 @@ NO_FACE_REASON = "laptop sees a peeper; turret camera sees no face"
 CONFIRMING_REASON = "laptop sees a peeper; confirming the turret camera's face"
 HELD_REASON = "laptop sees a peeper; holding the last face through a dropout"
 FALLBACK_REASON = "laptop-guided aim (turret camera lost the face)"
+NO_MATCH_REASON = "laptop sees a peeper; no turret face matches the laptop's peeper"
+MATCH_REASONS = {
+    "map": "laptop sees a peeper; aiming at the face where the map expects the peeper",
+    "single": "laptop sees a peeper; aiming at the only face",
+    "order": "laptop sees a peeper; aiming at the face on the peeper's side of the user",
+    "smallest": "laptop sees a peeper; aiming at the smallest face",
+}
 _MAX_PACKETS_PER_POLL = 64  # Bound the drain so a flood cannot starve the camera loop.
 
 
@@ -33,6 +40,7 @@ class PeeperMessage:
     target_x: float | None = None
     target_y: float | None = None
     seq: int | None = None
+    user_x: float | None = None  # Optional: the user's x in the laptop image (PeeperMatcher's "order").
 
 
 def _optional_number(value) -> float | None:
@@ -58,6 +66,7 @@ def parse_peeper_message(payload: bytes) -> PeeperMessage | None:
         target_x=_optional_number(message.get("target_x")),
         target_y=_optional_number(message.get("target_y")),
         seq=seq if isinstance(seq, int) and not isinstance(seq, bool) else None,
+        user_x=_optional_number(message.get("user_x")),
     )
 
 
@@ -139,6 +148,91 @@ def pick_aim_target(
     x = min(1.0, max(0.0, (box.left + box.right) / (2 * width)))
     y = min(1.0, max(0.0, (box.top + box.bottom) / (2 * height)))
     return box, x, y
+
+
+def _face(box: FaceBox, width: int, height: int) -> tuple[FaceBox, float, float]:
+    return (box, min(1.0, max(0.0, (box.left + box.right) / (2 * width))),
+            min(1.0, max(0.0, (box.top + box.bottom) / (2 * height))))
+
+
+class PeeperMatcher:
+    """Pick the turret-camera face that is the laptop's peeper, not the user.
+
+    The laptop sees both people and names the peeper (target_x, and optionally the
+    user's x as ``user_x``); the turret camera may see either or both. While the
+    laptop is active, in order:
+
+    * "map": with a usable laptop_x -> pan map, the caller passes ``expected_x``,
+      where the peeper should appear in the turret image (PanTracker.expected_image_x
+      of map(laptop target_x)). The face whose centre x is nearest it wins if within
+      ``gate`` (frame widths); with none inside the gate there is no match ("none"),
+      so the tracker falls back to aiming at the map instead of at the user.
+    * "single": no map, one face: that face.
+    * "order": no map, 2+ faces, the laptop sent ``user_x``: the peeper's side of the
+      user in the laptop image picks the rightmost or leftmost turret face. This
+      assumes both cameras look at the people from the same side, unmirrored.
+    * "smallest": otherwise the smallest face (pick_aim_target, the old rule).
+
+    Lock: once a face is picked while the laptop is active, later frames take the
+    face nearest the last pick within ``lock_radius`` (x, frame widths), so the turret
+    does not jump to the user standing close by. The lock survives ``lock_dropout``
+    frames without such a face (returning None, so the user is not picked meanwhile),
+    and is dropped at once if the locked face leaves the gate around ``expected_x``;
+    matching then runs again. The laptop going inactive drops the lock. ``match`` is
+    how the current face was chosen (kept while locked), "none" without one.
+    """
+
+    def __init__(self, gate: float = 0.25, lock_radius: float = 0.15, lock_dropout: int = 2) -> None:
+        self.gate, self.lock_radius, self.lock_dropout = gate, lock_radius, lock_dropout
+        self.reset()
+
+    def reset(self) -> None:
+        self.lock_x: float | None = None
+        self.missed = 0
+        self.match = "none"
+        self.expected_x: float | None = None
+
+    def pick(
+        self, boxes: Sequence[FaceBox] | None, width: int, height: int, *, laptop_active: bool = True,
+        expected_x: float | None = None, laptop_x: float | None = None, user_x: float | None = None,
+    ) -> tuple[FaceBox, float, float] | None:
+        """This frame's face (box, x, y normalized 0..1), or None."""
+        self.expected_x = expected_x if laptop_active else None
+        if not laptop_active:
+            self.lock_x, self.missed = None, 0
+        faces = [_face(box, width, height) for box in boxes or ()]
+        if self.lock_x is not None:
+            near = [f for f in faces if abs(f[1] - self.lock_x) <= self.lock_radius]
+            if near:
+                face = min(near, key=lambda f: abs(f[1] - self.lock_x))
+                if self.expected_x is None or abs(face[1] - self.expected_x) <= self.gate:
+                    self.lock_x, self.missed = face[1], 0
+                    return face
+                self.lock_x = None  # The locked face is not where the map puts the peeper: re-match.
+            else:
+                self.missed += 1
+                if self.missed <= self.lock_dropout:
+                    return None
+                self.lock_x = None
+        self.missed = 0
+        face, self.match = self._match(faces, laptop_x, user_x)
+        if face is not None and laptop_active:
+            self.lock_x = face[1]
+        return face
+
+    def _match(self, faces, laptop_x, user_x):
+        if not faces:
+            return None, "none"
+        if self.expected_x is not None:
+            face = min(faces, key=lambda f: abs(f[1] - self.expected_x))
+            return (face, "map") if abs(face[1] - self.expected_x) <= self.gate else (None, "none")
+        if len(faces) == 1:
+            return faces[0], "single"
+        if laptop_x is not None and user_x is not None and laptop_x != user_x:
+            pick = max if laptop_x > user_x else min  # Peeper right of the user: the rightmost face.
+            return pick(faces, key=lambda f: f[1]), "order"
+        area = lambda f: ((f[0].right - f[0].left) * (f[0].bottom - f[0].top), -f[0].score)
+        return min(faces, key=area), "smallest"  # The same rule as pick_aim_target.
 
 
 class FaceConfirm:
@@ -223,14 +317,21 @@ class AimDecision:
 
 def decide_aim(
     laptop_active: bool, laptop_reason: str, boxes: Sequence[FaceBox] | None,
-    width: int, height: int, *, confirm: FaceConfirm | None = None,
+    width: int, height: int, *, confirm: FaceConfirm | None = None, matcher: PeeperMatcher | None = None,
+    expected_x: float | None = None, laptop_x: float | None = None, user_x: float | None = None,
 ) -> AimDecision:
     """Aim only while the laptop is active and the turret camera has a face to aim at.
 
+    With ``matcher`` the face is the PeeperMatcher's pick (``expected_x``, ``laptop_x``
+    and ``user_x`` are its inputs); without it, pick_aim_target's smallest face.
     With ``confirm`` the face must pass FaceConfirm; it is fed every frame, laptop
     active or not, so a face already in view is aimed at as soon as the laptop fires.
     """
-    picked = pick_aim_target(boxes, width, height) if boxes else None
+    if matcher is not None:
+        picked = matcher.pick(boxes, width, height, laptop_active=laptop_active, expected_x=expected_x,
+                              laptop_x=laptop_x, user_x=user_x)
+    else:
+        picked = pick_aim_target(boxes, width, height) if boxes else None
     if confirm is not None:
         picked = confirm.update(picked, width, height)
     if boxes is None:
@@ -239,12 +340,16 @@ def decide_aim(
         return AimDecision(False, reason=laptop_reason)
     if picked is None:
         confirming = confirm is not None and confirm.streak > 0
-        return AimDecision(False, reason=CONFIRMING_REASON if confirming else NO_FACE_REASON)
+        unmatched = matcher is not None and bool(boxes)
+        return AimDecision(False, reason=CONFIRMING_REASON if confirming else (
+            NO_MATCH_REASON if unmatched else NO_FACE_REASON))
     box, x, y = picked
     if confirm is not None and confirm.held:
         return AimDecision(True, x, y, HELD_REASON, box, held=True)
-    reason = ("laptop sees a peeper; aiming at the only face" if len(boxes) == 1
-              else "laptop sees a peeper; aiming at the smallest face")
+    if matcher is not None:
+        reason = MATCH_REASONS.get(matcher.match, MATCH_REASONS["smallest"])
+    else:
+        reason = MATCH_REASONS["single" if len(boxes) == 1 else "smallest"]
     return AimDecision(True, x, y, reason, box)
 
 
@@ -439,6 +544,16 @@ class PanTracker:
         if self._last_now is None or not self._actual_fresh(self._last_now) or not self.actual[2]:
             return None
         return self.actual[1]
+
+    def current_pan(self) -> float:
+        """Where the turret points now: the fresh real angle, else the firmware model's position."""
+        real = self.real_pan()
+        return real if real is not None else self.servo.position
+
+    def expected_image_x(self, bearing: float) -> float:
+        """Turret-image x (unclamped) of a face at world ``bearing``, the inverse of the
+        bearing formula above: 0.5 + sign * (bearing - current pan) / hfov."""
+        return 0.5 + self.sign * (bearing - self.current_pan()) / self.hfov_deg
 
     def turret_position(self, captured: float, now: float) -> float:
         """Where the turret pointed at ``captured``: the real angle when fresh, else the model."""
