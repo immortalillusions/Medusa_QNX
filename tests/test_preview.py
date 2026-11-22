@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from medusa.nose_offset import NoseOffset
-from medusa.preview import PreviewServer, RuntimeSettings, parse_settings
+from medusa.preview import PreviewServer, PreviewState, RuntimeSettings, parse_settings
 
 
 class SettingsTests(unittest.TestCase):
@@ -62,6 +62,36 @@ class SettingsTests(unittest.TestCase):
 
 
 class PreviewTests(unittest.TestCase):
+    def test_light_stream_shrinks_wide_frames_and_uses_its_quality(self) -> None:
+        calls = {}
+        frame = SimpleNamespace(shape=(480, 640, 3))
+        small = SimpleNamespace(shape=(360, 480, 3))
+
+        def resize(image, size, interpolation):
+            calls["resize"] = (image, size)
+            return small
+
+        def imencode(extension, image, options):
+            calls["encode"] = (image, options)
+            return True, memoryview(b"jpeg")
+
+        fake_cv2 = SimpleNamespace(IMWRITE_JPEG_QUALITY=1, INTER_AREA=3, resize=resize, imencode=imencode)
+        with patch.dict(sys.modules, {"cv2": fake_cv2}):
+            PreviewState(jpeg_quality=55, max_width=480).update_frame(frame)
+        self.assertEqual(calls["resize"], (frame, (480, 360)))
+        self.assertEqual(calls["encode"], (small, [1, 55]))
+
+    def test_default_stream_keeps_full_size_and_quality_75(self) -> None:
+        calls = {}
+        fake_cv2 = SimpleNamespace(
+            IMWRITE_JPEG_QUALITY=1, resize=lambda *a, **k: calls.setdefault("resize", True),
+            imencode=lambda extension, image, options: (calls.setdefault("encode", options) and True, memoryview(b"j")),
+        )
+        with patch.dict(sys.modules, {"cv2": fake_cv2}):
+            PreviewState().update_frame(SimpleNamespace(shape=(480, 640, 3)))
+        self.assertNotIn("resize", calls)
+        self.assertEqual(calls["encode"], [1, 75])
+
     def test_stream_waits_for_the_next_frame_without_blocking_status(self) -> None:
         preview = PreviewServer(0)
         preview.start()

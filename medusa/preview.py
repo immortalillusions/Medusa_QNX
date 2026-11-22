@@ -10,7 +10,8 @@ from .nose_offset import NoseOffset
 
 
 class PreviewState:
-    def __init__(self) -> None:
+    def __init__(self, jpeg_quality: int = 75, max_width: int | None = None) -> None:
+        self.jpeg_quality, self.max_width = jpeg_quality, max_width
         self.condition = threading.Condition()
         self.jpeg: bytes | None = None
         self.frame_number = 0
@@ -20,7 +21,11 @@ class PreviewState:
     def update_frame(self, frame) -> None:
         import cv2
 
-        ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        if self.max_width and frame.shape[1] > self.max_width:
+            # A smaller, lighter stream for a slow link (the Pi's preview over a phone hotspot).
+            height = round(frame.shape[0] * self.max_width / frame.shape[1])
+            frame = cv2.resize(frame, (self.max_width, height), interpolation=cv2.INTER_AREA)
+        ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
         if ok:
             with self.condition:
                 self.jpeg = encoded.tobytes()
@@ -94,8 +99,9 @@ class PreviewServer:
     With ``settings`` it also takes POST /settings (see parse_settings), answering 202.
     """
 
-    def __init__(self, port: int, settings: RuntimeSettings | None = None, host: str = "") -> None:
-        self.state = PreviewState()
+    def __init__(self, port: int, settings: RuntimeSettings | None = None, host: str = "", *,
+                 jpeg_quality: int = 75, max_width: int | None = None) -> None:
+        self.state = PreviewState(jpeg_quality, max_width)
         state = self.state
 
         class Handler(BaseHTTPRequestHandler):

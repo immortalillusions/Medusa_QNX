@@ -507,7 +507,8 @@ def main() -> int:
         print(f"Medusa cannot start safely: {error}", file=sys.stderr)
         return 2
 
-    preview = PreviewServer(args.preview_port) if args.preview_port else None
+    # Light stream (480 px wide, quality 55): it crosses a phone hotspot to the dashboard.
+    preview = PreviewServer(args.preview_port, jpeg_quality=55, max_width=480) if args.preview_port else None
     if preview:
         preview.start()
     arduino = None
