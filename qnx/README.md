@@ -14,6 +14,10 @@ Run on the Pi through the QNX OSS TensorFlow Lite runtime:
 - `blaze_face_short_range.tflite`: BlazeFace short-range (128x128), for
   `capture_face.py` and the older Pi-only mode.
 - `face_landmark_detector.tflite`: 468 face landmarks.
+- `cascades/haarcascade_profileface.xml`, `cascades/haarcascade_upperbody.xml`: OpenCV's
+  own Haar cascades (copied from `cv2/data`; BSD-style Intel and ETH Zurich licences, text in each file's
+  header), for `medusa/body_detector.py`'s head-from-body fallback. The Pi's cv2 has no
+  `cv2.data`, so they are checked in here.
 
 Run on the MacBook through MediaPipe:
 
