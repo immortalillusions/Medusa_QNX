@@ -51,6 +51,12 @@ class TrackerConfig:
     swap_hold_s: float = 0.5
     takeover_s: float = 1.0       # a newer peeper must look this long to steal the lock
     min_lock_s: float = 1.5       # no switch sooner than this after the last one
+    # Small (distant) faces: a face narrower than small_width (fraction of frame width) is
+    # smoothed with small_tau_s and must look for small_enter_s (None = the normal value).
+    # small_width 0 = off: every face is treated alike.
+    small_width: float = 0.0
+    small_tau_s: float | None = None
+    small_enter_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -187,6 +193,17 @@ class PeeperTracker:
         return track
 
     # ---- smoothing + looking ---------------------------------------------------------
+    def _small(self, track: Track) -> bool:
+        return track.width < self.config.small_width
+
+    def _tau(self, track: Track) -> float:
+        cfg = self.config
+        return cfg.small_tau_s if cfg.small_tau_s is not None and self._small(track) else cfg.smooth_tau_s
+
+    def _enter_s(self, track: Track) -> float:
+        cfg = self.config
+        return cfg.small_enter_s if cfg.small_enter_s is not None and self._small(track) else cfg.enter_s
+
     def _observe(self, track: Track, det: Detection, now: float, first: bool = False) -> None:
         cfg = self.config
         if not first:
@@ -205,7 +222,7 @@ class PeeperTracker:
         if gaze.method == "eyes":
             eye = (gaze.eye_yaw, gaze.eye_pitch)
             if track._eye is not None:  # smoothed eye contribution, held through a blink
-                a = _alpha(now - track._eye_time, cfg.smooth_tau_s)
+                a = _alpha(now - track._eye_time, self._tau(track))
                 eye = (track._eye[0] + a * (eye[0] - track._eye[0]),
                        track._eye[1] + a * (eye[1] - track._eye[1]))
             track._eye, track._eye_time = eye, now
@@ -225,7 +242,7 @@ class PeeperTracker:
                 return
             track._last_outlier = False
             track.frame_looking = self._in_band(*raw, wide=True)
-            a = _alpha(now - track._gaze_time, cfg.smooth_tau_s)
+            a = _alpha(now - track._gaze_time, self._tau(track))
             track.gaze_yaw += a * (raw[0] - track.gaze_yaw)
             track.gaze_pitch += a * (raw[1] - track.gaze_pitch)
         track._gaze_time = now
@@ -279,7 +296,7 @@ class PeeperTracker:
         # The smoothed gaze lags a glance's end by ~tau; frame_looking stops that lag
         # stretching a short glance past enter_s.
         ready = [t for t in candidates
-                 if t.looking_s(now) >= cfg.enter_s - EPS and t.frame_looking]
+                 if t.looking_s(now) >= self._enter_s(t) - EPS and t.frame_looking]
         if self.peeper_id is not None:
             current = next((t for t in candidates if t.id == self.peeper_id), None)
             if current is not None:

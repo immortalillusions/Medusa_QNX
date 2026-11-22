@@ -42,6 +42,7 @@ class GazeConfig:
     pitch_min_deg: float = -35.0   # looking down at the bottom of the screen
     pitch_max_deg: float = 10.0    # a little above the camera still counts
     closed_ratio: float = 0.12     # lid gap / eye width below this = eye closed
+    min_eye_px: float = 0.0        # an eye narrower than this (pixels) is ignored: iris too coarse
 
 
 @dataclass(frozen=True)
@@ -84,7 +85,8 @@ def _clamp(value: float) -> float:
 
 
 def eye_angles(points: Sequence[tuple[float, float]], config: GazeConfig) -> tuple[float, float] | None:
-    """Eye-in-head (yaw, pitch) averaged over the open eyes, or None if both are closed.
+    """Eye-in-head (yaw, pitch) averaged over the open eyes, or None if both are closed
+    (or narrower than ``min_eye_px``).
 
     ``points`` are pixel-proportional (x, y) with y down. Each eye's ratio runs from the
     image-left corner to the image-right one, so iris-right means looking image-right.
@@ -97,7 +99,7 @@ def eye_angles(points: Sequence[tuple[float, float]], config: GazeConfig) -> tup
         iris = points[eye["iris"]]
         h, width = _ratio(iris, a, b)
         v, gap = _ratio(iris, points[eye["upper"]], points[eye["lower"]])
-        if width <= 0 or gap / width < config.closed_ratio:
+        if width <= 0 or width < config.min_eye_px or gap / width < config.closed_ratio:
             continue
         yaws.append(_clamp((h - 0.5) / H_TRAVEL) * config.eye_gain_deg)
         pitches.append(_clamp((V_CENTRE - v) / V_TRAVEL) * config.eye_gain_deg)
