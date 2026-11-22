@@ -1,8 +1,10 @@
 """Find small faces, then zoom: landmarks for faces the full-frame landmarker is too coarse for.
 
 FaceLandmarker's own detector is BlazeFace short-range at 128x128 on the whole frame, so a
-face 3-4 m from a 1920x1080 camera is a few pixels there and is never found. Here the
-256x256 BlazeFace "back" model runs on native-resolution tiles instead: a 2x1 grid finds
+face 3-4 m from a 1920x1080 camera is a few pixels there and is never found. The default
+finder here is OpenCV's YuNet (medusa.yunet_detector), one half-resolution pass over the
+frame, which finds 23 px faces (10 m). The alternative (finder="blazeface") is the
+256x256 BlazeFace "back" model on native-resolution tiles: a 2x1 grid finds
 faces down to ~30 px (7 m), a 4x2 grid down to ~23 px (10 m). The tiles are shared out
 round-robin, ``tiles_per_frame`` a frame, and a face once found is followed by re-cropping
 around its last landmarks every frame, so a new face is found within a few frames while the
