@@ -28,13 +28,15 @@ IPC is localhost UDP JSON: simple and works on QNX's io-sock today. QNX native
 message passing (MsgSend/MsgReceive, priority-inheriting) would be the
 production choice, but has no binding in the stock Python build.
 
-The loop runs in the main thread; the HTTP status server and the stress-test
-timer run in daemon threads that are almost always blocked. The GIL switch
+The loop runs in the main thread; the HTTP status server, the stress-test
+timer and the Pi usage sampler (SystemSampler, one ``hogs`` run every ~2 s at
+priority 10) run in daemon threads that are almost always blocked. The GIL switch
 interval is shortened so a waking loop thread gets the interpreter quickly.
 """
 
 from __future__ import annotations
 
+import calendar
 import json
 import math
 import os
@@ -338,8 +340,7 @@ class StressTest:
 
     def command(self, seconds: float) -> list[str]:
         command = [sys.executable, "-c", _BUSY_LOOP, str(seconds)]
-        on_qnx = sys.platform.startswith(("qnx", "nto")) or os.uname().sysname.upper().startswith("QNX")
-        if on_qnx and shutil.which("on"):
+        if on_qnx() and shutil.which("on"):
             command = ["on", "-p", str(self.priority)] + command
         return command
 
@@ -365,12 +366,174 @@ class StressTest:
                 proc.kill()
             proc.wait()
 
+    def pids(self) -> set[int]:
+        with self.lock:
+            return {proc.pid for proc in self.procs if getattr(proc, "pid", None) is not None}
+
     def status(self) -> dict:
         with self.lock:
             ends_at = self.ends_at
             running = ends_at is not None and any(p.poll() is None for p in self.procs)
         left = max(0, math.ceil(ends_at - self.clock())) if running else 0
         return {"running": running, "seconds_left": left, "workers": self.workers if running else 0}
+
+
+# --- Pi usage (CPU, memory, temperature, uptime) --------------------------------------------
+
+SYSTEM_PERIOD_S = 2.0
+SYSTEM_KEYS = ("cpu_total_pct", "cpu_control_pct", "cpu_ai_pct", "mem_free_mb", "mem_total_mb",
+               "temp_c", "uptime_s", "sampled_age_s")
+# One spawn per sample: pidin info, then a 2 s hogs sample (root for real numbers; plain hogs
+# prints N/A). On QNX it runs through ``on -p 10`` so it never competes with the loop's 21.
+SYSTEM_COMMAND = "pidin info; sudo -n hogs -i 1 -s 2"
+_HOGS_HEADER = re.compile(r"^\s*PID\s+NAME\s+MSEC\b", re.M)
+_HOGS_ROW = re.compile(r"^\s*(\d+)\s+(.*?)\s*(\d+)\s+(\d+(?:\.\d+)?)%\s+(\d+(?:\.\d+)?)%")
+_MEM = re.compile(r"FreeMem:\s*(\d+(?:\.\d+)?)\s*([KMG]?)B?\s*/\s*(\d+(?:\.\d+)?)\s*([KMG]?)B?", re.I)
+_BOOT = re.compile(r"BootTime:\s*(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\w+\s+\d{4})")
+_MB = {"K": 1 / 1024, "": 1 / (1024 * 1024), "M": 1, "G": 1024}
+
+
+def on_qnx() -> bool:
+    return sys.platform.startswith(("qnx", "nto")) or os.uname().sysname.upper().startswith("QNX")
+
+
+def parse_hogs(text: str) -> list[tuple[int, str, float]]:
+    """QNX ``hogs`` rows after the ``PID NAME MSEC PIDS SYS MEMORY`` header: (pid, name, SYS %).
+
+    SYS is the share of total CPU. Rows without numbers (non-root hogs prints N/A) are skipped.
+    """
+    header = _HOGS_HEADER.search(text)
+    if header is None:
+        return []
+    rows = []
+    for line in text[header.end():].splitlines():
+        match = _HOGS_ROW.match(line)
+        if match:
+            rows.append((int(match.group(1)), match.group(2).strip(), float(match.group(5))))
+    return rows
+
+
+def cpu_from_hogs(rows, control_pid: int, exclude=()) -> tuple[float | None, float | None, float | None]:
+    """(total, control, AI) CPU %. Total is 100 minus PID 1 (procnto, which holds the idle
+    threads), so it slightly under-counts the kernel. The AI is the busiest other python
+    process (stress workers, which are python too, are passed in ``exclude``)."""
+    if not rows:
+        return None, None, None
+    by_pid = {pid: pct for pid, _name, pct in rows}
+    total = None if 1 not in by_pid else round(max(0.0, min(100.0, 100.0 - by_pid[1])), 1)
+    control = by_pid.get(control_pid, 0.0)
+    ai = [pct for pid, name, pct in rows
+          if "python" in name.lower() and pid != control_pid and pid not in exclude]
+    return total, round(control, 1), round(max(ai), 1) if ai else None
+
+
+def parse_pidin_info(text: str) -> tuple[float | None, float | None, float | None]:
+    """``pidin info`` -> (free MB, total MB, boot time as a Unix time); None where absent."""
+    free = total = boot = None
+    mem = _MEM.search(text)
+    if mem:
+        free = round(float(mem.group(1)) * _MB[mem.group(2).upper()], 1)
+        total = round(float(mem.group(3)) * _MB[mem.group(4).upper()], 1)
+    when = _BOOT.search(text)
+    if when:
+        try:
+            boot = calendar.timegm(time.strptime(" ".join(when.group(1).split()), "%b %d %H:%M:%S %Z %Y"))
+        except (ValueError, OverflowError):
+            boot = None
+    return free, total, boot
+
+
+def parse_thermal(text: str) -> float | None:
+    """``/dev/thermal`` prints the SoC temperature in degrees C, e.g. ``51.57``."""
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if match is None:
+        return None
+    value = float(match.group(0))
+    return round(value, 1) if -40 <= value <= 150 else None
+
+
+def _run_system_command(timeout: float = 6.0) -> str:
+    if not on_qnx():
+        return ""  # pidin and hogs are QNX tools: elsewhere every field stays null.
+    command = ["sh", "-c", SYSTEM_COMMAND]
+    if shutil.which("on"):
+        command = ["on", "-p", "10"] + command
+    result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, timeout=timeout, check=False)
+    return result.stdout.decode("utf-8", "replace")
+
+
+def _read_thermal(path: str = "/dev/thermal") -> str:
+    with open(path, "rb") as handle:
+        return handle.read(64).decode("ascii", "replace")
+
+
+class SystemSampler:
+    """Samples Pi usage every ``period_s`` in a daemon thread; never touched by the 50 Hz loop.
+
+    Every source is optional: a failed command, file or parse leaves its fields null.
+    """
+
+    def __init__(self, *, period_s: float = SYSTEM_PERIOD_S, run=_run_system_command,
+                 read_thermal=_read_thermal, clock=system_clock, wall=time.time, pid: int | None = None,
+                 exclude=lambda: ()) -> None:
+        self.period_s, self.run, self.read_thermal = period_s, run, read_thermal
+        self.clock, self.wall = clock, wall
+        self.pid = os.getpid() if pid is None else pid
+        self.exclude = exclude  # pids that are not the AI (the stress workers)
+        self._lock = threading.Lock()
+        self._sample: dict | None = None
+        self._sampled_at: float | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def sample_once(self) -> dict:
+        try:
+            text = self.run()
+        except Exception:  # missing tool, timeout, anything: null fields, never an exception
+            text = ""
+        header = _HOGS_HEADER.search(text)
+        info, hogs = (text[:header.start()], text[header.start():]) if header else (text, "")
+        try:
+            total, control, ai = cpu_from_hogs(parse_hogs(hogs), self.pid, set(self.exclude()))
+        except Exception:
+            total = control = ai = None
+        free, mem_total, boot = parse_pidin_info(info)
+        try:
+            temp = parse_thermal(self.read_thermal())
+        except Exception:
+            temp = None
+        uptime = None
+        if boot is not None and 0 <= self.wall() - boot < 10 * 365 * 86400:
+            uptime = round(self.wall() - boot)
+        elif hasattr(time, "CLOCK_MONOTONIC") and on_qnx():
+            uptime = round(time.clock_gettime(time.CLOCK_MONOTONIC))  # QNX: seconds since boot
+        sample = {"cpu_total_pct": total, "cpu_control_pct": control, "cpu_ai_pct": ai,
+                  "mem_free_mb": free, "mem_total_mb": mem_total, "temp_c": temp, "uptime_s": uptime}
+        with self._lock:
+            self._sample, self._sampled_at = sample, self.clock()
+        return sample
+
+    def status(self, now: float | None = None) -> dict:
+        now = self.clock() if now is None else now
+        with self._lock:
+            sample, at = self._sample, self._sampled_at
+        if sample is None:
+            return dict.fromkeys(SYSTEM_KEYS)
+        return {**sample, "sampled_age_s": round(now - at, 1)}
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            started = self.clock()
+            self.sample_once()
+            self._stop.wait(max(0.1, self.period_s - (self.clock() - started)))
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="control-system", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
 
 
 # --- the control loop -----------------------------------------------------------------------
@@ -381,7 +544,7 @@ class ControlLoop:
         period_s: float = PERIOD_S, target_timeout: float = TARGET_TIMEOUT_S,
         link_timeout: float = LINK_TIMEOUT_S, yaw_range=(65, 115), pitch_range=(65, 115),
         home=(90, 90), window_s: float = WINDOW_S, stress: StressTest | None = None,
-        clock=system_clock, sleep=time.sleep,
+        system: SystemSampler | None = None, clock=system_clock, sleep=time.sleep,
     ) -> None:
         self.serial, self.target_sock = serial, target_sock
         self.actual_sock, self.actual_addr = actual_sock, actual_addr
@@ -390,6 +553,7 @@ class ControlLoop:
         self.home_yaw, self.home_pitch = home
         self.stats = TickStats(period_s, window_s)
         self.stress = stress
+        self.system = system
         self.clock, self.sleep = clock, sleep
         self.reader = StatusReader()
         self.status: ArduinoStatus | None = None
@@ -513,6 +677,7 @@ class ControlLoop:
             },
             "stress": self.stress.status() if self.stress else {"running": False, "seconds_left": 0},
             "write_failures": self.write_failures,
+            "system": self.system.status(now) if self.system else dict.fromkeys(SYSTEM_KEYS),
         }
         return result
 

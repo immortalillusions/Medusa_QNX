@@ -3,6 +3,7 @@ import json
 import socket
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -16,7 +17,8 @@ import medusa_control
 import qnx_ai_service
 from medusa import trigger as trigger_module
 from medusa.control import (
-    ControlClient, ControlHTTPServer, ControlLoop, StatusReader, StressTest, TickStats, format_a_line, format_n_line,
+    SYSTEM_KEYS, ControlClient, ControlHTTPServer, ControlLoop, StatusReader, StressTest, SystemSampler, TickStats,
+    cpu_from_hogs, parse_hogs, parse_pidin_info, parse_thermal, format_a_line, format_n_line,
     make_target_packet, parse_actual_packet, parse_command_line, parse_status_line, parse_target_packet,
     system_clock,
 )
@@ -356,7 +358,95 @@ class StressTests(unittest.TestCase):
 
 
 CONTRACT_KEYS = {"state", "safe_reason", "loop_hz", "period_ms_mean", "jitter_ms_p99", "period_ms_max",
-                 "missed_deadlines", "target_age_s", "ai_alive", "arduino", "stress"}
+                 "missed_deadlines", "target_age_s", "ai_alive", "arduino", "stress", "system"}
+
+# Captured shapes of the QNX 8 tools on the Pi (pidin info's first lines, then sudo hogs -i 1 -s 2).
+PIDIN_INFO = ("CPU:AARCH64 Release:8.0.0  FreeMem:7069MB/8128MB BootTime:Nov 22 05:30:12 UTC 2026\n"
+              "Processes: 61, Threads: 297\n"
+              "Processor1: 1091555328 Cortex-A76 2400MHz FPU\n")
+HOGS = ("    PID           NAME  MSEC PIDS  SYS       MEMORY\n"
+        "      1                 5214  71%  65%   1128k   0%\n"
+        "  45079 usr/bin/python3  1603  21%  20%  98304k   1%\n"
+        "  45080        python3   402   5%   5%  51200k   0%\n"
+        "  45099        python3   300   3%   3%  20480k   0%\n"
+        "  12301  io-sock          88   1%   1%   4096k   0%\n")
+HOGS_NOT_ROOT = ("    PID           NAME  MSEC PIDS  SYS       MEMORY\n"
+                 "      1                  N/A   N/A  N/A   1128k   0%\n")
+
+
+class SystemSamplerTests(unittest.TestCase):
+    def test_hogs_rows_and_cpu_split(self) -> None:
+        rows = parse_hogs(HOGS)
+        self.assertEqual(rows[0], (1, "", 65.0))
+        self.assertEqual(rows[1], (45079, "usr/bin/python3", 20.0))
+        self.assertEqual(len(rows), 5)
+        # Total = 100 - procnto (idle); control = own pid; AI = busiest other python, not a stress worker.
+        self.assertEqual(cpu_from_hogs(rows, 45080), (35.0, 5.0, 20.0))
+        self.assertEqual(cpu_from_hogs(rows, 45080, exclude={45079}), (35.0, 5.0, 3.0))
+        self.assertEqual(cpu_from_hogs(rows, 999), (35.0, 0.0, 20.0))  # control idle: not listed
+        self.assertEqual(parse_hogs(HOGS_NOT_ROOT), [])
+        self.assertEqual(cpu_from_hogs([], 1), (None, None, None))
+        self.assertEqual(parse_hogs("garbage\n  1 x 2 3% 4%\n"), [])  # no header: nothing
+
+    def test_pidin_info_and_thermal(self) -> None:
+        free, total, boot = parse_pidin_info(PIDIN_INFO)
+        self.assertEqual((free, total), (7069.0, 8128.0))
+        self.assertEqual(time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(boot)), "2026-11-22 05:30:12")
+        self.assertEqual(parse_pidin_info("FreeMem:7G/8G")[:2], (7168.0, 8192.0))
+        self.assertEqual(parse_pidin_info("nothing here"), (None, None, None))
+        self.assertEqual(parse_thermal("51.57\n"), 51.6)
+        self.assertIsNone(parse_thermal(""))
+        self.assertIsNone(parse_thermal("9999"))
+
+    def test_sample_combines_sources_and_failures_are_null(self) -> None:
+        clock = FakeClock(50.0)
+        boot = parse_pidin_info(PIDIN_INFO)[2]
+        sampler = SystemSampler(run=lambda: PIDIN_INFO + HOGS, read_thermal=lambda: "51.57",
+                                clock=clock.monotonic, wall=lambda: boot + 3600, pid=45080)
+        self.assertEqual(sampler.status(), dict.fromkeys(SYSTEM_KEYS))  # nothing sampled yet
+        sampler.sample_once()
+        clock.now = 51.5
+        self.assertEqual(sampler.status(), {"cpu_total_pct": 35.0, "cpu_control_pct": 5.0, "cpu_ai_pct": 20.0,
+                                            "mem_free_mb": 7069.0, "mem_total_mb": 8128.0, "temp_c": 51.6,
+                                            "uptime_s": 3600, "sampled_age_s": 1.5})
+
+        def boom():
+            raise OSError("no such tool")
+        broken = SystemSampler(run=boom, read_thermal=boom, clock=clock.monotonic, pid=1)
+        with patch("medusa.control.on_qnx", return_value=False):
+            broken.sample_once()
+        self.assertEqual(broken.status(), {**dict.fromkeys(SYSTEM_KEYS), "sampled_age_s": 0.0})
+
+    def test_snapshot_carries_the_system_block_and_the_loop_never_samples(self) -> None:
+        calls = []
+        sampler = SystemSampler(run=lambda: calls.append(1) or "", read_thermal=lambda: "", pid=1)
+        loop = ControlLoop(FakeSerial(), system=sampler)
+        for k in range(10):
+            loop.tick(k * 0.02)
+        self.assertEqual(calls, [])  # sampling happens only on the sampler's own thread
+        self.assertEqual(set(loop.snapshot()["system"]), set(SYSTEM_KEYS))
+        self.assertEqual(set(ControlLoop(FakeSerial()).snapshot()["system"]), set(SYSTEM_KEYS))
+
+    def test_sampler_thread_runs_and_stops(self) -> None:
+        done = threading.Event()
+        sampler = SystemSampler(run=lambda: done.set() or "", read_thermal=lambda: "40", period_s=0.05, pid=1)
+        sampler.start()
+        self.addCleanup(sampler.stop)
+        self.assertTrue(done.wait(2))
+        self.assertEqual(sampler._thread.name, "control-system")
+        self.assertTrue(sampler._thread.daemon)
+
+    def test_off_qnx_no_command_is_spawned(self) -> None:
+        from medusa import control
+        with patch.object(control, "on_qnx", return_value=False), patch.object(control.subprocess, "run") as run:
+            self.assertEqual(control._run_system_command(), "")
+        run.assert_not_called()
+        with patch.object(control, "on_qnx", return_value=True), \
+                patch.object(control.shutil, "which", return_value="/proc/boot/on"), \
+                patch.object(control.subprocess, "run", return_value=SimpleNamespace(stdout=b"x")) as run:
+            self.assertEqual(control._run_system_command(), "x")
+        self.assertEqual(run.call_args.args[0][:3], ["on", "-p", "10"])
+        self.assertEqual(run.call_count, 1)
 
 
 class HttpContractTests(unittest.TestCase):

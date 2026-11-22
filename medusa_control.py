@@ -23,7 +23,7 @@ import threading
 
 from medusa.control import (
     DEFAULT_ACTUAL_PORT, DEFAULT_HTTP_PORT, DEFAULT_TARGET_PORT, PERIOD_S, STRESS_MAX_S, TARGET_TIMEOUT_S,
-    ControlHTTPServer, ControlLoop, SerialPort, StressTest, _udp_socket,
+    ControlHTTPServer, ControlLoop, SerialPort, StressTest, SystemSampler, _udp_socket,
 )
 
 
@@ -75,6 +75,7 @@ def main(argv=None) -> int:
         return 2
     sockets, http = [], None
     stress = StressTest(args.stress_workers, args.stress_priority)
+    system = SystemSampler(exclude=stress.pids)
     loop = None
     try:
         target_sock = _udp_socket(args.target_port)
@@ -87,8 +88,9 @@ def main(argv=None) -> int:
             actual_addr=("127.0.0.1", args.actual_port) if args.actual_port else None,
             period_s=args.period_ms / 1000, target_timeout=args.target_timeout,
             yaw_range=(args.servo_min, args.servo_max), pitch_range=(args.tilt_min, args.tilt_max),
-            home=(args.servo_home, args.tilt_home), stress=stress,
+            home=(args.servo_home, args.tilt_home), stress=stress, system=system,
         )
+        system.start()
         http = ControlHTTPServer(loop, args.http_port)
         http.start()
         stop = threading.Event()
@@ -101,6 +103,7 @@ def main(argv=None) -> int:
         print(f"medusa_control cannot start: {error}", file=sys.stderr)
         return 2
     finally:
+        system.stop()
         stress.stop()
         if loop is not None:
             loop.shutdown()  # Park lines: home, LED off; the firmware disarms 300 ms later.
