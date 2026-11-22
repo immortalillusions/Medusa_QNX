@@ -868,7 +868,9 @@ export default function Home() {
         badge={laptop.connected && l.active ? { text: "PEEPER", tone: "bad" } : null} />
       <CameraPanel title="Turret camera — aiming (QNX)" sub="Raspberry Pi on QNX · face lock and pan" source={turret}
         ratio="classic" caption={turretCaption} offlineHint="Check the Pi is on the network and QNX preview is running."
-        badge={turret.connected && t.active ? { text: "AIMING", tone: "warn" } : null} />
+        badge={!turret.connected ? null
+          : t.pan_state === "fallback" ? { text: "Following from laptop", tone: "warn" }
+          : t.active ? { text: "AIMING", tone: "warn" } : null} />
     </div>
 
     <Metrics laptop={laptop} turret={turret} control={control} latency={latency} />
