@@ -1,0 +1,38 @@
+README.md
+  s_23fc94f2b4e91f::t_b4c84a5cc6803c 69,72-76
+arduino/medusa_controller/medusa_controller.ino
+  s_23fc94f2b4e91f::t_21f2dc8eeade75 8-9,14,20-23,30-46,53-57,63-64,67,72,86-89
+  s_23fc94f2b4e91f::t_dee2f827b62179 1-7,10-13,15-19,24-29,47-52,58-62,65-66,68-71,73-85,90-92
+medusa/arduino_serial.py
+  s_23fc94f2b4e91f::t_dee2f827b62179 1-40
+medusa/servo.py
+  s_23fc94f2b4e91f::t_0abcfa45e89b3e 17-24
+  s_23fc94f2b4e91f::t_dee2f827b62179 1-16,25-38
+qnx_ai_service.py
+  s_23fc94f2b4e91f::t_130b9b157e374d 11,17,37-41,65-83,91-92,103-104,124-126
+TODO.md
+  s_23fc94f2b4e91f::t_b4c84a5cc6803c 16,28
+  s_23fc94f2b4e91f::t_21f2dc8eeade75 29-30
+tests/test_decision.py
+  s_23fc94f2b4e91f::t_b4c84a5cc6803c 5,32-37
+docs/wiring-diagram.md
+  s_23fc94f2b4e91f::t_0e2f30c1715ccc 48-51
+  s_23fc94f2b4e91f::t_21f2dc8eeade75 26,33-37
+  s_23fc94f2b4e91f::t_d65c2945a0be46 38
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4782b7753802c1ec2869bec01ee36ebc280f7c27",
+  "prompts": {},
+  "sessions": {
+    "s_23fc94f2b4e91f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a2000b-bfe3-7622-8674-fef2c37f959c",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "immortalillusions <84871548+immortalillusions@users.noreply.github.com>"
+    }
+  }
+}
