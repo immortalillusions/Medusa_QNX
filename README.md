@@ -121,8 +121,11 @@ python3 -u qnx_ai_service.py --qnx-camera-unit 5 --control-port 8768 \
 ```
 
 The pan and tilt ranges must match `PAN_*` and `TILT_*` in the firmware, or the
-firmware rejects the commands. On the demo Pi, a `start_medusa.sh` script runs
-these at boot; it lives on the Pi, not in this repo.
+firmware rejects the commands. On the demo Pi, `pi/start_medusa.sh` runs these (plus the low-priority
+`medusa_sysmon.py` stats process) from the repo checkout; `pi/start_uart.sh` brings up the
+header UART first. `pi/boot-autostart.snippet` is the block appended to
+`/data/var/etc/settings/network`, which QNX's boot script sources as root, so Medusa
+starts about 30 s after boot.
 
 The learned pan map is saved to `~/Medusa_QNX-bench/handoff.json`. Use
 `python3 -m medusa.handoff show|record|record-now|clear` to inspect or edit it.
