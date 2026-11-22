@@ -76,8 +76,10 @@ class HeartbeatTests(unittest.TestCase):
                                  "target_x": None, "target_y": None, "seq": 1,
                                  "user_x": (400 + 200) / 1280})
         last, _ = sock.sent[-1]
-        self.assertEqual(set(last), {"type", "active", "target_x", "target_y", "seq", "user_x"})
+        self.assertEqual(set(last), {"type", "active", "target_x", "target_y", "seq", "user_x",
+                                     "peeper_id"})
         self.assertTrue(last["active"])
+        self.assertEqual(last["peeper_id"], detector.tracker.peeper_id)  # only sent while active
         self.assertEqual(last["seq"], frames)
         self.assertAlmostEqual(last["target_x"], (1000 + 60) / 1280)
         self.assertAlmostEqual(last["target_y"], (100 + 60) / 720)

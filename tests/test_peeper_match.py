@@ -160,6 +160,22 @@ class NoMapTests(unittest.TestCase):
         self.assertEqual((aim.active, aim.held, round(aim.target_x, 4)), (True, True, 0.7))
 
 
+class PeeperSwitchTests(unittest.TestCase):
+    def test_a_new_laptop_peeper_id_drops_the_lock_and_rematches(self) -> None:
+        matcher = PeeperMatcher()
+        old, new = face(0.5), face(0.62)  # Both inside the lock radius of each other.
+        self.assertEqual(picked_x(matcher.pick([old], W, H, peeper_id=1)), 0.5)
+        # Same peeper: the lock keeps the old face even with the newer one in view.
+        self.assertEqual(picked_x(matcher.pick([old, new], W, H, expected_x=0.6, peeper_id=1)), 0.5)
+        # The laptop switched peepers: the lock drops and the map's expected x picks again.
+        self.assertEqual(picked_x(matcher.pick([old, new], W, H, expected_x=0.6, peeper_id=2)), 0.62)
+
+    def test_no_peeper_id_keeps_the_old_lock_behaviour(self) -> None:
+        matcher = PeeperMatcher()
+        matcher.pick([face(0.5)], W, H)
+        self.assertEqual(picked_x(matcher.pick([face(0.5), face(0.62)], W, H, expected_x=0.6)), 0.5)
+
+
 class PacketAndStatusTests(unittest.TestCase):
     def test_user_x_is_optional(self) -> None:
         def parse(**fields):
@@ -168,6 +184,10 @@ class PacketAndStatusTests(unittest.TestCase):
         self.assertEqual(parse(target_x=0.7, user_x=0.3).user_x, 0.3)
         self.assertIsNone(parse(target_x=0.7).user_x)
         self.assertIsNone(parse(target_x=0.7, user_x="left").user_x)
+        self.assertEqual(parse(target_x=0.7, peeper_id=4).peeper_id, 4)
+        self.assertIsNone(parse(target_x=0.7).peeper_id)
+        self.assertIsNone(parse(target_x=0.7, peeper_id=True).peeper_id)
+        self.assertIsNone(parse(target_x=0.7, peeper_id="4").peeper_id)
 
     def test_status_reports_the_match_and_expected_x(self) -> None:
         trigger = LaptopTrigger(Mock())

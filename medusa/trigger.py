@@ -41,12 +41,17 @@ class PeeperMessage:
     target_y: float | None = None
     seq: int | None = None
     user_x: float | None = None  # Optional: the user's x in the laptop image (PeeperMatcher's "order").
+    peeper_id: int | None = None  # Optional: the laptop's peeper identity; a change drops the face lock.
 
 
 def _optional_number(value) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         return None
     return float(value)
+
+
+def _optional_int(value) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def parse_peeper_message(payload: bytes) -> PeeperMessage | None:
@@ -67,6 +72,7 @@ def parse_peeper_message(payload: bytes) -> PeeperMessage | None:
         target_y=_optional_number(message.get("target_y")),
         seq=seq if isinstance(seq, int) and not isinstance(seq, bool) else None,
         user_x=_optional_number(message.get("user_x")),
+        peeper_id=_optional_int(message.get("peeper_id")),
     )
 
 
@@ -179,7 +185,9 @@ class PeeperMatcher:
     frames without such a face (returning None, so the user is not picked meanwhile),
     and is dropped at once if the locked face leaves the gate around ``expected_x``;
     matching then runs again. The laptop going inactive drops the lock. ``match`` is
-    how the current face was chosen (kept while locked), "none" without one.
+    how the current face was chosen (kept while locked), "none" without one. A new
+    ``peeper_id`` from the laptop (it switched to a more recent peeper) drops the lock at
+    once, so the turret re-matches instead of staying on the old face.
     """
 
     def __init__(self, gate: float = 0.25, lock_radius: float = 0.15, lock_dropout: int = 2) -> None:
@@ -191,15 +199,21 @@ class PeeperMatcher:
         self.missed = 0
         self.match = "none"
         self.expected_x: float | None = None
+        self.peeper_id: int | None = None
 
     def pick(
         self, boxes: Sequence[FaceBox] | None, width: int, height: int, *, laptop_active: bool = True,
         expected_x: float | None = None, laptop_x: float | None = None, user_x: float | None = None,
+        peeper_id: int | None = None,
     ) -> tuple[FaceBox, float, float] | None:
         """This frame's face (box, x, y normalized 0..1), or None."""
         self.expected_x = expected_x if laptop_active else None
         if not laptop_active:
             self.lock_x, self.missed = None, 0
+        elif peeper_id is not None:
+            if self.peeper_id is not None and peeper_id != self.peeper_id:
+                self.lock_x, self.missed = None, 0  # The laptop switched peepers: re-match.
+            self.peeper_id = peeper_id
         faces = [_face(box, width, height) for box in boxes or ()]
         if self.lock_x is not None:
             near = [f for f in faces if abs(f[1] - self.lock_x) <= self.lock_radius]
@@ -319,6 +333,7 @@ def decide_aim(
     laptop_active: bool, laptop_reason: str, boxes: Sequence[FaceBox] | None,
     width: int, height: int, *, confirm: FaceConfirm | None = None, matcher: PeeperMatcher | None = None,
     expected_x: float | None = None, laptop_x: float | None = None, user_x: float | None = None,
+    peeper_id: int | None = None,
 ) -> AimDecision:
     """Aim only while the laptop is active and the turret camera has a face to aim at.
 
@@ -329,7 +344,7 @@ def decide_aim(
     """
     if matcher is not None:
         picked = matcher.pick(boxes, width, height, laptop_active=laptop_active, expected_x=expected_x,
-                              laptop_x=laptop_x, user_x=user_x)
+                              laptop_x=laptop_x, user_x=user_x, peeper_id=peeper_id)
     else:
         picked = pick_aim_target(boxes, width, height) if boxes else None
     if confirm is not None:

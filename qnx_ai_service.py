@@ -189,6 +189,10 @@ def _laptop_user_x(trigger: LaptopTrigger, laptop_active: bool) -> float | None:
     return trigger.latest.user_x if laptop_active and trigger.latest is not None else None
 
 
+def _laptop_peeper_id(trigger: LaptopTrigger, laptop_active: bool) -> int | None:
+    return trigger.latest.peeper_id if laptop_active and trigger.latest is not None else None
+
+
 def _expected_x(pan: PanTracker | None, learned, laptop_x: float | None) -> float | None:
     """Where the laptop's peeper should appear in the turret image, or None without a usable map."""
     expected_pan = learned.angle(laptop_x) if pan is not None and learned is not None else None
@@ -310,7 +314,8 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
             # first, else the laptop's left/right ordering, else the smallest face.
             aim = decide_aim(laptop_active, laptop_reason, boxes, width, height, confirm=confirm,
                              matcher=matcher, expected_x=_expected_x(pan, learned, laptop_x),
-                             laptop_x=laptop_x, user_x=_laptop_user_x(trigger, laptop_active))
+                             laptop_x=laptop_x, user_x=_laptop_user_x(trigger, laptop_active),
+                             peeper_id=_laptop_peeper_id(trigger, laptop_active))
             if pan:
                 # A held target is a stale image position on a camera that has since moved: the
                 # tracker coasts on its own prediction instead.

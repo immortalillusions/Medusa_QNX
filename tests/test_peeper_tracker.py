@@ -191,3 +191,108 @@ class FrameRateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def peeper_at(x, looking):
+    return looking_peeper(x) if looking else away_peeper(x)
+
+
+def two_peepers(fps, seconds, a_looks, b_looks, a_x=0.75, b_x=0.55):
+    """User at 0.3 plus peepers A and B; a_looks/b_looks(t) say whether each looks."""
+    frames = []
+    for n in range(int(fps * seconds)):
+        t = n / fps
+        frames.append([user(), peeper_at(a_x, a_looks(t)), peeper_at(b_x, b_looks(t))])
+    return frames
+
+
+def switches(results):
+    """(time, new peeper id) each time the peeper changes while active."""
+    out, last = [], None
+    for t, r in results:
+        if r.decision.active and r.peeper_id != last:
+            out.append((t, r.peeper_id))
+            last = r.peeper_id
+    return out
+
+
+class MostRecentPeeperTests(unittest.TestCase):
+    """The turret aims at one peeper: the most recent steady look, never flip-flopping."""
+
+    def config(self):
+        return TrackerConfig(min_faces=2)  # takeover_s 1.0, min_lock_s 1.5 by default
+
+    def test_a_newer_peeper_takes_over_after_a_steady_takeover_s(self):
+        fps = 30
+        frames = two_peepers(fps, 6, a_looks=lambda t: True, b_looks=lambda t: t >= 2.0)
+        results = run(PeeperTracker(self.config()), frames, fps)
+        ids = {r.tracks[1].id: "A" for _, r in results[:1]}
+        ids[results[0][1].tracks[2].id] = "B"
+        sw = [(t, ids[pid]) for t, pid in switches(results)]
+        self.assertEqual([who for _, who in sw], ["A", "B"])  # A never steals back
+        self.assertAlmostEqual(sw[1][0], 3.0, delta=0.15)     # B looked from 2.0, +takeover_s
+
+    def test_a_glance_shorter_than_takeover_s_steals_nothing(self):
+        fps = 30
+        frames = two_peepers(fps, 5, a_looks=lambda t: True, b_looks=lambda t: 2.0 <= t < 2.8)
+        results = run(PeeperTracker(self.config()), frames, fps)
+        self.assertEqual(len(switches(results)), 1)
+        self.assertTrue(all(r.decision.active for _, r in results[30:]))
+
+    def test_repeated_feints_never_add_up_to_a_takeover(self):
+        fps = 30
+        # B looks 0.7 s, looks away 0.3 s, over and over: each look restarts the count.
+        frames = two_peepers(fps, 8, a_looks=lambda t: True,
+                             b_looks=lambda t: t >= 1.0 and (t - 1.0) % 1.0 < 0.7)
+        results = run(PeeperTracker(self.config()), frames, fps)
+        self.assertEqual(len(switches(results)), 1)
+
+    def test_two_people_taking_turns_cannot_flip_faster_than_min_lock_s(self):
+        fps = 30
+        # Each looks away briefly at its own rhythm, so each keeps starting a "newer" look.
+        frames = two_peepers(fps, 12,
+                             a_looks=lambda t: (t % 1.3) > 0.25,
+                             b_looks=lambda t: t > 0.6 and ((t + 0.6) % 1.1) > 0.25)
+        results = run(PeeperTracker(self.config()), frames, fps)
+        times = [t for t, _ in switches(results)]
+        gaps = [b - a for a, b in zip(times, times[1:])]
+        self.assertTrue(all(g >= 1.5 - 1e-6 for g in gaps), gaps)
+
+    def test_when_two_rivals_qualify_together_the_newest_look_wins(self):
+        fps = 30
+        # A locks at ~0.5 s; B looks from 0.6, C from 0.8. Both qualify when min_lock_s ends
+        # (~2.0 s): C, the more recent look, wins, and B (older than C) never takes over.
+        frames = []
+        for n in range(int(fps * 6)):
+            t = n / fps
+            frames.append([user(), peeper_at(0.85, True), peeper_at(0.65, t >= 0.6),
+                           peeper_at(0.5, t >= 0.8)])
+        results = run(PeeperTracker(self.config()), frames, fps)
+        a_id, b_id, c_id = (results[0][1].tracks[i].id for i in (1, 2, 3))
+        sw = switches(results)
+        self.assertEqual([pid for _, pid in sw], [a_id, c_id])
+        self.assertAlmostEqual(sw[1][0], sw[0][0] + 1.5, delta=0.1)
+        self.assertNotIn(b_id, [pid for _, pid in sw])
+
+    def test_the_old_peeper_leaving_hands_over_to_a_ready_one_at_exit_s(self):
+        fps = 30
+        frames = two_peepers(fps, 5, a_looks=lambda t: t < 2.0, b_looks=lambda t: t >= 1.5)
+        results = run(PeeperTracker(self.config()), frames, fps)
+        sw = switches(results)
+        self.assertEqual(len(sw), 2)
+        self.assertLess(sw[1][0], 2.0 + 0.7 + 0.25)  # B ready, A gone: no 1.0 s wait needed
+
+    def test_with_no_lock_the_newest_ready_look_is_picked(self):
+        fps = 30
+        # A leaves; when its exit window ends, B (looking since 1.3) and C (since 1.5) are
+        # both ready and nobody holds the lock: C, the more recent look, is picked.
+        # takeover_s is huge so the pick comes from the no-lock path, not a takeover.
+        frames = []
+        for n in range(int(fps * 4)):
+            t = n / fps
+            frames.append([user(), peeper_at(0.85, t < 1.0), peeper_at(0.65, t >= 1.3),
+                           peeper_at(0.5, t >= 1.5)])
+        tracker = PeeperTracker(TrackerConfig(min_faces=2, exit_s=1.5, takeover_s=99))
+        results = run(tracker, frames, fps)
+        a_id, b_id, c_id = (results[0][1].tracks[i].id for i in (1, 2, 3))
+        self.assertEqual([pid for _, pid in switches(results)], [a_id, c_id])

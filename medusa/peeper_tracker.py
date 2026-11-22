@@ -11,7 +11,11 @@ single not-looking frame, so a still viewer flickers. This module instead:
 4. keeps the laptop user (largest face) sticky, swapping only when another face is
    ``swap_ratio`` times larger for ``swap_hold_s``;
 5. goes ACTIVE after one peeper track has looked for ``enter_s`` and stays ACTIVE until that
-   track has not been seen looking for ``exit_s``.
+   track has not been seen looking for ``exit_s``;
+6. aims at the most recent peeper: with several ready the newest look wins, and a newer
+   peeper takes over a locked one only after looking steadily for ``takeover_s``, and never
+   sooner than ``min_lock_s`` after the last switch, so glances, feints and two people
+   taking turns cannot make the target flip back and forth.
 
 Everything is in seconds, not frames, so 15 fps and 30 fps behave the same. Pure Python.
 """
@@ -45,6 +49,8 @@ class TrackerConfig:
     match_distance: float = 0.15  # fraction of frame width
     swap_ratio: float = 1.25
     swap_hold_s: float = 0.5
+    takeover_s: float = 1.0       # a newer peeper must look this long to steal the lock
+    min_lock_s: float = 1.5       # no switch sooner than this after the last one
 
 
 @dataclass(frozen=True)
@@ -119,6 +125,7 @@ class PeeperTracker:
     _next_id: int = 1
     _challenger: tuple[int, float] | None = None
     _peeper_ok_at: float = 0.0           # last time the active peeper was seen looking
+    _locked_at: float = 0.0              # when the current peeper was picked
     _peeper_center: tuple[float, float] = (0.0, 0.0)
     _peeper_source: str = "mac-camera"
     _aspect: float = 1.0
@@ -281,16 +288,18 @@ class PeeperTracker:
                 self.peeper_id = None  # gone too long; a ready candidate may take over below
             elif self.peeper_id not in self.tracks and self._reacquire(candidates, now):
                 return self._active(f"peeper {self.peeper_id} looking (re-acquired)")
-            else:
-                away = now - self._peeper_ok_at
-                return self._active(f"peeper {self.peeper_id} away {away:.1f}/{cfg.exit_s:g} s")
             if self.peeper_id is not None:
+                challenger = self._challenger_for(ready, current, now)
+                if challenger is not None:
+                    return self._lock(challenger, now, "took over")
+                if current is None:
+                    away = now - self._peeper_ok_at
+                    return self._active(f"peeper {self.peeper_id} away {away:.1f}/{cfg.exit_s:g} s")
                 return self._active(f"peeper {self.peeper_id} looking")
         if ready:
-            pick = max(ready, key=lambda t: (t.looking_s(now), -t.area))
-            self.peeper_id = pick.id
-            self._remember(pick, now)
-            return self._active(f"peeper {pick.id} looking")
+            # The most recent steady look wins (shortest looking time that still passed enter_s).
+            pick = min(ready, key=lambda t: (t.looking_s(now), -t.area))
+            return self._lock(pick, now, "looking")
         if len(self.tracks) < max(1, cfg.min_faces):
             return SnooperDecision(False, reason="no face" if cfg.min_faces <= 1
                                    else f"fewer than {cfg.min_faces} faces")
@@ -300,6 +309,25 @@ class PeeperTracker:
         best = max(candidates, key=lambda t: t.looking_s(now))
         return SnooperDecision(False, reason=f"face {best.id} looking "
                                              f"{best.looking_s(now):.1f}/{cfg.enter_s:g} s")
+
+    def _challenger_for(self, ready: list[Track], current: Track | None, now: float) -> Track | None:
+        """A newer peeper that has earned the lock: looked steadily for takeover_s, started
+        looking after the current peeper did (when the current one is still looking), and
+        the current lock has held for min_lock_s. The newest such look wins."""
+        cfg = self.config
+        if now - self._locked_at < cfg.min_lock_s - EPS:
+            return None
+        since = current.looking_since if current is not None else None
+        rivals = [t for t in ready
+                  if t.id != self.peeper_id and t.looking_s(now) >= cfg.takeover_s - EPS
+                  and (since is None or (t.looking_since is not None and t.looking_since > since))]
+        return min(rivals, key=lambda t: (t.looking_s(now), -t.area), default=None)
+
+    def _lock(self, track: Track, now: float, how: str) -> SnooperDecision:
+        self.peeper_id = track.id
+        self._locked_at = now
+        self._remember(track, now)
+        return self._active(f"peeper {track.id} {how}")
 
     def _reacquire(self, candidates: list[Track], now: float) -> bool:
         """The peeper's track expired inside the exit window: a looking face where it was
