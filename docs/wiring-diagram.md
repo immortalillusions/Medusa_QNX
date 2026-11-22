@@ -45,6 +45,8 @@ pins.
 
 - Pi → UNO Q: the control process sends `N,<yaw_x10>,<pitch_x10>,<led>,<seq>`
   (tenths of a degree) every 20 ms, or `M,<yaw>,<pitch>,0,<seq>` to park.
+  On a dashboard request it adds `A,<1 arm|0 switch off>,<seq>`, which is not a
+  heartbeat.
 - UNO Q → Pi, every 100 ms: `S,<armed>,<pan_x10>,<tilt_x10>,<seq>,<gate>,<parking>`.
   The Pi ignores the Zephyr boot banner that also appears on D1 at reset.
 

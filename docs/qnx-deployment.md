@@ -84,6 +84,9 @@ On the Pi:
   `safe_reason`.
 - `POST :8082/stress?seconds=N`: CPU hog workers at the AI's priority, for
   the real-time demo.
+- `POST :8082/arm` and `POST :8082/disarm`: the dashboard's arm / switch-off
+  button. Returns 202; the loop sends one `A` line on its next tick and the
+  firmware decides (kill gate and heartbeat still apply).
 
 ## Pre-demo checks
 
