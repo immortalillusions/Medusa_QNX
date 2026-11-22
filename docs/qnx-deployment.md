@@ -76,6 +76,18 @@ match it to the installed QNX release.
 3. Start the laptop detector on the Mac. The Pi accepts its heartbeats on
    UDP 8767 from the address given in `--trigger-from`.
 
+`pi/start_medusa.sh` passes `--qnx-camera-unit auto`. Units 1 and 2 are QNX's
+built-in test-pattern cameras (colour bars) and open fine, so auto tries units
+5, then 1-10, and keeps the first whose frames look like a real scene: it
+rejects units that do not open, frames whose columns are constant top to
+bottom (test patterns), and all-one-colour frames. With no real camera the AI
+keeps running: the turret goes home, `status.json` reads
+`"reason": "waiting for the turret camera"`, and it searches again every 3 s,
+also after the camera disappears mid-run. Plug the C270 in and it comes back
+with no restart. `/tmp/service.log` names the chosen unit and why the others
+were rejected. A number (`--qnx-camera-unit 5`) still opens that unit only and
+exits if it is missing.
+
 On the Pi:
 
 - `:8080/status.json` and `:8080/stream.mjpg`: the AI decision and the turret
