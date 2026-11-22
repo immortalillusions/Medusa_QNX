@@ -16,7 +16,7 @@ import medusa_control
 import qnx_ai_service
 from medusa import trigger as trigger_module
 from medusa.control import (
-    ControlClient, ControlHTTPServer, ControlLoop, StatusReader, StressTest, TickStats, format_n_line,
+    ControlClient, ControlHTTPServer, ControlLoop, StatusReader, StressTest, TickStats, format_a_line, format_n_line,
     make_target_packet, parse_actual_packet, parse_command_line, parse_status_line, parse_target_packet,
     system_clock,
 )
@@ -127,6 +127,13 @@ class CommandLineTests(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertIsNone(parse_command_line(line, 55, 125))
 
+    def test_a_line_format(self) -> None:
+        self.assertEqual(format_a_line(True, 7), b"A,1,7\n")
+        self.assertEqual(format_a_line(False, 4294967295), b"A,0,4294967295\n")
+        self.assertIsNone(parse_command_line("A,1,7", 0, 180))  # never mistaken for an aim line
+        source = INO.read_text()
+        self.assertIn('sscanf(command, "A,%d,%lu", &arm, &sequence)', source)
+
     def test_firmware_parses_n_lines_in_tenths(self) -> None:
         source = INO.read_text()
         self.assertIn('sscanf(command, "N,%d,%d,%d,%lu"', source)
@@ -213,6 +220,27 @@ class ControlTickTests(unittest.TestCase):
         self.assertEqual(state(1.40), ("SAFE", "AI target stale"))
         self.assertEqual(state(2.00), ("SAFE", "Arduino link lost"))
         self.assertFalse(self.loop.snapshot(2.10)["ai_alive"])
+
+    def test_arm_request_is_sent_once_after_the_heartbeat_with_the_shared_sequence(self) -> None:
+        self.loop.tick(0.00)
+        self.loop.request_arm(True)
+        self.assertEqual(lines(self.serial), ["M,90,90,0,1"])  # queued only: nothing written yet
+        self.loop.tick(0.02)
+        self.loop.tick(0.04)                                   # sent once, not repeated
+        self.loop.request_arm(True)
+        self.loop.request_arm(False)                           # latest wins
+        self.sock.queue += [target(True, 70)]
+        self.loop.tick(0.06)
+        self.assertEqual(lines(self.serial), ["M,90,90,0,1", "M,90,90,0,2", "A,1,3", "M,90,90,0,4",
+                                              "N,700,900,1,5", "A,0,6"])
+        self.assertEqual(self.loop.write_failures, 0)
+
+    def test_a_dropped_arm_write_counts_as_a_failure_and_is_not_retried(self) -> None:
+        self.serial.write = lambda data: not data.startswith(b"A,") and self.serial.written.append(data) is None
+        self.loop.request_arm(True)
+        self.loop.tick(0.00)
+        self.loop.tick(0.02)
+        self.assertEqual((lines(self.serial), self.loop.write_failures), (["M,90,90,0,1", "M,90,90,0,3"], 1))
 
     def test_shutdown_sends_park_lines(self) -> None:
         self.sock.queue += [target(True, 70)]
@@ -381,6 +409,35 @@ class HttpContractTests(unittest.TestCase):
             with self.subTest(path=path):
                 status, headers, _ = self.request(path, method)
                 self.assertEqual((status, headers["Access-Control-Allow-Origin"]), (code, "*"))
+
+    def test_post_arm_and_disarm_queue_an_a_line_for_the_loop(self) -> None:
+        written = len(self.serial.written)
+        for path, requested, line in (("/arm", "arm", "A,1,3"), ("/disarm", "disarm", "A,0,5")):
+            with self.subTest(path=path):
+                status, headers, body = self.request(path, "POST")
+                self.assertEqual((status, headers["Access-Control-Allow-Origin"]), (202, "*"))
+                self.assertEqual(json.loads(body), {"requested": requested})
+                self.assertEqual(len(self.serial.written), written)  # the HTTP thread never writes
+                self.loop.tick(system_clock())
+                self.assertEqual(lines(self.serial)[-1], line)
+                written = len(self.serial.written)
+        for path, method in (("/arm", "GET"), ("/armed", "POST"), ("/disarm/x", "POST")):
+            with self.subTest(path=path, method=method):
+                self.assertEqual(self.request(path, method)[0], 404)
+        self.loop.tick(system_clock())
+        self.assertFalse(lines(self.serial)[-1].startswith("A,"))
+
+    def test_arm_is_accepted_without_an_arduino_link(self) -> None:
+        loop = ControlLoop(FakeSerial())  # no S line ever: link down
+        server = ControlHTTPServer(loop, port=0, host="127.0.0.1")
+        server.start()
+        self.addCleanup(server.stop)
+        request = urllib.request.Request(f"http://127.0.0.1:{server.port}/arm", method="POST")
+        with urllib.request.urlopen(request, timeout=5) as response:
+            self.assertEqual((response.status, json.loads(response.read())), (202, {"requested": "arm"}))
+        self.assertFalse(loop.snapshot()["arduino"]["link_ok"])
+        loop.tick(system_clock())
+        self.assertEqual(lines(loop.serial), ["M,90,90,0,1", "A,1,2"])
 
     def test_post_stress_starts_and_stops(self) -> None:
         status, headers, body = self.request("/stress?seconds=20", "POST")

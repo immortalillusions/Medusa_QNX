@@ -17,7 +17,11 @@ AI loop. Each tick it:
    ``M`` park line (the configured ``home`` angles, LED off): an armed turret
    glides home on it, and a disarmed one only takes it as the heartbeat (its
    servos are detached then);
-4. sends a ``medusa-actual`` packet back to the AI process, so its pan tracker
+4. sends ``A,<1|0>,seq`` right after it when the dashboard asked to arm or switch
+   off (POST /arm, /disarm); the HTTP thread only records the request, so this loop
+   stays the only writer to the port. The firmware applies its own rules: kill gate
+   closed and a live heartbeat to arm, a glide home to switch off;
+5. sends a ``medusa-actual`` packet back to the AI process, so its pan tracker
    can use where the turret really points.
 
 IPC is localhost UDP JSON: simple and works on QNX's io-sock today. QNX native
@@ -89,6 +93,11 @@ def tenths(degrees: float) -> int:
 def format_n_line(yaw: float, pitch: float, led: bool, seq: int) -> bytes:
     """``N,<yaw_x10>,<pitch_x10>,<led>,<seq>\\n``: angles in tenths of a degree (92.5 -> 925)."""
     return f"N,{tenths(yaw)},{tenths(pitch)},{int(bool(led))},{seq}\n".encode("ascii")
+
+
+def format_a_line(arm: bool, seq: int) -> bytes:
+    """``A,<1|0>,<seq>\\n``: ask the firmware to arm (1) or switch off (0). Not a heartbeat."""
+    return f"A,{int(bool(arm))},{seq}\n".encode("ascii")
 
 
 def parse_command_line(line: str, servo_min: int = 0, servo_max: int = 180):
@@ -390,6 +399,18 @@ class ControlLoop:
         self.sequence = 0
         self.write_failures = 0
         self.ticks = 0
+        self._arm_request: bool | None = None  # set by the HTTP thread, sent and cleared by tick()
+        self._arm_lock = threading.Lock()
+
+    def request_arm(self, arm: bool) -> None:
+        """Queue an arm (True) or switch-off (False) for the next tick; the latest request wins."""
+        with self._arm_lock:
+            self._arm_request = bool(arm)
+
+    def _take_arm_request(self) -> bool | None:
+        with self._arm_lock:
+            request, self._arm_request = self._arm_request, None
+        return request
 
     @staticmethod
     def _clamp(value: float, bounds) -> float:
@@ -424,6 +445,13 @@ class ControlLoop:
             line = self.park_line()  # Heartbeat only (no AI target, or the kill gate open): LED off.
         if not self.serial.write(line):
             self.write_failures += 1
+        arm = self._take_arm_request()
+        if arm is not None:
+            # After the N/M line, so the firmware has a fresh heartbeat when it checks one to arm.
+            # Sent once: a dropped write is not retried, and the dashboard shows nothing changed.
+            self.sequence += 1
+            if not self.serial.write(format_a_line(arm, self.sequence)):
+                self.write_failures += 1
         if self.actual_sock is not None and self.actual_addr is not None:
             try:
                 self.actual_sock.sendto(self.actual_packet(now), self.actual_addr)
@@ -516,7 +544,11 @@ class ControlLoop:
 # --- HTTP status server ---------------------------------------------------------------------
 
 class ControlHTTPServer:
-    """GET /control.json, POST /stress?seconds=N; CORS on every response. Runs in a daemon thread."""
+    """GET /control.json, POST /stress?seconds=N, POST /arm, POST /disarm; CORS on every response.
+
+    Runs in a daemon thread. /arm and /disarm only queue an A line for the loop (202), even
+    with the Arduino link down: the firmware decides, and control.json shows the outcome.
+    """
 
     def __init__(self, loop: ControlLoop, port: int = DEFAULT_HTTP_PORT, host: str = "0.0.0.0",
                  stress_max: int = STRESS_MAX_S) -> None:
@@ -547,6 +579,10 @@ class ControlHTTPServer:
 
             def do_POST(self) -> None:
                 url = urlparse(self.path)
+                if url.path in ("/arm", "/disarm"):
+                    loop.request_arm(url.path == "/arm")
+                    self._reply(HTTPStatus.ACCEPTED, {"requested": url.path[1:]})
+                    return
                 if url.path != "/stress":
                     self._reply(HTTPStatus.NOT_FOUND, {"error": "not found"})
                     return
