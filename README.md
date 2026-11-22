@@ -147,7 +147,7 @@ UART (`/dev/ser1`) and run both processes, control first:
 ```sh
 on -p 21 python3 -u medusa_control.py --port /dev/ser1 \
     --servo-min 15 --servo-max 165 --servo-home 90 --tilt-min 0 --tilt-max 0 --tilt-home 0 &
-python3 -u qnx_ai_service.py --qnx-camera-unit 5 --control-port 8768 \
+python3 -u qnx_ai_service.py --qnx-camera-unit auto --control-port 8768 \
     --trigger-udp-port 8767 --trigger-from <mac-ip> --camera-on-turret --servo-reversed \
     --servo-min 15 --servo-max 165 --servo-home 90 --tilt-min 0 --tilt-max 0 --tilt-home 0
 ```
