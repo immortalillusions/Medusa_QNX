@@ -76,6 +76,12 @@ and how late ticks start) that shows where the loop's time goes.
 The two processes talk over localhost UDP. QNX message passing would be the
 production choice, but stock Python has no binding for it.
 
+## Next hardware version
+
+`docs/medusa-shield.md` is the PCB we'd fabricate next: the breadboard's safety circuit
+(servo power with a two-pole kill switch, kill sense, arm button, Pi UART) on one UNO-format
+shield, with pin map, BOM and v2 changes.
+
 ## Safety
 
 - **Off means limp.** At boot, or when disarmed by the button, the servos are
