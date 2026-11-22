@@ -178,6 +178,20 @@ class FaceZoomerTests(unittest.TestCase):
             zoomer(np.zeros((H, W, 3), np.uint8))
         self.assertEqual(zoomer.crop_landmarker.calls, 4)
 
+    def test_an_unsure_box_with_no_face_waits_before_it_is_tried_again(self):
+        zoomer = self.zoomer([FaceBox(1000, 500, 1040, 550, 0.35)], found=False, fail_hold=3)
+        with patch.dict(sys.modules, {"mediapipe": fake_mediapipe()}):
+            for _ in range(4):
+                zoomer(np.zeros((H, W, 3), np.uint8))
+        self.assertEqual(zoomer.crop_landmarker.calls, 2)  # frames 1 and 4
+
+    def test_a_sure_box_is_tried_every_frame(self):
+        zoomer = self.zoomer([FaceBox(1000, 500, 1040, 550, 0.9)], found=False, fail_hold=3)
+        with patch.dict(sys.modules, {"mediapipe": fake_mediapipe()}):
+            for _ in range(4):
+                zoomer(np.zeros((H, W, 3), np.uint8))
+        self.assertEqual(zoomer.crop_landmarker.calls, 4)
+
     def test_round_robin_runs_tiles_per_frame_tiles(self):
         zoomer = self.zoomer([], grids=((2, 1), (4, 2)), tiles_per_frame=3)
         with patch.dict(sys.modules, {"mediapipe": fake_mediapipe()}):
