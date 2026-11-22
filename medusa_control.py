@@ -21,9 +21,10 @@ import signal
 import sys
 import threading
 
+from medusa.sysmon import DEFAULT_SYSTEM_FILE
 from medusa.control import (
     DEFAULT_ACTUAL_PORT, DEFAULT_HTTP_PORT, DEFAULT_TARGET_PORT, PERIOD_S, STRESS_MAX_S, TARGET_TIMEOUT_S,
-    ControlHTTPServer, ControlLoop, SerialPort, StressTest, SystemSampler, _udp_socket,
+    ControlHTTPServer, ControlLoop, SerialPort, StressTest, SystemStatusFile, _udp_socket,
 )
 
 
@@ -48,6 +49,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stress-workers", type=int, default=4, help="busy-loop processes for POST /stress")
     parser.add_argument("--stress-priority", type=int, default=10,
                         help="QNX priority for stress workers (started with `on -p`)")
+    parser.add_argument("--system-file", default=DEFAULT_SYSTEM_FILE,
+                        help="Pi usage JSON written by medusa_sysmon.py, served as control.json's system block")
     parser.add_argument("--switch-interval", type=float, default=0.001,
                         help="sys.setswitchinterval: how long another thread may hold the GIL")
     return parser
@@ -75,7 +78,6 @@ def main(argv=None) -> int:
         return 2
     sockets, http = [], None
     stress = StressTest(args.stress_workers, args.stress_priority)
-    system = SystemSampler(exclude=stress.pids)
     loop = None
     try:
         target_sock = _udp_socket(args.target_port)
@@ -88,10 +90,9 @@ def main(argv=None) -> int:
             actual_addr=("127.0.0.1", args.actual_port) if args.actual_port else None,
             period_s=args.period_ms / 1000, target_timeout=args.target_timeout,
             yaw_range=(args.servo_min, args.servo_max), pitch_range=(args.tilt_min, args.tilt_max),
-            home=(args.servo_home, args.tilt_home), stress=stress, system=system,
+            home=(args.servo_home, args.tilt_home), stress=stress,
         )
-        system.start()
-        http = ControlHTTPServer(loop, args.http_port)
+        http = ControlHTTPServer(loop, args.http_port, system_file=SystemStatusFile(args.system_file))
         http.start()
         stop = threading.Event()
         for signum in (signal.SIGINT, signal.SIGTERM):
@@ -103,7 +104,6 @@ def main(argv=None) -> int:
         print(f"medusa_control cannot start: {error}", file=sys.stderr)
         return 2
     finally:
-        system.stop()
         stress.stop()
         if loop is not None:
             loop.shutdown()  # Park lines: home, LED off; the firmware disarms 300 ms later.

@@ -29,14 +29,14 @@ message passing (MsgSend/MsgReceive, priority-inheriting) would be the
 production choice, but has no binding in the stock Python build.
 
 The loop runs in the main thread; the HTTP status server, the stress-test
-timer and the Pi usage sampler (SystemSampler, one ``pidin`` spawn every 2 s at
-priority 10) run in daemon threads that are almost always blocked. The GIL switch
+timer run in daemon threads that are almost always blocked. Pi usage (CPU,
+memory, temperature) is sampled by medusa_sysmon.py, a separate priority-10
+process; /control.json only reads the file it writes. The GIL switch
 interval is shortened so a waking loop thread gets the interpreter quickly.
 """
 
 from __future__ import annotations
 
-import calendar
 import json
 import math
 import os
@@ -52,6 +52,10 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+
+from .sysmon import DEFAULT_SYSTEM_FILE, SYSTEM_KEYS, on_qnx
+
+SYSTEM_STALE_S = 10.0
 
 TARGET_MESSAGE_TYPE = "medusa-target"
 ACTUAL_MESSAGE_TYPE = "medusa-actual"
@@ -366,10 +370,6 @@ class StressTest:
                 proc.kill()
             proc.wait()
 
-    def pids(self) -> set[int]:
-        with self.lock:
-            return {proc.pid for proc in self.procs if getattr(proc, "pid", None) is not None}
-
     def status(self) -> dict:
         with self.lock:
             ends_at = self.ends_at
@@ -378,206 +378,44 @@ class StressTest:
         return {"running": running, "seconds_left": left, "workers": self.workers if running else 0}
 
 
-# --- Pi usage (CPU, memory, temperature, uptime) --------------------------------------------
+# --- Pi usage, sampled by medusa_sysmon.py (a separate priority-10 process) -----------------
 
-SYSTEM_PERIOD_S = 2.0
-SYSTEM_KEYS = ("cpu_total_pct", "cpu_control_pct", "cpu_ai_pct", "mem_free_mb", "mem_total_mb",
-               "temp_c", "uptime_s", "sampled_age_s")
-CPU_WINDOW_S = 10.0  # CPU % is averaged over up to this long: pidin prints 1 s steps past a minute
-# One spawn per sample: pidin info, then every process's cumulative CPU times (root sees them
-# all). On QNX it runs through ``on -p 10`` so it never competes with the loop's 21. (hogs was
-# dropped: as root its SYS column read per core and its rows came back N/A or empty.)
-SYSTEM_COMMAND = "pidin info; sudo -n pidin times"
-_TIMES_HEADER = re.compile(r"^\s*pid\s+name\b.*\butime\s+stime\b.*$", re.M | re.I)
-_DURATION = re.compile(r"^(?:\d+(?:\.\d+)?|(?:\d+(?:\.\d+)?[dhms])+)$")
-_DURATION_PART = re.compile(r"(\d+(?:\.\d+)?)([dhms])")
-_UNIT_S = {"d": 86400, "h": 3600, "m": 60, "s": 1}
-_MEM = re.compile(r"FreeMem:\s*(\d+(?:\.\d+)?)\s*([KMG]?)B?\s*/\s*(\d+(?:\.\d+)?)\s*([KMG]?)B?", re.I)
-_BOOT = re.compile(r"BootTime:\s*(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\w+\s+\d{4})")
-_MB = {"K": 1 / 1024, "": 1 / (1024 * 1024), "M": 1, "G": 1024}
+class SystemStatusFile:
+    """Reads the file medusa_sysmon.py rewrites every 2 s, for the HTTP thread only.
 
-
-def on_qnx() -> bool:
-    return sys.platform.startswith(("qnx", "nto")) or os.uname().sysname.upper().startswith("QNX")
-
-
-def parse_cpu_seconds(token: str) -> float | None:
-    """A pidin CPU time: ``68.071`` (seconds), ``14m40s``, ``2h05m``, ``1d03h`` ... or None."""
-    token = token.strip()
-    if not _DURATION.match(token):
-        return None
-    if token[-1].isdigit():
-        return float(token)
-    return sum(float(value) * _UNIT_S[unit] for value, unit in _DURATION_PART.findall(token))
-
-
-def parse_pidin_times(text: str) -> dict[int, tuple[str, float]]:
-    """``pidin times`` rows (pid name sid start-time utime stime cutime cstime) after the header
-    -> {pid: (name, utime + stime seconds)}. The start time has spaces, so the four times are
-    read from the right. Rows that do not parse are skipped."""
-    header = _TIMES_HEADER.search(text)
-    if header is None:
-        return {}
-    times = {}
-    for line in text[header.end():].splitlines():
-        fields = line.split()
-        if len(fields) < 6 or not fields[0].isdigit():
-            continue
-        utime, stime = parse_cpu_seconds(fields[-4]), parse_cpu_seconds(fields[-3])
-        if utime is None or stime is None or parse_cpu_seconds(fields[-2]) is None:
-            continue
-        name = fields[1] if len(fields) > 6 and not fields[1].isdigit() else ""
-        times[int(fields[0])] = (name, utime + stime)
-    return times
-
-
-def cpu_from_times(before: dict, after: dict, elapsed_s: float, cores: int, control_pid: int,
-                   exclude=()) -> tuple[float | None, float | None, float | None]:
-    """(total, control, AI) as % of the whole chip (all ``cores``), from two pidin times samples.
-
-    Total sums every process but procnto (PID 1). The AI is the busiest other python process
-    (stress workers, python too, are in ``exclude``). Processes that started, ended or reused a
-    PID between the samples are skipped (a negative delta)."""
-    if not before or not after or elapsed_s <= 0 or cores < 1:
-        return None, None, None
-    capacity = elapsed_s * cores
-
-    def pct(seconds: float) -> float:
-        return round(max(0.0, min(100.0, seconds / capacity * 100)), 1)
-
-    deltas = {}
-    for pid, (name, seconds) in after.items():
-        if pid in before and before[pid][0] == name and seconds >= before[pid][1]:
-            deltas[pid] = (name, seconds - before[pid][1])
-    total = sum(delta for pid, (name, delta) in deltas.items() if pid != 1 and "procnto" not in name)
-    ai = [delta for pid, (name, delta) in deltas.items()
-          if "python" in name.lower() and pid != control_pid and pid not in exclude]
-    control = deltas.get(control_pid, (None, None))[1]
-    return pct(total), None if control is None else pct(control), pct(max(ai)) if ai else None
-
-
-def parse_pidin_info(text: str) -> tuple[float | None, float | None, float | None]:
-    """``pidin info`` -> (free MB, total MB, boot time as a Unix time); None where absent."""
-    free = total = boot = None
-    mem = _MEM.search(text)
-    if mem:
-        free = round(float(mem.group(1)) * _MB[mem.group(2).upper()], 1)
-        total = round(float(mem.group(3)) * _MB[mem.group(4).upper()], 1)
-    when = _BOOT.search(text)
-    if when:
-        try:
-            boot = calendar.timegm(time.strptime(" ".join(when.group(1).split()), "%b %d %H:%M:%S %Z %Y"))
-        except (ValueError, OverflowError):
-            boot = None
-    return free, total, boot
-
-
-def parse_thermal(text: str) -> float | None:
-    """``/dev/thermal`` prints the SoC temperature in degrees C, e.g. ``51.57``."""
-    match = re.search(r"-?\d+(?:\.\d+)?", text)
-    if match is None:
-        return None
-    value = float(match.group(0))
-    return round(value, 1) if -40 <= value <= 150 else None
-
-
-def _run_system_command(timeout: float = 6.0) -> str:
-    if not on_qnx():
-        return ""  # pidin is a QNX tool: elsewhere every field stays null.
-    command = ["sh", "-c", SYSTEM_COMMAND]
-    if shutil.which("on"):
-        command = ["on", "-p", "10"] + command
-    result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, timeout=timeout, check=False)
-    return result.stdout.decode("utf-8", "replace")
-
-
-def _read_thermal(path: str = "/dev/thermal") -> str:
-    with open(path, "rb") as handle:
-        return handle.read(64).decode("ascii", "replace")
-
-
-class SystemSampler:
-    """Samples Pi usage every ``period_s`` in a daemon thread; never touched by the 50 Hz loop.
-
-    Every source is optional: a failed command, file or parse leaves its fields null.
+    The 50 Hz loop never touches it: sampling inside this process cost the loop its deadlines.
+    Cached by mtime; missing, unreadable or older than ``stale_s`` gives all-null fields.
     """
 
-    def __init__(self, *, period_s: float = SYSTEM_PERIOD_S, run=_run_system_command,
-                 read_thermal=_read_thermal, clock=system_clock, wall=time.time, pid: int | None = None,
-                 exclude=lambda: (), cores: int | None = None, window_s: float = CPU_WINDOW_S) -> None:
-        self.period_s, self.run, self.read_thermal = period_s, run, read_thermal
-        self.cores = cores or os.cpu_count() or 4
-        self.window_s = window_s
-        self._history: deque[tuple[float, dict]] = deque()  # (when, pidin times), oldest first
-        self.clock, self.wall = clock, wall
-        self.pid = os.getpid() if pid is None else pid
-        self.exclude = exclude  # pids that are not the AI (the stress workers)
+    def __init__(self, path: str = DEFAULT_SYSTEM_FILE, stale_s: float = SYSTEM_STALE_S, wall=time.time) -> None:
+        self.path, self.stale_s, self.wall = path, stale_s, wall
         self._lock = threading.Lock()
-        self._sample: dict | None = None
-        self._sampled_at: float | None = None
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
+        self._cached: tuple[int, dict] | None = None  # (mtime_ns, sample)
 
-    def sample_once(self) -> dict:
+    def read(self) -> dict:
+        empty = dict.fromkeys(SYSTEM_KEYS)
         try:
-            text = self.run()
-        except Exception:  # missing tool, timeout, anything: null fields, never an exception
-            text = ""
-        now = self.clock()
-        header = _TIMES_HEADER.search(text)
-        info, times_text = (text[:header.start()], text[header.start():]) if header else (text, "")
-        total = control = ai = None
-        try:
-            times = parse_pidin_times(times_text)
-            if times:
-                # Against the oldest sample inside the window: a longer base smooths pidin's
-                # whole-second steps. Null until there are two samples.
-                while self._history and now - self._history[0][0] > self.window_s:
-                    self._history.popleft()
-                if self._history:
-                    then, before = self._history[0]
-                    total, control, ai = cpu_from_times(before, times, now - then, self.cores, self.pid,
-                                                        set(self.exclude()))
-                self._history.append((now, times))
-        except Exception:
-            total = control = ai = None
-        free, mem_total, boot = parse_pidin_info(info)
-        try:
-            temp = parse_thermal(self.read_thermal())
-        except Exception:
-            temp = None
-        uptime = None
-        if boot is not None and 0 <= self.wall() - boot < 10 * 365 * 86400:
-            uptime = round(self.wall() - boot)
-        elif hasattr(time, "CLOCK_MONOTONIC") and on_qnx():
-            uptime = round(time.clock_gettime(time.CLOCK_MONOTONIC))  # QNX: seconds since boot
-        sample = {"cpu_total_pct": total, "cpu_control_pct": control, "cpu_ai_pct": ai,
-                  "mem_free_mb": free, "mem_total_mb": mem_total, "temp_c": temp, "uptime_s": uptime}
+            stat = os.stat(self.path)
+        except OSError:
+            return empty
+        age = self.wall() - stat.st_mtime
+        if not -1 <= age <= self.stale_s:
+            return empty
         with self._lock:
-            self._sample, self._sampled_at = sample, now
-        return sample
-
-    def status(self, now: float | None = None) -> dict:
-        now = self.clock() if now is None else now
-        with self._lock:
-            sample, at = self._sample, self._sampled_at
-        if sample is None:
-            return dict.fromkeys(SYSTEM_KEYS)
-        return {**sample, "sampled_age_s": round(now - at, 1)}
-
-    def _run(self) -> None:
-        while not self._stop.is_set():
-            started = self.clock()
-            self.sample_once()
-            self._stop.wait(max(0.1, self.period_s - (self.clock() - started)))
-
-    def start(self) -> None:
-        self._thread = threading.Thread(target=self._run, name="control-system", daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
+            cached = self._cached
+            if cached is None or cached[0] != stat.st_mtime_ns:
+                try:
+                    with open(self.path, "rb") as handle:
+                        payload = json.loads(handle.read(65536))
+                except (OSError, ValueError):
+                    return empty
+                if not isinstance(payload, dict):
+                    return empty
+                cached = self._cached = (stat.st_mtime_ns, payload)
+        sample = cached[1]
+        result = {key: _number(sample.get(key)) for key in SYSTEM_KEYS}
+        result["sampled_age_s"] = round(max(0.0, age), 1)
+        return result
 
 
 # --- the control loop -----------------------------------------------------------------------
@@ -588,7 +426,7 @@ class ControlLoop:
         period_s: float = PERIOD_S, target_timeout: float = TARGET_TIMEOUT_S,
         link_timeout: float = LINK_TIMEOUT_S, yaw_range=(65, 115), pitch_range=(65, 115),
         home=(90, 90), window_s: float = WINDOW_S, stress: StressTest | None = None,
-        system: SystemSampler | None = None, clock=system_clock, sleep=time.sleep,
+        clock=system_clock, sleep=time.sleep,
     ) -> None:
         self.serial, self.target_sock = serial, target_sock
         self.actual_sock, self.actual_addr = actual_sock, actual_addr
@@ -597,7 +435,6 @@ class ControlLoop:
         self.home_yaw, self.home_pitch = home
         self.stats = TickStats(period_s, window_s)
         self.stress = stress
-        self.system = system
         self.clock, self.sleep = clock, sleep
         self.reader = StatusReader()
         self.status: ArduinoStatus | None = None
@@ -721,7 +558,6 @@ class ControlLoop:
             },
             "stress": self.stress.status() if self.stress else {"running": False, "seconds_left": 0},
             "write_failures": self.write_failures,
-            "system": self.system.status(now) if self.system else dict.fromkeys(SYSTEM_KEYS),
         }
         return result
 
@@ -760,7 +596,7 @@ class ControlHTTPServer:
     """
 
     def __init__(self, loop: ControlLoop, port: int = DEFAULT_HTTP_PORT, host: str = "0.0.0.0",
-                 stress_max: int = STRESS_MAX_S) -> None:
+                 stress_max: int = STRESS_MAX_S, system_file: SystemStatusFile | None = None) -> None:
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, _format, *_args):
                 return
@@ -782,7 +618,9 @@ class ControlHTTPServer:
 
             def do_GET(self) -> None:
                 if urlparse(self.path).path == "/control.json":
-                    self._reply(HTTPStatus.OK, loop.snapshot())
+                    snapshot = loop.snapshot()
+                    snapshot["system"] = system_file.read() if system_file else dict.fromkeys(SYSTEM_KEYS)
+                    self._reply(HTTPStatus.OK, snapshot)
                 else:
                     self._reply(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
