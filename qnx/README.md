@@ -1,20 +1,28 @@
-# QNX camera and models
+# QNX camera bridge and models
 
-Build the Sensor Framework bridge in this directory and run
-`python3 capture_face.py` from the repo root on the Pi. See the
+`camera_capture.c` is a small Sensor Framework bridge that `medusa/qnx_camera.py`
+loads as `libmedusa_camera.so`. Build it on the Pi and check it with
+`python3 capture_face.py` from the repo root. The
 [snapshot setup](../docs/qnx-deployment.md#take-a-face-detection-snapshot)
-for dependencies and build commands.
+lists the dependencies and build commands.
 
-## TFLite models
+## Models
 
-These are the models used by the QNX service:
+Run on the Pi through the QNX OSS TensorFlow Lite runtime:
 
-- `blaze_face_short_range.tflite` detects faces.
-- `face_landmark_detector.tflite` estimates 468 face landmarks.
-- The service derives a conservative screen-facing/head-direction signal from
-  eye and nose landmark geometry.
+- `face_detector.tflite`: BlazeFace "back" (256x256), the turret's face detector.
+- `blaze_face_short_range.tflite`: BlazeFace short-range (128x128), for
+  `capture_face.py` and the older Pi-only mode.
+- `face_landmark_detector.tflite`: 468 face landmarks.
 
-The QNX Pi runs them locally through the QNX OSS TensorFlow Lite runtime. No
-model is downloaded during a demo. Before presenting, verify that the exact
-QNX image can load both models and their required operators.
+Run on the MacBook through MediaPipe:
 
+- `face_landmarker.task`: face landmarks with iris points, used by
+  `laptop_detector.py` for gaze.
+- `blaze_face_short_range.tflite`: used by `laptop_detector.py --detector blazeface`
+  and `face_webcam.py`.
+
+`face_webcam.py` is the Windows webcam variant (see
+[docs/windows-desktop-switching.md](../docs/windows-desktop-switching.md)).
+`laptop_detector.py` reuses its `detect_faces` helper. All models are checked
+in; nothing is downloaded at run time.

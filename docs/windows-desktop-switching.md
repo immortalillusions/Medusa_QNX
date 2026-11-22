@@ -1,5 +1,9 @@
 # Windows desktop switching
 
+This is an older Windows variant, kept working but outside the current demo.
+The current build runs on a MacBook with `laptop_detector.py`; see the
+[README](../README.md).
+
 The Windows webcam demo and the Pi event listener can activate the most
 recently used window of a pinned app when Medusa confirms a snooper. Use
 `--switch-desktop` to opt in and
