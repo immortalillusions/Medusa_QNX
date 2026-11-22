@@ -29,7 +29,7 @@ message passing (MsgSend/MsgReceive, priority-inheriting) would be the
 production choice, but has no binding in the stock Python build.
 
 The loop runs in the main thread; the HTTP status server, the stress-test
-timer and the Pi usage sampler (SystemSampler, one ``hogs`` run every ~2 s at
+timer and the Pi usage sampler (SystemSampler, one ``pidin`` spawn every 2 s at
 priority 10) run in daemon threads that are almost always blocked. The GIL switch
 interval is shortened so a waking loop thread gets the interpreter quickly.
 """
@@ -383,11 +383,15 @@ class StressTest:
 SYSTEM_PERIOD_S = 2.0
 SYSTEM_KEYS = ("cpu_total_pct", "cpu_control_pct", "cpu_ai_pct", "mem_free_mb", "mem_total_mb",
                "temp_c", "uptime_s", "sampled_age_s")
-# One spawn per sample: pidin info, then a 2 s hogs sample (root for real numbers; plain hogs
-# prints N/A). On QNX it runs through ``on -p 10`` so it never competes with the loop's 21.
-SYSTEM_COMMAND = "pidin info; sudo -n hogs -i 1 -s 2"
-_HOGS_HEADER = re.compile(r"^\s*PID\s+NAME\s+MSEC\b", re.M)
-_HOGS_ROW = re.compile(r"^\s*(\d+)\s+(.*?)\s*(\d+)\s+(\d+(?:\.\d+)?)%\s+(\d+(?:\.\d+)?)%")
+CPU_WINDOW_S = 10.0  # CPU % is averaged over up to this long: pidin prints 1 s steps past a minute
+# One spawn per sample: pidin info, then every process's cumulative CPU times (root sees them
+# all). On QNX it runs through ``on -p 10`` so it never competes with the loop's 21. (hogs was
+# dropped: as root its SYS column read per core and its rows came back N/A or empty.)
+SYSTEM_COMMAND = "pidin info; sudo -n pidin times"
+_TIMES_HEADER = re.compile(r"^\s*pid\s+name\b.*\butime\s+stime\b.*$", re.M | re.I)
+_DURATION = re.compile(r"^(?:\d+(?:\.\d+)?|(?:\d+(?:\.\d+)?[dhms])+)$")
+_DURATION_PART = re.compile(r"(\d+(?:\.\d+)?)([dhms])")
+_UNIT_S = {"d": 86400, "h": 3600, "m": 60, "s": 1}
 _MEM = re.compile(r"FreeMem:\s*(\d+(?:\.\d+)?)\s*([KMG]?)B?\s*/\s*(\d+(?:\.\d+)?)\s*([KMG]?)B?", re.I)
 _BOOT = re.compile(r"BootTime:\s*(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\w+\s+\d{4})")
 _MB = {"K": 1 / 1024, "": 1 / (1024 * 1024), "M": 1, "G": 1024}
@@ -397,34 +401,59 @@ def on_qnx() -> bool:
     return sys.platform.startswith(("qnx", "nto")) or os.uname().sysname.upper().startswith("QNX")
 
 
-def parse_hogs(text: str) -> list[tuple[int, str, float]]:
-    """QNX ``hogs`` rows after the ``PID NAME MSEC PIDS SYS MEMORY`` header: (pid, name, SYS %).
+def parse_cpu_seconds(token: str) -> float | None:
+    """A pidin CPU time: ``68.071`` (seconds), ``14m40s``, ``2h05m``, ``1d03h`` ... or None."""
+    token = token.strip()
+    if not _DURATION.match(token):
+        return None
+    if token[-1].isdigit():
+        return float(token)
+    return sum(float(value) * _UNIT_S[unit] for value, unit in _DURATION_PART.findall(token))
 
-    SYS is the share of total CPU. Rows without numbers (non-root hogs prints N/A) are skipped.
-    """
-    header = _HOGS_HEADER.search(text)
+
+def parse_pidin_times(text: str) -> dict[int, tuple[str, float]]:
+    """``pidin times`` rows (pid name sid start-time utime stime cutime cstime) after the header
+    -> {pid: (name, utime + stime seconds)}. The start time has spaces, so the four times are
+    read from the right. Rows that do not parse are skipped."""
+    header = _TIMES_HEADER.search(text)
     if header is None:
-        return []
-    rows = []
+        return {}
+    times = {}
     for line in text[header.end():].splitlines():
-        match = _HOGS_ROW.match(line)
-        if match:
-            rows.append((int(match.group(1)), match.group(2).strip(), float(match.group(5))))
-    return rows
+        fields = line.split()
+        if len(fields) < 6 or not fields[0].isdigit():
+            continue
+        utime, stime = parse_cpu_seconds(fields[-4]), parse_cpu_seconds(fields[-3])
+        if utime is None or stime is None or parse_cpu_seconds(fields[-2]) is None:
+            continue
+        name = fields[1] if len(fields) > 6 and not fields[1].isdigit() else ""
+        times[int(fields[0])] = (name, utime + stime)
+    return times
 
 
-def cpu_from_hogs(rows, control_pid: int, exclude=()) -> tuple[float | None, float | None, float | None]:
-    """(total, control, AI) CPU %. Total is 100 minus PID 1 (procnto, which holds the idle
-    threads), so it slightly under-counts the kernel. The AI is the busiest other python
-    process (stress workers, which are python too, are passed in ``exclude``)."""
-    if not rows:
+def cpu_from_times(before: dict, after: dict, elapsed_s: float, cores: int, control_pid: int,
+                   exclude=()) -> tuple[float | None, float | None, float | None]:
+    """(total, control, AI) as % of the whole chip (all ``cores``), from two pidin times samples.
+
+    Total sums every process but procnto (PID 1). The AI is the busiest other python process
+    (stress workers, python too, are in ``exclude``). Processes that started, ended or reused a
+    PID between the samples are skipped (a negative delta)."""
+    if not before or not after or elapsed_s <= 0 or cores < 1:
         return None, None, None
-    by_pid = {pid: pct for pid, _name, pct in rows}
-    total = None if 1 not in by_pid else round(max(0.0, min(100.0, 100.0 - by_pid[1])), 1)
-    control = by_pid.get(control_pid, 0.0)
-    ai = [pct for pid, name, pct in rows
+    capacity = elapsed_s * cores
+
+    def pct(seconds: float) -> float:
+        return round(max(0.0, min(100.0, seconds / capacity * 100)), 1)
+
+    deltas = {}
+    for pid, (name, seconds) in after.items():
+        if pid in before and before[pid][0] == name and seconds >= before[pid][1]:
+            deltas[pid] = (name, seconds - before[pid][1])
+    total = sum(delta for pid, (name, delta) in deltas.items() if pid != 1 and "procnto" not in name)
+    ai = [delta for pid, (name, delta) in deltas.items()
           if "python" in name.lower() and pid != control_pid and pid not in exclude]
-    return total, round(control, 1), round(max(ai), 1) if ai else None
+    control = deltas.get(control_pid, (None, None))[1]
+    return pct(total), None if control is None else pct(control), pct(max(ai)) if ai else None
 
 
 def parse_pidin_info(text: str) -> tuple[float | None, float | None, float | None]:
@@ -454,7 +483,7 @@ def parse_thermal(text: str) -> float | None:
 
 def _run_system_command(timeout: float = 6.0) -> str:
     if not on_qnx():
-        return ""  # pidin and hogs are QNX tools: elsewhere every field stays null.
+        return ""  # pidin is a QNX tool: elsewhere every field stays null.
     command = ["sh", "-c", SYSTEM_COMMAND]
     if shutil.which("on"):
         command = ["on", "-p", "10"] + command
@@ -476,8 +505,11 @@ class SystemSampler:
 
     def __init__(self, *, period_s: float = SYSTEM_PERIOD_S, run=_run_system_command,
                  read_thermal=_read_thermal, clock=system_clock, wall=time.time, pid: int | None = None,
-                 exclude=lambda: ()) -> None:
+                 exclude=lambda: (), cores: int | None = None, window_s: float = CPU_WINDOW_S) -> None:
         self.period_s, self.run, self.read_thermal = period_s, run, read_thermal
+        self.cores = cores or os.cpu_count() or 4
+        self.window_s = window_s
+        self._history: deque[tuple[float, dict]] = deque()  # (when, pidin times), oldest first
         self.clock, self.wall = clock, wall
         self.pid = os.getpid() if pid is None else pid
         self.exclude = exclude  # pids that are not the AI (the stress workers)
@@ -492,10 +524,22 @@ class SystemSampler:
             text = self.run()
         except Exception:  # missing tool, timeout, anything: null fields, never an exception
             text = ""
-        header = _HOGS_HEADER.search(text)
-        info, hogs = (text[:header.start()], text[header.start():]) if header else (text, "")
+        now = self.clock()
+        header = _TIMES_HEADER.search(text)
+        info, times_text = (text[:header.start()], text[header.start():]) if header else (text, "")
+        total = control = ai = None
         try:
-            total, control, ai = cpu_from_hogs(parse_hogs(hogs), self.pid, set(self.exclude()))
+            times = parse_pidin_times(times_text)
+            if times:
+                # Against the oldest sample inside the window: a longer base smooths pidin's
+                # whole-second steps. Null until there are two samples.
+                while self._history and now - self._history[0][0] > self.window_s:
+                    self._history.popleft()
+                if self._history:
+                    then, before = self._history[0]
+                    total, control, ai = cpu_from_times(before, times, now - then, self.cores, self.pid,
+                                                        set(self.exclude()))
+                self._history.append((now, times))
         except Exception:
             total = control = ai = None
         free, mem_total, boot = parse_pidin_info(info)
@@ -511,7 +555,7 @@ class SystemSampler:
         sample = {"cpu_total_pct": total, "cpu_control_pct": control, "cpu_ai_pct": ai,
                   "mem_free_mb": free, "mem_total_mb": mem_total, "temp_c": temp, "uptime_s": uptime}
         with self._lock:
-            self._sample, self._sampled_at = sample, self.clock()
+            self._sample, self._sampled_at = sample, now
         return sample
 
     def status(self, now: float | None = None) -> dict:

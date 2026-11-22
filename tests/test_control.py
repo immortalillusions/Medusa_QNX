@@ -18,7 +18,7 @@ import qnx_ai_service
 from medusa import trigger as trigger_module
 from medusa.control import (
     SYSTEM_KEYS, ControlClient, ControlHTTPServer, ControlLoop, StatusReader, StressTest, SystemSampler, TickStats,
-    cpu_from_hogs, parse_hogs, parse_pidin_info, parse_thermal, format_a_line, format_n_line,
+    cpu_from_times, parse_cpu_seconds, parse_pidin_info, parse_pidin_times, parse_thermal, format_a_line, format_n_line,
     make_target_packet, parse_actual_packet, parse_command_line, parse_status_line, parse_target_packet,
     system_clock,
 )
@@ -360,33 +360,65 @@ class StressTests(unittest.TestCase):
 CONTRACT_KEYS = {"state", "safe_reason", "loop_hz", "period_ms_mean", "jitter_ms_p99", "period_ms_max",
                  "missed_deadlines", "target_age_s", "ai_alive", "arduino", "stress", "system"}
 
-# Captured shapes of the QNX 8 tools on the Pi (pidin info's first lines, then sudo hogs -i 1 -s 2).
+# Captured shapes of the QNX 8 tools on the Pi (pidin info's first lines, then sudo pidin times).
 PIDIN_INFO = ("CPU:AARCH64 Release:8.0.0  FreeMem:7069MB/8128MB BootTime:Nov 22 05:30:12 UTC 2026\n"
               "Processes: 61, Threads: 297\n"
               "Processor1: 1091555328 Cortex-A76 2400MHz FPU\n")
-HOGS = ("    PID           NAME  MSEC PIDS  SYS       MEMORY\n"
-        "      1                 5214  71%  65%   1128k   0%\n"
-        "  45079 usr/bin/python3  1603  21%  20%  98304k   1%\n"
-        "  45080        python3   402   5%   5%  51200k   0%\n"
-        "  45099        python3   300   3%   3%  20480k   0%\n"
-        "  12301  io-sock          88   1%   1%   4096k   0%\n")
-HOGS_NOT_ROOT = ("    PID           NAME  MSEC PIDS  SYS       MEMORY\n"
-                 "      1                  N/A   N/A  N/A   1128k   0%\n")
+TIMES_HEADER = "     pid name                       sid start time       utime     stime    cutime    cstime\n"
+
+
+def pidin_times(procnto, ai, control, stress, io_sock, extra=""):
+    return (TIMES_HEADER
+            + f"       1 proc/boot/procnto-smp-instr  0 Nov 22 10:34 {procnto}   2m10s     0.000     0.000\n"
+            + "  6275100 system/bin/sh        6275100 Nov 22 11:08     0.010     0.020     0.000     0.000\n"
+            + f"  6410282 system/bin/python3   6275100 Nov 22 11:08 {ai}     1.500     0.000     0.000\n"
+            + f"  6410283 system/bin/python3   6275100 Nov 22 11:08 {control}     2.000     0.000     0.000\n"
+            + f"  6410290 system/bin/python3   6410283 Nov 22 11:41 {stress}     0.000     0.000     0.000\n"
+            + f"     8200 proc/boot/io-sock          0 Nov 22 10:34 {io_sock}     3.000     0.000     0.000\n"
+            + extra)
+
+
+TIMES_A = pidin_times("14m40s", "68.071", "10.000", "1.000", "1m05s",
+                      "  6410300 system/bin/ls        6275100 Nov 22 11:42     0.001     0.001     0.000     0.000\n")
+TIMES_B = pidin_times("14m42s", "72.071", "10.400", "2.600", "1m06s",  # ls ended, cat started
+                      "  6410301 system/bin/cat       6275100 Nov 22 11:42     0.500     0.000     0.000     0.000\n")
 
 
 class SystemSamplerTests(unittest.TestCase):
-    def test_hogs_rows_and_cpu_split(self) -> None:
-        rows = parse_hogs(HOGS)
-        self.assertEqual(rows[0], (1, "", 65.0))
-        self.assertEqual(rows[1], (45079, "usr/bin/python3", 20.0))
-        self.assertEqual(len(rows), 5)
-        # Total = 100 - procnto (idle); control = own pid; AI = busiest other python, not a stress worker.
-        self.assertEqual(cpu_from_hogs(rows, 45080), (35.0, 5.0, 20.0))
-        self.assertEqual(cpu_from_hogs(rows, 45080, exclude={45079}), (35.0, 5.0, 3.0))
-        self.assertEqual(cpu_from_hogs(rows, 999), (35.0, 0.0, 20.0))  # control idle: not listed
-        self.assertEqual(parse_hogs(HOGS_NOT_ROOT), [])
-        self.assertEqual(cpu_from_hogs([], 1), (None, None, None))
-        self.assertEqual(parse_hogs("garbage\n  1 x 2 3% 4%\n"), [])  # no header: nothing
+    def test_cpu_time_forms(self) -> None:
+        for token, seconds in (("68.071", 68.071), ("0.000", 0.0), ("14m40s", 880.0), ("2h05m", 7500.0),
+                               ("1d03h", 97200.0), ("40s", 40.0), ("3m", 180.0)):
+            with self.subTest(token=token):
+                self.assertAlmostEqual(parse_cpu_seconds(token), seconds)
+        for token in ("", "N/A", "11:08", "12x", "m40s"):
+            self.assertIsNone(parse_cpu_seconds(token))
+
+    def test_pidin_times_rows(self) -> None:
+        times = parse_pidin_times(PIDIN_INFO + TIMES_A)
+        self.assertEqual(times[1], ("proc/boot/procnto-smp-instr", 880.0 + 130.0))
+        self.assertEqual(times[6410282][0], "system/bin/python3")
+        self.assertAlmostEqual(times[6410282][1], 69.571)
+        self.assertAlmostEqual(times[8200][1], 68.0)
+        self.assertEqual(len(times), 7)
+        self.assertEqual(parse_pidin_times("6410282 python3 1 Nov 22 11:08 1.0 1.0 0 0"), {})  # no header
+        # The coordinator's live one-process line parses too.
+        live = parse_pidin_times(TIMES_HEADER + "6410282 system/bin/python3 6275100 Nov 22 11:08 68.071 0.000 0.000 0.000")
+        self.assertEqual(live, {6410282: ("system/bin/python3", 68.071)})
+
+    def test_cpu_split_is_percent_of_the_whole_chip(self) -> None:
+        before, after = parse_pidin_times(TIMES_A), parse_pidin_times(TIMES_B)
+        # 2 s on 4 cores = 8 core-seconds. AI +4.0 s, control +0.4, stress +1.6, io-sock +1.0, procnto
+        # skipped; ls ended and cat started between the samples: both skipped.
+        self.assertEqual(cpu_from_times(before, after, 2.0, 4, 6410283, exclude={6410290}), (87.5, 5.0, 50.0))
+        # Without the stress pid excluded the AI is still the busiest python.
+        self.assertEqual(cpu_from_times(before, after, 2.0, 4, 6410283)[2], 50.0)
+        # Control not listed: null; every value is capped at 100.
+        self.assertEqual(cpu_from_times(before, after, 2.0, 4, 999)[1], None)
+        self.assertEqual(cpu_from_times(before, after, 0.01, 4, 6410283)[0], 100.0)
+        self.assertEqual(cpu_from_times({}, after, 2.0, 4, 6410283), (None, None, None))
+        # A reused pid (different name, or time went backwards) is skipped, not negative.
+        reused = {**after, 6410282: ("system/bin/sh", 1.0)}
+        self.assertEqual(cpu_from_times(before, reused, 2.0, 4, 6410283, exclude={6410290})[2], None)
 
     def test_pidin_info_and_thermal(self) -> None:
         free, total, boot = parse_pidin_info(PIDIN_INFO)
@@ -401,14 +433,33 @@ class SystemSamplerTests(unittest.TestCase):
     def test_sample_combines_sources_and_failures_are_null(self) -> None:
         clock = FakeClock(50.0)
         boot = parse_pidin_info(PIDIN_INFO)[2]
-        sampler = SystemSampler(run=lambda: PIDIN_INFO + HOGS, read_thermal=lambda: "51.57",
-                                clock=clock.monotonic, wall=lambda: boot + 3600, pid=45080)
+        outputs = [PIDIN_INFO + TIMES_A, PIDIN_INFO + TIMES_B]
+        sampler = SystemSampler(run=lambda: outputs.pop(0), read_thermal=lambda: "51.57", cores=4,
+                                clock=clock.monotonic, wall=lambda: boot + 3600, pid=6410283,
+                                exclude=lambda: {6410290})
         self.assertEqual(sampler.status(), dict.fromkeys(SYSTEM_KEYS))  # nothing sampled yet
+        first = sampler.sample_once()
+        self.assertEqual((first["cpu_total_pct"], first["cpu_control_pct"], first["cpu_ai_pct"]),
+                         (None, None, None))  # CPU needs two samples
+        clock.now = 52.0
         sampler.sample_once()
-        clock.now = 51.5
-        self.assertEqual(sampler.status(), {"cpu_total_pct": 35.0, "cpu_control_pct": 5.0, "cpu_ai_pct": 20.0,
+        clock.now = 53.5
+        self.assertEqual(sampler.status(), {"cpu_total_pct": 87.5, "cpu_control_pct": 5.0, "cpu_ai_pct": 50.0,
                                             "mem_free_mb": 7069.0, "mem_total_mb": 8128.0, "temp_c": 51.6,
                                             "uptime_s": 3600, "sampled_age_s": 1.5})
+
+    def test_cpu_base_is_the_oldest_sample_inside_the_window(self) -> None:
+        clock = FakeClock(0.0)
+        texts = [TIMES_A, TIMES_A, TIMES_B, TIMES_B]
+        sampler = SystemSampler(run=lambda: texts.pop(0), read_thermal=lambda: "", cores=4, window_s=10.0,
+                                clock=clock.monotonic, pid=6410283, exclude=lambda: {6410290})
+        for now in (0.0, 2.0, 4.0):
+            clock.now = now
+            sample = sampler.sample_once()
+        self.assertEqual(sample["cpu_ai_pct"], 25.0)  # 4.0 s over 4 s x 4 cores, against t=0
+        clock.now = 13.5  # t=0 and t=2 fell out of the window; t=4 is the base now
+        self.assertEqual(sampler.sample_once()["cpu_ai_pct"], 0.0)
+        self.assertEqual(len(sampler._history), 2)
 
         def boom():
             raise OSError("no such tool")
@@ -416,6 +467,7 @@ class SystemSamplerTests(unittest.TestCase):
         with patch("medusa.control.on_qnx", return_value=False):
             broken.sample_once()
         self.assertEqual(broken.status(), {**dict.fromkeys(SYSTEM_KEYS), "sampled_age_s": 0.0})
+        self.assertEqual(len(broken._history), 0)
 
     def test_snapshot_carries_the_system_block_and_the_loop_never_samples(self) -> None:
         calls = []
