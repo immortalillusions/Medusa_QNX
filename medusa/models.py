@@ -1,12 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
-
-
-class Mode(str, Enum):
-    LAPTOP_ONLY = "laptop-only"
-    FULL_HARDWARE = "full-hardware"
 
 
 @dataclass(frozen=True)
