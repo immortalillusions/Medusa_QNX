@@ -185,20 +185,25 @@ class HeadFallback:
         self.heads = dedupe(self.cached, boxes)
         return list(boxes) + self.heads
 
-    def status(self, aim, fallback: bool = False) -> dict:
-        """status.json fields: where the aim came from and the head estimator's last run."""
-        if aim is not None and aim.active:
-            source = aim.target_box.kind if is_head(aim.target_box) else "face"
-        else:
-            source = "laptop" if fallback else None
-        return {
-            "aim_source": source,
-            "head_candidates": len(self.heads),
-            "head_ms": round(self.last_ms, 1) if self.last_ms is not None else None,
-        }
-
     def draw(self, frame, target=None) -> None:
         draw_head_boxes(frame, self.heads, target)
+
+
+def aim_source(aim, fallback: bool = False) -> str | None:
+    """What the turret aims at: "face", a head kind, "laptop" (map fallback) or None."""
+    if aim is not None and aim.active:
+        return aim.target_box.kind if is_head(aim.target_box) else "face"
+    return "laptop" if fallback else None
+
+
+def head_status(aim, fallback: bool = False, heads: HeadFallback | None = None) -> dict:
+    """status.json fields: aim_source always; with the fallback on, its candidates and last run."""
+    status = {"aim_source": aim_source(aim, fallback)}
+    if heads is not None:
+        status["head_candidates"] = len(heads.heads)
+        status["head_ms"] = round(heads.last_ms, 1) if heads.last_ms is not None else None
+        status["head_runs"] = heads.runs
+    return status
 
 
 def _dashed_rect(cv2, frame, p0, p1, color, weight: int, dash: int) -> None:
