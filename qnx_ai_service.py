@@ -76,7 +76,8 @@ def _open_camera(args):
 
 
 def _unavailable(camera) -> str:
-    return getattr(camera, "unavailable_reason", "camera frame unavailable")
+    reason = getattr(camera, "unavailable_reason", None)  # AutoCamera says whether it is waiting
+    return reason if isinstance(reason, str) else "camera frame unavailable"
 
 
 def build_parser() -> argparse.ArgumentParser:
