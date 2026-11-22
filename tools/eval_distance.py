@@ -30,11 +30,11 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from laptop_detector import (  # noqa: E402
-    MODELS, ZOOM_DETECTOR, detection, landmarker_faces, small_face_defaults,
+    MODELS, ZOOM_FINDERS, detection, landmarker_faces, small_face_defaults,
 )
 from medusa.gaze import LEFT_EYE, RIGHT_EYE, GazeConfig  # noqa: E402
 from medusa.peeper_tracker import PeeperTracker, TrackerConfig  # noqa: E402
-from medusa.zoom import ZOOM_MODES, LandmarkPipeline, parse_enhance  # noqa: E402
+from medusa.zoom import FINDERS, ZOOM_MODES, LandmarkPipeline, parse_enhance  # noqa: E402
 
 
 def eye_px(landmarks, width: int, height: int) -> float | None:
@@ -48,7 +48,8 @@ def eye_px(landmarks, width: int, height: int) -> float | None:
 
 
 def run_clip(path: Path, zoom: str, gaze: GazeConfig, tracking: TrackerConfig, *,
-             enhance: tuple[str, ...] = (), max_frames: int | None = None) -> dict:
+             enhance: tuple[str, ...] = (), max_frames: int | None = None,
+             finder: str = "yunet") -> dict:
     import cv2
 
     capture = cv2.VideoCapture(str(path))
@@ -57,8 +58,8 @@ def run_clip(path: Path, zoom: str, gaze: GazeConfig, tracking: TrackerConfig, *
     counts = dict(frames=0, found=0, raw=0, track=0, active=0)
     faces_px, eyes_px = [], []
     busy = 0.0
-    with LandmarkPipeline(str(MODELS["landmarker"]), str(ZOOM_DETECTOR), zoom=zoom,
-                          enhance=enhance) as pipeline:
+    with LandmarkPipeline(str(MODELS["landmarker"]), str(ZOOM_FINDERS[finder]), zoom=zoom,
+                          enhance=enhance, finder=finder) as pipeline:
         while max_frames is None or counts["frames"] < max_frames:
             ok, frame = capture.read()
             if not ok:
@@ -111,6 +112,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--enhance", default="none",
                         help="comma list of crop-enhance variants, each a preset or steps joined "
                              "by + (e.g. none,grey-clahe,bilateral+unsharp)")
+    parser.add_argument("--finder", default="yunet",
+                        help=f"comma list of small-face finders from {', '.join(FINDERS)}")
     parser.add_argument("--min-faces", type=int, default=2,
                         help="1 = a lone face is the subject (clips with nobody else in them)")
     parser.add_argument("--max-frames", type=int)
@@ -124,11 +127,14 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as error:
         parser.error(str(error))
     base_gaze, base_tracking = GazeConfig(), TrackerConfig(min_faces=args.min_faces)
-    print(f"{'clip':14} {'zoom':4} {'enhance':18} {'small':5} {'found':>5} {'raw':>5} {'track':>5} {'active':>6} "
+    finders = [f.strip() for f in args.finder.split(",") if f.strip()]
+    if any(f not in FINDERS for f in finders):
+        parser.error(f"--finder takes {', '.join(FINDERS)}")
+    print(f"{'clip':14} {'zoom':4} {'finder':9} {'enhance':18} {'small':5} {'found':>5} {'raw':>5} {'track':>5} {'active':>6} "
           f"{'face':>5} {'eye':>5} {'fps':>5}")
     for clip in args.clips:
-        for zoom, (enhance_name, enhance), small in (
-                (z, e, r) for z in zooms for e in enhances for r in rules):
+        for zoom, finder, (enhance_name, enhance), small in (
+                (z, f, e, r) for z in zooms for f in finders for e in enhances for r in rules):
             if True:
                 gaze, tracking = base_gaze, base_tracking
                 if small:
@@ -136,8 +142,8 @@ def main(argv: list[str] | None = None) -> int:
                     gaze = replace(gaze, **gaze_extra)
                     tracking = replace(tracking, **tracking_extra)
                 r = run_clip(clip, zoom, gaze, tracking, enhance=enhance,
-                             max_frames=args.max_frames)
-                print(f"{clip.stem[:14]:14} {zoom:4} {enhance_name[:18]:18} {'on' if small else 'off':5} "
+                             max_frames=args.max_frames, finder=finder)
+                print(f"{clip.stem[:14]:14} {zoom:4} {finder:9} {enhance_name[:18]:18} {'on' if small else 'off':5} "
                       f"{r['found']:5.2f} {r['raw']:5.2f} {r['track']:5.2f} {r['active']:6.2f} "
                       f"{_fmt(r['face_px'], '5.0f')} {_fmt(r['eye_px'], '5.1f')} "
                       f"{_fmt(r['fps'], '5.1f')}", flush=True)

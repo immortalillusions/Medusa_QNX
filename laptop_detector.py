@@ -34,7 +34,9 @@ from medusa.gaze import NOSE_TIP, GazeConfig, GazeEstimate, estimate_gaze
 from medusa.models import FaceObservation, SnooperDecision
 from medusa.peeper_tracker import Detection, PeeperTracker, Track, TrackerConfig
 from medusa.preview import PreviewServer
-from medusa.zoom import DEFAULT_ENHANCE, PRESETS, ZOOM_MODES, LandmarkPipeline, parse_enhance
+from medusa.zoom import (
+    DEFAULT_ENHANCE, DEFAULT_FINDER, FINDERS, PRESETS, ZOOM_MODES, LandmarkPipeline, parse_enhance,
+)
 from qnx.face_webcam import detect_faces  # lazy cv2/mediapipe imports inside
 
 
@@ -44,7 +46,10 @@ MODELS = {
     "landmarker": Path(__file__).resolve().parent / "qnx" / "face_landmarker.task",
     "blazeface": Path(__file__).resolve().parent / "qnx" / "blaze_face_short_range.tflite",
 }
-ZOOM_DETECTOR = Path(__file__).resolve().parent / "qnx" / "face_detector.tflite"  # BlazeFace back 256
+ZOOM_FINDERS = {  # the "find small faces" stage of --zoom-faces
+    "yunet": Path(__file__).resolve().parent / "qnx" / "face_detection_yunet_2023mar.onnx",
+    "blazeface": Path(__file__).resolve().parent / "qnx" / "face_detector.tflite",  # back, 256
+}
 MAX_FACES = 4
 PEEPER_COLOR = (0, 0, 255)  # BGR red
 USER_COLOR = (0, 255, 0)
@@ -465,6 +470,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="landmarker only. far (default) = also find small faces with the "
                              "long-range detector and zoom in on them; all = zoom every face; "
                              "off = the full-frame landmarker alone")
+    parser.add_argument("--zoom-finder", choices=FINDERS, default=DEFAULT_FINDER,
+                        help="small-face detector for --zoom-faces: yunet (OpenCV, default) or "
+                             "blazeface (back model on round-robin tiles)")
     parser.add_argument("--zoom-enhance", default=DEFAULT_ENHANCE,
                         help=f"clean-up of zoomed crops: a preset ({', '.join(PRESETS)}) or steps "
                              f"joined by + (default: {DEFAULT_ENHANCE})")
@@ -549,8 +557,9 @@ def main(argv: list[str] | None = None) -> int:
         base = mp.tasks.BaseOptions(model_asset_path=str(model))
         zooming = landmarker and args.zoom_faces != "off"
         if zooming:
-            model_context = LandmarkPipeline(str(model), str(ZOOM_DETECTOR), zoom=args.zoom_faces,
-                                             max_faces=MAX_FACES, enhance=enhance)
+            model_context = LandmarkPipeline(str(model), str(ZOOM_FINDERS[args.zoom_finder]),
+                                             zoom=args.zoom_faces, max_faces=MAX_FACES,
+                                             enhance=enhance, finder=args.zoom_finder)
         elif landmarker:
             options = vision.FaceLandmarkerOptions(
                 base_options=base, running_mode=vision.RunningMode.VIDEO, num_faces=MAX_FACES,

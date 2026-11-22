@@ -29,6 +29,8 @@ DEFAULT_MARGIN = 1.8
 DEFAULT_TILES = (2, 1)
 DEFAULT_GRIDS = ((2, 1), (4, 2))  # 2x1 finds >= ~30 px faces, 4x2 >= ~23 px (10 m at 1080p)
 DEFAULT_TILES_PER_FRAME = 3       # of the 10 tiles: a full sweep every 4 frames
+FINDERS = ("yunet", "blazeface")
+DEFAULT_FINDER = "yunet"
 DEFAULT_OVERLAP = 0.1
 DEFAULT_SCORE = 0.5
 ZOOM_MODES = ("off", "far", "all")
@@ -360,7 +362,8 @@ class LandmarkPipeline:
 
     def __init__(self, landmarker_model: str, detector_model: str | None = None, *,
                  zoom: str = "far", max_faces: int = 4, crop_size: int = DEFAULT_CROP_SIZE,
-                 enhance: Sequence[str] = (), num_threads: int = 4) -> None:
+                 enhance: Sequence[str] = (), num_threads: int = 4,
+                 finder: str = "blazeface") -> None:
         import mediapipe as mp
 
         if zoom not in ZOOM_MODES:
@@ -380,15 +383,26 @@ class LandmarkPipeline:
         self.full = landmarker(vision.RunningMode.VIDEO, max_faces) if zoom != "all" else None
         self.zoomer = None
         if zoom != "off":
-            from .tflite_detector import TFLiteFaceDetector
-
             if detector_model is None:
-                raise ValueError("zoom needs the BlazeFace back detector model")
-            detector = TFLiteFaceDetector(str(detector_model), score_threshold=DEFAULT_SCORE,
-                                          num_threads=num_threads)
+                raise ValueError("zoom needs a face detector model")
+            if finder == "yunet":
+                from .yunet_detector import YuNetFaceDetector
+
+                # One half-resolution pass over the whole frame finds 23 px faces.
+                detector = YuNetFaceDetector(str(detector_model))
+                grids, whole = ((1, 1),), False
+            elif finder == "blazeface":
+                from .tflite_detector import TFLiteFaceDetector
+
+                detector = TFLiteFaceDetector(str(detector_model), score_threshold=DEFAULT_SCORE,
+                                              num_threads=num_threads)
+                grids, whole = DEFAULT_GRIDS, zoom == "all"
+            else:
+                raise ValueError(f"finder must be one of {FINDERS}")
             self.zoomer = FaceZoomer(landmarker(vision.RunningMode.IMAGE, 1), detector,
                                      crop_size=crop_size, enhance=enhance, max_faces=max_faces,
-                                     whole_frame=zoom == "all")
+                                     grids=grids, tiles_per_frame=None if finder == "yunet"
+                                     else DEFAULT_TILES_PER_FRAME, whole_frame=whole)
 
     def __call__(self, frame, timestamp_ms: int):
         import cv2
