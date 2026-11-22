@@ -1,30 +1,26 @@
 # Parts
 
-## Core QNX system
+## Compute
 
-- Raspberry Pi 5 (8 GB) with QNX microSD card
-- Raspberry Pi Active Cooler
-- Logitech C270 USB webcam, mounted fixed above the display
-- Local BlazeFace and face-landmark TFLite models stored on the Pi
-- QNX OSS TensorFlow Lite runtime for AArch64
-- Laptop on the same local network, for the privacy event listener
+- Raspberry Pi 5 with a QNX 8 microSD image and the Active Cooler, powered from
+  its wall charger. A laptop USB-C port can brown it out.
+- MacBook with a built-in camera, on the same network as the Pi.
+- Arduino UNO Q.
 
-## Actuator and safety hardware
+## Turret
 
-- Arduino UNO Q (one spare is helpful)
-- One SG90 micro servo for left/right aiming
-- Optional second SG90 micro servo for tilt
-- Low-power LED, finger light, or mini flashlight; never a laser
-- 2N2222A transistor to switch the LED circuit
-- 1 kOhm base resistor and a base pull-down resistor
-- Breadboard and jumper wires
-- Dedicated regulated 5 V servo supply
-- 470 uF or larger capacitor across the servo supply near the servos
-- Physical kill switch or pull-tab for servo and LED power
-- Multimeter
+- Logitech C270 USB webcam, clipped on the pan stage so it turns with the turret.
+- SG90 micro servo for pan. A second SG90 for tilt is optional; the demo holds
+  tilt at 90.
+- 3D-printed base plate and pan yoke (`cad/`).
 
-## Mechanical items
+## Power and safety
 
-- LED mount and servo bracket (the existing CAD parts may be used)
-- Zip ties or double-sided tape
-- Fixed camera mount above the display
+- A dedicated regulated 5 V supply for the servos, never the Pi or UNO Q 5 V pin.
+- A 470 uF or larger capacitor across the servo supply, near the servos.
+- A kill plug or pull-tab that cuts the servo 5 V rail.
+- Three 10 kOhm resistors: a divider from the servo rail to A2, so the firmware
+  can sense the kill gate.
+- A push button for arm/disarm (D2 to GND).
+- A level-safe connection for the Pi to UNO Q UART, plus breadboard and jumper wires.
+- A multimeter.
