@@ -8,6 +8,10 @@ Start it at a higher priority than the AI process (QNX):
 HTTP server, the stress timer) inherit it, and the 50 Hz loop runs in the main
 thread. The AI process stays at the default priority 10 and sends targets with
 ``qnx_ai_service.py --control-port 8768``. See medusa/control.py.
+
+The servo defaults (65..115, home 90) predate the current turret. Pass the
+firmware's ranges (``--servo-min 0 --servo-max 70 --servo-home 0``, tilt 90),
+or the firmware rejects every park line.
 """
 
 from __future__ import annotations

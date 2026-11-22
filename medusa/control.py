@@ -625,7 +625,7 @@ class ControlClient:
         self._send(active, yaw, pitch)
 
     def safe_stop(self) -> None:
-        """Home on both axes, light off: exactly the configured homes, not a smoothed step toward them."""
+        """Home on both axes, led bit 0: exactly the configured homes, not a smoothed step toward them."""
         self._send(False, self.mapper.park(), self.tilt_mapper.park())
 
     def poll_actual(self) -> ActualStatus | None:
