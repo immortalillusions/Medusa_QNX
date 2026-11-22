@@ -193,8 +193,21 @@ def _laptop_peeper_id(trigger: LaptopTrigger, laptop_active: bool) -> int | None
     return trigger.latest.peeper_id if laptop_active and trigger.latest is not None else None
 
 
+MAP_TRUST_MARGIN = 0.05  # laptop_x this far past the map's outermost learned points is still trusted
+
+
 def _expected_x(pan: PanTracker | None, learned, laptop_x: float | None) -> float | None:
-    """Where the laptop's peeper should appear in the turret image, or None without a usable map."""
+    """Where the laptop's peeper should appear in the turret image, or None without a usable map.
+
+    Also None when laptop_x lies outside the x range the map has learned (beyond
+    MAP_TRUST_MARGIN): an extrapolated guess must not gate out the face the turret
+    really sees, or the map could never learn that side. Matching then falls back to
+    the single-face / left-right-order rules.
+    """
+    points = getattr(learned, "points", None)
+    if laptop_x is not None and points and not (
+            points[0][0] - MAP_TRUST_MARGIN <= laptop_x <= points[-1][0] + MAP_TRUST_MARGIN):
+        return None
     expected_pan = learned.angle(laptop_x) if pan is not None and learned is not None else None
     return pan.expected_image_x(expected_pan) if expected_pan is not None else None
 
