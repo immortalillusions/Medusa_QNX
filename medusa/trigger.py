@@ -369,19 +369,21 @@ def decide_aim(
 
 
 def draw_aim_boxes(frame, boxes: Sequence[FaceBox], target: FaceBox | None) -> None:
-    """Draw the aim target in red with an AIM label and every other face in green."""
+    """Aim target in amber with an AIM tag, other faces in blue-grey, a small centre crosshair."""
     import cv2
 
-    height, width = frame.shape[:2]
+    from .overlay import AMBER, BLUE_GREY, crosshair, frame_scale, label, thickness
+
+    scale = frame_scale(frame)
+    crosshair(cv2, frame, scale)
     for box in boxes:
         is_target = box is target
-        color = (0, 0, 255) if is_target else (0, 255, 0)
+        color = AMBER if is_target else BLUE_GREY
         left, top = int(box.left), int(box.top)
         cv2.rectangle(frame, (left, top), (int(box.right) - 1, int(box.bottom) - 1), color,
-                      3 if is_target else 2)
+                      thickness(scale, 3.0 if is_target else 1.5), cv2.LINE_AA)
         if is_target:
-            cv2.putText(frame, "AIM", (min(left, max(0, width - 50)), min(height - 1, max(20, top - 6))),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+            label(cv2, frame, "AIM", left, top - thickness(scale), color, scale)
 
 
 # The firmware's motion profile, mirrored here so the Pi knows where the turret

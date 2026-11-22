@@ -159,16 +159,47 @@ class DecideAimTests(unittest.TestCase):
         self.assertEqual(decide_aim(True, "", None, 640, 480).reason, "AI inference unavailable")
 
 
+try:
+    import cv2 as _cv2
+    import numpy as _np
+except ImportError:  # the Pi's test runs may lack OpenCV
+    _cv2 = _np = None
+
+
+def _pixel(frame, x, y):
+    return tuple(int(v) for v in frame[y, x])
+
+
+def _near(pixel, colour, tolerance=40):  # anti-aliased 1 px lines blend toward the background
+    return all(abs(a - b) <= tolerance for a, b in zip(pixel, colour)) and any(pixel)
+
+
+@unittest.skipIf(_cv2 is None, "needs OpenCV and numpy")
 class DrawAimBoxesTests(unittest.TestCase):
-    def test_target_is_red_with_label_and_others_green(self) -> None:
-        cv2 = SimpleNamespace(rectangle=Mock(), putText=Mock(), FONT_HERSHEY_SIMPLEX=0, LINE_AA=16)
-        target, other = FaceBox(10, 10, 50, 50, 0.9), FaceBox(100, 100, 200, 200, 0.9)
-        with patch.dict(sys.modules, {"cv2": cv2}):
-            draw_aim_boxes(SimpleNamespace(shape=(480, 640, 3)), [target, other], target)
-        colors = [c.args[3] for c in cv2.rectangle.call_args_list]
-        self.assertEqual(colors, [(0, 0, 255), (0, 255, 0)])
-        self.assertEqual(cv2.putText.call_count, 1)
-        self.assertEqual(cv2.putText.call_args.args[1], "AIM")
+    def test_target_amber_with_aim_tag_others_blue_grey_and_a_centre_crosshair(self) -> None:
+        from medusa.overlay import AMBER, BLUE_GREY, INK, TEXT
+        for height, width in ((480, 640), (1080, 1920)):
+            with self.subTest(size=(width, height)):
+                frame = _np.zeros((height, width, 3), _np.uint8)
+                s = height / 480
+                target = FaceBox(int(100 * s), int(150 * s), int(200 * s), int(250 * s), 0.9)
+                other = FaceBox(int(400 * s), int(150 * s), int(500 * s), int(250 * s), 0.9)
+                draw_aim_boxes(frame, [target, other], target)
+                self.assertEqual(_pixel(frame, int(150 * s), int(249 * s)), AMBER)  # target's bottom edge
+                self.assertEqual(_pixel(frame, int(450 * s), int(249 * s)), BLUE_GREY)
+                self.assertTrue(_near(_pixel(frame, width // 2 + int(8 * s), height // 2), BLUE_GREY))  # cross arm
+                self.assertEqual(_pixel(frame, width // 2, height // 2), (0, 0, 0))  # open centre
+                tag = frame[int(150 * s) - int(30 * s):int(150 * s) - 2, int(100 * s):int(160 * s)]
+                colours = {tuple(int(v) for v in px) for row in tag for px in row}
+                self.assertTrue({INK, TEXT, AMBER} <= colours)  # ink box, off-white text, amber bar
+                self.assertNotIn((0, 0, 255), colours)
+
+    def test_label_stays_inside_the_frame_at_the_top_edge(self) -> None:
+        from medusa.overlay import INK
+        frame = _np.zeros((480, 640, 3), _np.uint8)
+        target = FaceBox(600, 0, 639, 40, 0.9)
+        draw_aim_boxes(frame, [target], target)
+        self.assertEqual(_pixel(frame, 636, 2), INK)  # pushed left and down, still drawn
 
 
 class PreviewStatusTests(unittest.TestCase):

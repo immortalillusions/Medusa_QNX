@@ -402,6 +402,48 @@ class RuntimeSettingsTests(unittest.TestCase):
         self.assertIsInstance(settings, laptop_detector.RuntimeSettings)
         self.assertIs(preview.call_args.args[1], settings)
 
+
+class DrawTests(unittest.TestCase):
+    def setUp(self):
+        try:
+            import numpy
+            import cv2  # noqa: F401
+        except ImportError:
+            self.skipTest("needs OpenCV and numpy")
+        self.np = numpy
+
+    def draw(self, roles, user_id=None, height=480, width=640):
+        from medusa.peeper_tracker import Track
+        frame = self.np.zeros((height, width, 3), self.np.uint8)
+        faces, tracks, peeper = [], [], None
+        for k, (role, looking) in enumerate(roles):
+            box = (40 + k * 150, 120, 100, 100)
+            faces.append(laptop_detector.TrackedFace(None, None, box))
+            track = Track(id=k + 1, center_x=0.5, center_y=0.5, width=0.1, height=0.1, last_seen=0.0,
+                          looking=looking)
+            tracks.append(track)
+            if role == "peeper":
+                peeper = faces[-1]
+        with patch("cv2.putText", wraps=__import__("cv2").putText) as put:
+            laptop_detector.draw(frame, faces, peeper, tracks, user_id)
+        return frame, [c.args[1] for c in put.call_args_list]
+
+    def test_roles_and_colours(self):
+        from medusa.overlay import AMBER, BLUE_GREY, MUTED, RED
+        frame, tags = self.draw([("user", True), ("peeper", True), ("other", True), ("other", False)], user_id=1)
+        self.assertEqual(tags, ["USER #1 looking", "#3 looking", "#4 not looking",
+                                "PEEPER #2 looking"])  # the peeper is drawn last, on top
+        edges = [tuple(int(v) for v in frame[219, 90 + k * 150]) for k in range(4)]
+        self.assertEqual(edges, [BLUE_GREY, RED, AMBER, MUTED])
+
+    def test_one_person_mode_has_no_user_and_big_frames_scale_up(self):
+        _, tags = self.draw([("other", True)], user_id=None)
+        self.assertEqual(tags, ["#1 looking"])
+        small, _ = self.draw([("other", True)])
+        big, _ = self.draw([("other", True)], height=1080, width=1920)
+        ink = lambda frame: int((frame.reshape(-1, 3) == (22, 17, 14)).all(axis=1).sum())
+        self.assertGreater(ink(big), 3 * ink(small))  # the tag grows with the frame
+
 class MainTests(unittest.TestCase):
     def fake_modules(self, opened):
         camera = MagicMock()

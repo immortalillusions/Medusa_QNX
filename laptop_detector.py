@@ -45,9 +45,6 @@ MODELS = {
     "blazeface": Path(__file__).resolve().parent / "qnx" / "blaze_face_short_range.tflite",
 }
 MAX_FACES = 4
-PEEPER_COLOR = (0, 0, 255)  # BGR red
-USER_COLOR = (0, 255, 0)
-AWAY_COLOR = (160, 160, 160)
 DEBUG_GAZE_INTERVAL_S = 1.0
 CONTROL_PORT = 8082
 CONTROL_POLL_S = 0.5
@@ -399,30 +396,34 @@ class LaptopDetector:
 
 
 def draw(frame, faces: list[TrackedFace], peeper: TrackedFace | None,
-         tracks: list[Track]) -> None:
-    """Box per face (green looking / red PEEPER / grey not looking), smoothed gaze arrow, tag."""
+         tracks: list[Track], user_id: int | None = None) -> None:
+    """Box, tag and smoothed gaze arrow per face: PEEPER red, USER blue-grey, another face
+    amber while looking and grey while not. ``user_id`` is None in one-person mode (no USER)."""
     import cv2
 
-    for face, track in zip(faces, tracks):
+    from medusa.overlay import AMBER, BLUE_GREY, MUTED, RED, frame_scale, label, thickness
+
+    scale = frame_scale(frame)
+    # The peeper last, so its box and tag are never covered by a neighbour's.
+    for face, track in sorted(zip(faces, tracks), key=lambda pair: pair[0] is peeper):
         left, top, box_w, box_h = face.box
         is_peeper = face is peeper
+        is_user = not is_peeper and track.id == user_id
         looking = track.looking
-        color = PEEPER_COLOR if is_peeper else USER_COLOR if looking else AWAY_COLOR
-        cv2.rectangle(frame, (left, top), (left + box_w, top + box_h), color, 3 if is_peeper else 2)
-        tag = f"#{track.id} " + ("looking" if looking else "not looking")
+        color = RED if is_peeper else BLUE_GREY if is_user else AMBER if looking else MUTED
+        cv2.rectangle(frame, (left, top), (left + box_w, top + box_h), color,
+                      thickness(scale, 3.0 if is_peeper else 2.0), cv2.LINE_AA)
+        role = "PEEPER " if is_peeper else "USER " if is_user else ""
+        tag = f"{role}#{track.id} " + ("looking" if looking else "not looking")
         if track.gaze_yaw is not None:
             tag += f" {track.gaze_yaw:+.0f}/{track.gaze_pitch:+.0f}"
-        tag += f" | {track.method}"
-        if is_peeper:
-            tag = "PEEPER " + tag
-        cv2.putText(frame, tag, (max(0, left), max(18, top - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+        label(cv2, frame, tag, left, top - thickness(scale), color, scale)
         if track.gaze_yaw is not None and face.nose is not None:
             # Length grows with the angle: a face width at 60 degrees.
-            scale = box_w / 60.0
-            tip = (round(face.nose[0] + track.gaze_yaw * scale),
-                   round(face.nose[1] - track.gaze_pitch * scale))
-            cv2.arrowedLine(frame, face.nose, tip, color, 2, tipLength=0.25)
+            arrow = box_w / 60.0
+            tip = (round(face.nose[0] + track.gaze_yaw * arrow),
+                   round(face.nose[1] - track.gaze_pitch * arrow))
+            cv2.arrowedLine(frame, face.nose, tip, color, thickness(scale), cv2.LINE_AA, tipLength=0.25)
 
 
 def detect_landmarks(landmarker, frame, timestamp_ms: int):
@@ -569,7 +570,7 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     raw = detect_faces(face_model, frame)
                 _, peeper = detector.step(raw, width, height)
-                draw(frame, detector.faces, peeper, detector.face_tracks)
+                draw(frame, detector.faces, peeper, detector.face_tracks, detector.user_id)
                 preview.state.update_frame(frame)
     except KeyboardInterrupt:
         _LOG.info("Stopping.")
