@@ -52,11 +52,41 @@ FACE_MODELS = {
 YUNET_MODEL = Path("qnx/face_detection_yunet_2023mar.onnx")
 
 
+def _camera_unit(value: str):
+    return "auto" if value == "auto" else int(value)
+
+
+def _open_camera(args):
+    """The configured camera; raises RuntimeError/ValueError/ImportError when it cannot open."""
+    if args.qnx_camera_unit is None:
+        import cv2
+
+        camera = cv2.VideoCapture(args.camera)
+        if not camera.isOpened():
+            camera.release()
+            raise RuntimeError("OpenCV camera is unavailable")
+        return camera
+    from medusa.qnx_camera import QnxCamera
+
+    if args.qnx_camera_unit == "auto":
+        from medusa.camera_select import AutoCamera
+
+        return AutoCamera(QnxCamera, log=lambda line: print(line, flush=True))
+    return QnxCamera(args.qnx_camera_unit)
+
+
+def _unavailable(camera) -> str:
+    return getattr(camera, "unavailable_reason", "camera frame unavailable")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     cameras = parser.add_mutually_exclusive_group()
     cameras.add_argument("--camera", type=int, default=0, help="OpenCV camera index")
-    cameras.add_argument("--qnx-camera-unit", type=int, help="QNX Sensor Framework camera unit")
+    cameras.add_argument("--qnx-camera-unit", type=_camera_unit, metavar="N|auto",
+                         help="QNX Sensor Framework camera unit, or auto: find the real camera (skipping "
+                              "QNX's test-pattern units), wait for it while it is missing, and find it "
+                              "again if it disappears")
     parser.add_argument("--face-model", choices=sorted(FACE_MODELS),
                         help="BlazeFace variant: back (256x256, finds smaller/farther faces; default in "
                              "laptop-trigger mode) or short (128x128; default otherwise)")
@@ -347,7 +377,7 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
             trigger.poll()
             laptop_active, laptop_reason = trigger.status()
             if not ok:
-                go_home("camera frame unavailable")
+                go_home(_unavailable(camera))
                 continue
             rate.tick()
             height, width = frame.shape[:2]
@@ -471,15 +501,7 @@ def main() -> int:
 
             detector.face_detector = FallbackFaceDetector(
                 detector.face_detector, YuNetFaceDetector(str(YUNET_MODEL), scale=1.0), want=1)
-        if args.qnx_camera_unit is None:
-            camera = cv2.VideoCapture(args.camera)
-            if not camera.isOpened():
-                camera.release()
-                raise RuntimeError("OpenCV camera is unavailable")
-        else:
-            from medusa.qnx_camera import QnxCamera
-
-            camera = QnxCamera(args.qnx_camera_unit)
+        camera = _open_camera(args)
     except (ImportError, RuntimeError, ValueError, OSError) as error:
         print(f"Medusa cannot start safely: {error}", file=sys.stderr)
         return 2
@@ -527,11 +549,11 @@ def main() -> int:
                 ok, frame = camera.read()
                 if not ok:
                     clear_frames = 0
-                    send(events, target, False, None, "camera frame unavailable")
+                    send(events, target, False, None, _unavailable(camera))
                     if arduino:
                         arduino.safe_stop()
                     if preview:
-                        preview.state.update_status(False, "camera frame unavailable")
+                        preview.state.update_status(False, _unavailable(camera))
                     continue
                 boxes = None
                 inference_failed = False
