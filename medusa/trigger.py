@@ -42,6 +42,7 @@ class PeeperMessage:
     seq: int | None = None
     user_x: float | None = None  # Optional: the user's x in the laptop image (PeeperMatcher's "order").
     peeper_id: int | None = None  # Optional: the laptop's peeper identity; a change drops the face lock.
+    target_size: float | None = None  # Optional: peeper face width / laptop frame width (--fusion bands).
 
 
 def _optional_number(value) -> float | None:
@@ -73,6 +74,7 @@ def parse_peeper_message(payload: bytes) -> PeeperMessage | None:
         seq=seq if isinstance(seq, int) and not isinstance(seq, bool) else None,
         user_x=_optional_number(message.get("user_x")),
         peeper_id=_optional_int(message.get("peeper_id")),
+        target_size=_optional_number(message.get("target_size")),
     )
 
 
