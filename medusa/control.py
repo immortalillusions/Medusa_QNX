@@ -461,7 +461,7 @@ class ControlLoop:
         elif gate_closed is False:
             reason = "kill gate open"
         elif parking:
-            reason = "returning home after link loss"
+            reason = "returning home, then limp"
         elif not armed:
             reason = "turret disarmed"
         elif target is None:

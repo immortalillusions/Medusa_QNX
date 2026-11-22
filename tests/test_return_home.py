@@ -60,7 +60,11 @@ class FirmwareParkingTests(unittest.TestCase):
 
     def test_button_or_gate_during_parking_cuts_to_limp(self) -> None:
         button = function_body(self.source, "void updateArmButton(")
-        self.assertIn("setArmed(parking ? false : !armed);", button)
+        # A press while parking cuts to limp; a press while armed parks first (glide home,
+        # then limp, so the next arm starts at home); a press while off arms.
+        self.assertIn("if (parking) setArmed(false);", button)
+        self.assertIn("else if (armed) startParking();", button)
+        self.assertIn("else setArmed(true);", button)
         gate = function_body(self.source, "void updateKillGate(")
         self.assertIn("if (!gateClosed && (armed || parking)) setArmed(false);", gate)
         # setArmed(false) is the stop-in-place detach (target = position), not a glide.
@@ -116,7 +120,7 @@ class ControlParkLineTests(unittest.TestCase):
         serial.incoming += [b"S,0,350,900,1,1,1\n"]
         loop.tick(1.0)
         snap = loop.snapshot(1.1)
-        self.assertEqual((snap["state"], snap["safe_reason"]), ("SAFE", "returning home after link loss"))
+        self.assertEqual((snap["state"], snap["safe_reason"]), ("SAFE", "returning home, then limp"))
         self.assertEqual((snap["arduino"]["parking"], snap["arduino"]["armed"]), (True, False))
         serial.incoming += [b"S,0,0,900,2,1,0\n"]  # home and limp
         loop.tick(1.2)

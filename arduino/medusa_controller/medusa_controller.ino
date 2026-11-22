@@ -161,8 +161,9 @@ void setArmed(bool shouldArm) {
 }
 
 void startParking() {
-  // The QNX heartbeat stopped while armed (control process dead, UART out): glide
-  // both axes home with the normal easing, still attached, then go limp in loop().
+  // Switched off by the button, or the QNX heartbeat stopped while armed (control process
+  // dead, UART out): glide both axes home with the normal easing, still attached, then go
+  // limp in loop().
   // Disarmed for everything else: commands are ignored and the status says 0.
   armed = false;
   parking = true;
@@ -207,8 +208,14 @@ void updateArmButton() {
   if (millis() - buttonChangedMs >= BUTTON_DEBOUNCE_MS && reading != stableButtonReading) {
     stableButtonReading = reading;
     // INPUT_PULLUP means a pressed button reads LOW.
-    // A press while parking cuts to limp; it never re-arms mid-glide.
-    if (stableButtonReading == LOW) setArmed(parking ? false : !armed);
+    // Switching off while armed glides home first, then goes limp, so the next arm starts
+    // at home with no jolt (an SG90 cannot report its angle). A press while parking cuts
+    // to limp at once; it never re-arms mid-glide. The kill gate still cuts instantly.
+    if (stableButtonReading == LOW) {
+      if (parking) setArmed(false);
+      else if (armed) startParking();
+      else setArmed(true);
+    }
   }
   lastButtonReading = reading;
 }
