@@ -5,10 +5,25 @@ header { display:flex; justify-content:space-between; align-items:flex-start; ma
 .setup, .alert { background:#101b20; border:1px solid #26363a; border-radius:12px; padding:18px; } label { display:block; margin-bottom:8px; } .setup div { display:flex; gap:8px; } input { min-width:0; flex:1; padding:11px; border-radius:7px; border:1px solid #3a4a4c; background:#091014; color:white; } button { border:0; border-radius:7px; background:#41d6aa; color:#062118; font-weight:bold; padding:0 18px; cursor:pointer; } small { display:block; color:#8ba6a1; margin-top:10px; } code { color:#b2f6df; }
 .grid { display:grid; grid-template-columns:2fr 1fr; gap:18px; margin-top:18px; } .video { min-height:360px; display:grid; place-items:center; overflow:hidden; border-radius:12px; background:#101b20; border:1px solid #26363a; color:#8ba6a1; } .video img { width:100%; display:block; } .alert strong { display:block; font-size:26px; margin:4px 0 14px; } .active { border-color:#ff5e66; color:#ffdce0; } .note { color:#8ba6a1; margin-top:20px; } @media(max-width:700px) { .grid { grid-template-columns:1fr; } header { gap:16px; } }
 
-.nose-offset {
-  border-top: 1px solid #465553;
-  margin: 18px 0;
-  padding-top: 12px;
-  font-variant-numeric: tabular-nums;
-}
-.nose-offset p { margin: 0 0 6px; }
+.banner { margin-bottom:18px; } .banner strong { margin-bottom:6px; }
+.sources { display:grid; grid-template-columns:1fr 1fr; gap:18px; } .source { display:flex; flex-direction:column; gap:12px; min-width:0; }
+.source-head { display:flex; justify-content:space-between; align-items:center; gap:12px; } .source-head h2 { margin:0; font-size:20px; }
+.source .video { min-height:260px; } .source .alert p { margin:0 0 6px; font-variant-numeric:tabular-nums; } .source .alert strong { margin-bottom:10px; }
+@media(max-width:900px) { .sources { grid-template-columns:1fr; } }
+
+.safe { border-color:#41d6aa; color:#c9f7e8; } .alert.safe strong { color:#41d6aa; } .alert.active strong { color:#ff5e66; }
+.safety { display:flex; flex-direction:column; gap:12px; margin-bottom:18px; } .safety-top { display:grid; grid-template-columns:minmax(220px,1fr) 2fr; gap:12px; }
+.safety-state strong { font-size:34px; margin-bottom:4px; } .safety-state small { margin-top:4px; }
+.lights { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:8px; background:#101b20; border:1px solid #26363a; border-radius:12px; padding:14px; align-content:center; }
+.light { display:flex; gap:10px; align-items:flex-start; min-width:0; } .light p { margin:0; font-size:14px; font-weight:bold; } .light small { margin-top:2px; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
+.dot { flex:none; width:12px; height:12px; border-radius:50%; margin-top:3px; background:#465553; } .dot.ok { background:#41d6aa; box-shadow:0 0 8px #41d6aa88; } .dot.warn { background:#f5c451; } .dot.bad { background:#ff5e66; box-shadow:0 0 8px #ff5e6688; }
+.armed { color:#ff5e66; font-weight:bold; } .light b { font-weight:bold; color:#e8f0ef; } .light b.armed { color:#ff5e66; }
+.realtime { display:grid; grid-template-columns:auto 1fr auto; grid-template-areas:"head head head" "stats spark stress"; gap:10px 18px; align-items:center; background:#101b20; border:1px solid #26363a; border-radius:12px; padding:14px 18px; }
+.rt-head { grid-area:head; display:flex; gap:12px; align-items:baseline; flex-wrap:wrap; } .rt-head .eyebrow { margin:0; } .rt-head small { margin:0; }
+.rt-stats { grid-area:stats; display:flex; flex-wrap:wrap; gap:6px 18px; margin:0; } .rt-stats dt { color:#8ba6a1; font-size:12px; } .rt-stats dd { margin:2px 0 0; font-size:18px; font-weight:bold; font-variant-numeric:tabular-nums; }
+.rt-spark { grid-area:spark; min-width:0; } .rt-spark small { margin-top:4px; font-size:12px; }
+.spark { display:block; width:100%; height:44px; background:#091014; border-radius:6px; } .spark-line { fill:none; stroke:#41d6aa; stroke-width:1.5; vector-effect:non-scaling-stroke; } .spark-nominal { stroke:#465553; stroke-dasharray:4 4; vector-effect:non-scaling-stroke; }
+.rt-stress { grid-area:stress; display:flex; flex-direction:column; align-items:flex-end; } .rt-stress button { padding:11px 16px; } .rt-stress small { margin-top:6px; }
+button:disabled { background:#26363a; color:#8ba6a1; cursor:not-allowed; } button.secondary { background:#26363a; color:#e8f0ef; }
+.advanced summary { color:#8ba6a1; cursor:pointer; font-size:13px; } .advanced .setup { margin-top:8px; }
+@media(max-width:900px) { .safety-top { grid-template-columns:1fr; } .realtime { grid-template-columns:1fr; grid-template-areas:"head" "stats" "spark" "stress"; } .rt-stress { align-items:stretch; } }

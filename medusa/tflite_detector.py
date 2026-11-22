@@ -17,6 +17,71 @@ from .decision import screen_facing_from_landmarks
 from .models import FaceObservation
 
 _NOSE_KEYPOINT_OFFSET = 4 + 2 * 2  # Four box values, then the third x/y keypoint.
+DEFAULT_SCORE_THRESHOLD = 0.55
+DEFAULT_NUM_THREADS = 4
+
+
+@dataclass(frozen=True)
+class BlazeFaceSpec:
+    """One BlazeFace variant: its square input size and MediaPipe's SSD anchor strides."""
+
+    name: str
+    input_size: int
+    strides: tuple[int, ...]
+
+
+# MediaPipe face_detection_short_range / face_detection_back SsdAnchorsCalculator options.
+MODEL_SPECS = {
+    128: BlazeFaceSpec("short", 128, (8, 16, 16, 16)),
+    256: BlazeFaceSpec("back", 256, (16, 32, 32, 32)),
+}
+
+
+def model_spec_for_input(shape) -> BlazeFaceSpec | None:
+    """Pick the BlazeFace variant from the input tensor shape [1, S, S, 3]."""
+    shape = tuple(int(v) for v in shape)
+    if len(shape) != 4 or shape[0] != 1 or shape[1] != shape[2] or shape[3] != 3:
+        return None
+    return MODEL_SPECS.get(shape[1])
+
+
+def ssd_anchors(input_size: int, strides: Sequence[int], *, anchor_offset: float = 0.5,
+                aspect_ratios: Sequence[float] = (1.0,),
+                interpolated_scale_aspect_ratio: float = 1.0) -> list[tuple[float, float]]:
+    """Anchor centres (0..1) in the order MediaPipe's SsdAnchorsCalculator emits them.
+
+    Consecutive layers with the same stride share one feature map; each layer adds
+    one anchor per aspect ratio plus one interpolated-scale anchor per cell. With
+    fixed_anchor_size every anchor is 1x1, so only the centres matter here.
+    """
+    anchors = []
+    layer = 0
+    while layer < len(strides):
+        per_cell, last = 0, layer
+        while last < len(strides) and strides[last] == strides[layer]:
+            per_cell += len(aspect_ratios) + (1 if interpolated_scale_aspect_ratio > 0 else 0)
+            last += 1
+        grid = math.ceil(input_size / strides[layer])
+        for y in range(grid):
+            for x in range(grid):
+                anchors.extend([((x + anchor_offset) / grid, (y + anchor_offset) / grid)] * per_cell)
+        layer = last
+    return anchors
+
+
+def order_output_heads(shapes) -> tuple[list[int], list[int]]:
+    """Indices of the box-regressor ([1, N, 16]) and score ([1, N, 1]) outputs, larger N first.
+
+    The back model splits each into a 512-anchor (16x16 grid) and a 384-anchor
+    (8x8 grid) head; anchors list the 16x16 grid first.
+    """
+    shapes = [tuple(int(v) for v in shape) for shape in shapes]
+
+    def heads(width):
+        found = [i for i, shape in enumerate(shapes) if len(shape) == 3 and shape[0] == 1 and shape[2] == width]
+        return sorted(found, key=lambda i: -shapes[i][1])
+
+    return heads(16), heads(1)
 
 
 @dataclass(frozen=True)
@@ -59,9 +124,13 @@ def draw_face_boxes(
 
 
 class TFLiteFaceDetector:
-    """Run the short-range BlazeFace model and report boxes in photo coordinates."""
+    """Run a BlazeFace model (short-range 128 or back 256) and report boxes in photo coordinates."""
 
-    def __init__(self, model_path: str) -> None:
+    input_size = 128
+    score_threshold = DEFAULT_SCORE_THRESHOLD
+
+    def __init__(self, model_path: str, *, score_threshold: float = DEFAULT_SCORE_THRESHOLD,
+                 num_threads: int = DEFAULT_NUM_THREADS) -> None:
         try:
             import cv2
             import numpy as np
@@ -69,72 +138,75 @@ class TFLiteFaceDetector:
         except ImportError as error:
             raise RuntimeError("QNX TFLite runtime, NumPy, and OpenCV are required.") from error
         self.cv2, self.np, self.Interpreter = cv2, np, Interpreter
-        self.face = Interpreter(model_path=model_path, num_threads=1)
+        self.num_threads = num_threads
+        self.face = Interpreter(model_path=model_path, num_threads=num_threads)
         self.face.allocate_tensors()
         self.face_in = self.face.get_input_details()[0]
-        if (tuple(self.face_in["shape"]) != (1, 128, 128, 3)
-                or self.face_in["dtype"] != np.float32):
-            raise RuntimeError("Expected the checked-in 128×128 float BlazeFace model.")
-        self.anchors = self._anchors(128, 128)
+        spec = model_spec_for_input(self.face_in["shape"])
+        if spec is None or self.face_in["dtype"] != np.float32:
+            raise RuntimeError("Expected a float BlazeFace model: 128×128 short-range or 256×256 back.")
+        self.model, self.input_size = spec.name, spec.input_size
+        self.anchors = ssd_anchors(spec.input_size, spec.strides)
+        self.score_threshold = score_threshold
+        details = self.face.get_output_details()
+        box_heads, score_heads = order_output_heads(detail["shape"] for detail in details)
+        self._box_heads = [details[i]["index"] for i in box_heads]
+        self._score_heads = [details[i]["index"] for i in score_heads]
+        anchors = len(self.anchors)
+        if (sum(int(details[i]["shape"][1]) for i in box_heads) != anchors
+                or sum(int(details[i]["shape"][1]) for i in score_heads) != anchors):
+            raise RuntimeError(f"Expected {anchors} anchors in the {spec.name} BlazeFace outputs.")
 
     def detect(self, frame) -> list[FaceBox]:
+        np, size = self.np, self.input_size
         height, width = frame.shape[:2]
-        scale = 128 / max(width, height)
+        scale = size / max(width, height)
         resized_width = max(1, round(width * scale))
         resized_height = max(1, round(height * scale))
-        pad_x = (128 - resized_width) // 2
-        pad_y = (128 - resized_height) // 2
+        pad_x = (size - resized_width) // 2
+        pad_y = (size - resized_height) // 2
         resized = self.cv2.resize(frame, (resized_width, resized_height))
         rgb = self.cv2.cvtColor(resized, self.cv2.COLOR_BGR2RGB)
-        image = self.np.full((1, 128, 128, 3), -1, dtype=self.np.float32)
+        image = np.full((1, size, size, 3), -1, dtype=np.float32)
         image[0, pad_y:pad_y + resized_height, pad_x:pad_x + resized_width] = rgb / 127.5 - 1
         self.face.set_tensor(self.face_in["index"], image)
         self.face.invoke()
-        outputs = {tuple(detail["shape"]): self.face.get_tensor(detail["index"])
-                   for detail in self.face.get_output_details()}
-        raw_boxes = outputs.get((1, 896, 16))
-        logits = outputs.get((1, 896, 1))
-        if raw_boxes is None or logits is None:
-            raise RuntimeError("Expected the checked-in 896-anchor BlazeFace model.")
-
-        return self._decode(raw_boxes[0], logits[0, :, 0], width, height,
-                            pad_x, pad_y, resized_width, resized_height)
+        raw_boxes = np.concatenate([self.face.get_tensor(i)[0] for i in self._box_heads])
+        logits = np.concatenate([self.face.get_tensor(i)[0, :, 0] for i in self._score_heads])
+        # Sigmoid is monotonic: drop anchors below the threshold before the per-box Python loop.
+        threshold = min(max(self.score_threshold, 1e-6), 1 - 1e-6)
+        keep = np.nonzero(logits >= math.log(threshold / (1 - threshold)))[0]
+        return self._decode(raw_boxes[keep], logits[keep], width, height,
+                            pad_x, pad_y, resized_width, resized_height,
+                            anchors=[self.anchors[i] for i in keep])
 
     def _decode(self, raw_boxes, logits, width, height, pad_x, pad_y,
-                resized_width, resized_height) -> list[FaceBox]:
+                resized_width, resized_height, *, anchors=None) -> list[FaceBox]:
+        size = self.input_size
         x_scale, y_scale = width / resized_width, height / resized_height
         boxes = []
-        for raw, logit, (anchor_x, anchor_y) in zip(raw_boxes, logits, self.anchors):
+        for raw, logit, (anchor_x, anchor_y) in zip(raw_boxes, logits, self.anchors if anchors is None else anchors):
             if not math.isfinite(logit):
                 continue
             score = 1 / (1 + math.exp(-max(-100, min(100, float(logit)))))
-            if score < .65:
+            if score < self.score_threshold:
                 continue
             offset_x, offset_y, box_width, box_height = map(float, raw[:4])
             if not all(map(math.isfinite, (offset_x, offset_y, box_width, box_height))):
                 continue
-            cx = offset_x + anchor_x * 128 - pad_x
-            cy = offset_y + anchor_y * 128 - pad_y
+            cx = offset_x + anchor_x * size - pad_x
+            cy = offset_y + anchor_y * size - pad_y
             half_width, half_height = box_width / 2, box_height / 2
             left, top = max(0, (cx - half_width) * x_scale), max(0, (cy - half_height) * y_scale)
             right = min(width, (cx + half_width) * x_scale)
             bottom = min(height, (cy + half_height) * y_scale)
             if right - left >= 1 and bottom - top >= 1:
                 nose_x, nose_y = map(float, raw[_NOSE_KEYPOINT_OFFSET:_NOSE_KEYPOINT_OFFSET + 2])
-                nose_x = (nose_x + anchor_x * 128 - pad_x) * x_scale
-                nose_y = (nose_y + anchor_y * 128 - pad_y) * y_scale
+                nose_x = (nose_x + anchor_x * size - pad_x) * x_scale
+                nose_y = (nose_y + anchor_y * size - pad_y) * y_scale
                 nose = (nose_x, nose_y) if 0 <= nose_x < width and 0 <= nose_y < height else None
                 boxes.append(FaceBox(left, top, right, bottom, score, nose))
         return self._nms(boxes)
-
-    @staticmethod
-    def _anchors(width, height):
-        anchors = []
-        for stride, repeats in ((8, 2), (16, 6)):
-            for y in range(0, height, stride):
-                for x in range(0, width, stride):
-                    anchors.extend([((x + stride / 2) / width, (y + stride / 2) / height)] * repeats)
-        return anchors
 
     def _nms(self, boxes, threshold=.3):
         kept = []
@@ -156,10 +228,13 @@ class TFLiteFaceDetector:
 class TFLiteFaceGazeDetector:
     """Local BlazeFace and landmark inference through the QNX TFLite runtime."""
 
-    def __init__(self, detector_path: str, landmark_path: str) -> None:
-        self.face_detector = TFLiteFaceDetector(detector_path)
+    def __init__(self, detector_path: str, landmark_path: str, *,
+                 score_threshold: float = DEFAULT_SCORE_THRESHOLD,
+                 num_threads: int = DEFAULT_NUM_THREADS) -> None:
+        self.face_detector = TFLiteFaceDetector(detector_path, score_threshold=score_threshold,
+                                                num_threads=num_threads)
         self.cv2, self.np = self.face_detector.cv2, self.face_detector.np
-        self.landmark = self.face_detector.Interpreter(model_path=landmark_path, num_threads=1)
+        self.landmark = self.face_detector.Interpreter(model_path=landmark_path, num_threads=num_threads)
         self.landmark.allocate_tensors()
         self.landmark_in = self.landmark.get_input_details()[0]
 

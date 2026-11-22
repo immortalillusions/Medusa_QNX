@@ -30,16 +30,21 @@ class PreviewState:
     def update_status(
         self, active: bool, reason: str, *, face_count: int | None = None,
         snooper_count: int = 0, nose_offset: NoseOffset | None = None,
+        extra: dict | None = None,
     ) -> None:
+        """Replace the status; ``extra`` adds mode-specific fields after the standard ones."""
+        status = {
+            "active": active,
+            "reason": reason,
+            "face_count": face_count,
+            "snooper_detected": snooper_count > 0,
+            "snooper_count": snooper_count,
+            "nose_offset": asdict(nose_offset) if nose_offset is not None else None,
+        }
+        if extra:
+            status.update(extra)
         with self.condition:
-            self.status = {
-                "active": active,
-                "reason": reason,
-                "face_count": face_count,
-                "snooper_detected": snooper_count > 0,
-                "snooper_count": snooper_count,
-                "nose_offset": asdict(nose_offset) if nose_offset is not None else None,
-            }
+            self.status = status
 
 
 class PreviewServer:

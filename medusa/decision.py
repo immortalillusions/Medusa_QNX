@@ -27,6 +27,7 @@ class SnooperSelector:
     """
 
     hold_frames: int = 15
+    min_viewers: int = 2  # 1 = aim at any single face (bench calibration only)
     min_confidence: float = 0.65
     _last_bucket: tuple[str, int] | None = None
     _streak: int = 0
@@ -36,7 +37,7 @@ class SnooperSelector:
             face for face in faces
             if face.screen_facing and face.confidence >= self.min_confidence
         ]
-        if len(viewers) < 2:
+        if len(viewers) < self.min_viewers:
             self._reset()
             return SnooperDecision(False, reason="fewer than two screen-facing faces")
 
@@ -57,6 +58,7 @@ class SnooperSelector:
         return SnooperDecision(
             True,
             target_x=snooper.center_x,
+            target_y=snooper.center_y,
             source=snooper.source,
             reason="two or more stable screen-facing faces",
         )

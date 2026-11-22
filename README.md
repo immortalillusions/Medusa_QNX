@@ -70,9 +70,49 @@ the QNX OSS TensorFlow Lite runtime—not the full MediaPipe runtime.
    ```
 
 Before this command, upload `arduino/medusa_controller/medusa_controller.ino`
-to the UNO Q. It accepts `M,yaw,led,sequence` commands at 115200 baud and
+to the UNO Q. It accepts `M,yaw,pitch,led,sequence` commands at 115200 baud and
 parks the servo plus turns off the LED if the heartbeat stops for 300 ms.
 Use `--servo-reversed` if left/right movement is backwards.
+
+When the camera is clipped on the turret's pan stage, add `--camera-on-turret`
+(laptop-trigger mode only). The Pi models the firmware's eased motion to know
+where the turret pointed when each frame was captured (`--camera-latency`, 0.07 s),
+turns the face's image x into a world bearing with `--camera-hfov`, and filters
+bearing and velocity. The command leads the face by `--pan-lead` (0.15 s from
+capture) and holds perfectly still for a still face (1.0 deg to start moving,
+0.4 deg to stop). After the target is lost the turret coasts for `--pan-coast`
+(0.3 s), waits until `--pan-hold` (default: no extra wait), then glides home at
+`--pan-return-speed` (60 deg/s). `--pan-gain`, `--pan-deadband` and
+`--pan-max-step` are accepted but ignored. The firmware's `MAX_SPEED` and
+`MAX_ACCEL` must match `FIRMWARE_*` in `medusa/trigger.py`. Tilt still maps
+face y through the tilt range.
+
+While the laptop reports a peeper but the turret camera sees no face, the
+turret first points where the handoff map says (`--handoff-map`, default
+`~/Medusa_QNX-bench/handoff.json`), then after `--handoff-timeout` (0.6 s), or
+straight away without a map, sweeps the pan range at `--search-speed`
+(60 deg/s), starting toward the laptop's side. The light stays off until the
+turret camera itself sees a face. `--no-search` restores coast-then-home. Edit
+the map with `python3 -m medusa.handoff record <laptop_x> <pan_deg>`, `show`,
+`clear`, or `record-now` (stand in place, let the turret centre on you, run it).
+
+### Real-time control process
+
+`medusa_control.py` owns `/dev/ser1` and runs a fixed 50 Hz loop on absolute
+deadlines: it forwards the AI's latest target while it is fresh (< 0.3 s) and
+otherwise sends a park line, so the Arduino heartbeat never depends on the AI
+loop. It reads the firmware's `S,<armed>,<pan_x10>,<tilt_x10>,<seq>` status
+(every 100 ms on UNO Q D1 -> Pi RX pin 10), forwards it to the AI process
+(UDP 8769) so the pan tracker uses the real angle and resets while disarmed,
+and serves `GET /control.json` and `POST /stress?seconds=N` on port 8082.
+Start it at priority 21 (its threads inherit it), then the AI process at the
+default priority 10 with `--control-port`; the AI process then never opens the
+serial port. In `start_medusa.sh`:
+
+```sh
+on -p 21 python3 -u medusa_control.py --port /dev/ser1 --tilt-min 90 --tilt-max 90 --tilt-home 90 &
+python3 -u qnx_ai_service.py --qnx-camera-unit 5 --control-port 8768 --trigger-udp-port 8767 --trigger-from 172.20.10.4 --camera-on-turret --servo-reversed --tilt-min 90 --tilt-max 90 --tilt-home 90
+```
 
 ## Local preview dashboard
 

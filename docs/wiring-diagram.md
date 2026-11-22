@@ -45,8 +45,8 @@ button is pressed again.
 4. Verify the exact QNX UART device and UNO Q voltage levels before connecting
    serial data.
 
-The Pi sends `M,yaw,led,sequence` at 115200 baud. Example:
-`M,92,1,1842`. The Arduino parks the servo and turns the LED off after 300 ms
+The Pi sends `M,yaw,pitch,led,sequence` at 115200 baud (old `M,yaw,led,sequence` still accepted). Example:
+`M,92,80,1,1842`. The Arduino parks both servos and turns the LED off after 300 ms
 without a valid command.
 
 ## 5. Safe first test

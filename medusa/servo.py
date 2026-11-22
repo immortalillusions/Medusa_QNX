@@ -7,8 +7,8 @@ from dataclasses import dataclass
 
 @dataclass
 class ServoMapper:
-    minimum: int = 35
-    maximum: int = 145
+    minimum: int = 65
+    maximum: int = 115
     home: int = 90
     reversed: bool = False
     smoothing: float = 0.35

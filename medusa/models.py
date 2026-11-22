@@ -30,6 +30,7 @@ class FaceObservation:
 class SnooperDecision:
     active: bool
     target_x: float | None = None
+    target_y: float | None = None
     source: str | None = None
     reason: str = ""
 
