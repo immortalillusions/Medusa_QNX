@@ -233,6 +233,32 @@ class SmoothFallbackTests(unittest.TestCase):
         first = {state: next(t for t, s in states if s == state) for state in ("holding", "returning")}
         self.assertAlmostEqual(first["holding"], 0.3, delta=0.1)
         self.assertAlmostEqual(first["returning"] - first["holding"], 1.0, delta=0.1)
+    def test_a_short_laptop_dropout_never_heads_home(self) -> None:
+        # Live: the laptop lost the peeper ~0.5 s and the turret lurched coasting -> home -> fallback.
+        # The laptop holds its own exit 0.7 s, so dropouts up to then must leave the turret where it is.
+        for face_first in (False, True):
+            with self.subTest(face_first=face_first):
+                pan = turret(fallback_search_deg=0)
+                times = jittery(0.0, 8.0)
+                self.fallback(pan, times[:50], lambda t: 0.8)  # settled near map(0.8) = 70
+                k = 50
+                if face_first:  # the turret camera had the face too, and lost it with the laptop
+                    for t in times[k:k + 5]:
+                        pan.update(0.5, now=t, laptop_active=True, laptop_x=0.8, fallback_map=LINE.angle)
+                    k += 5
+                held, drop = pan.command, times[k]
+                during = []
+                for t in times[k:]:
+                    if t >= drop + 0.7:
+                        break
+                    pan.update(None, now=t, laptop_active=False, fallback_map=LINE.angle)
+                    during.append((pan.state, pan.command))
+                    k += 1
+                self.assertTrue({state for state, _ in during} <= {"fallback", "coasting", "holding"}, during)
+                self.assertTrue(all(abs(angle - held) < 0.5 for _, angle in during), during)
+                after = self.fallback(pan, times[k:k + 20], lambda t: 0.8)
+                self.assertEqual(after[-1][1], "fallback")
+                self.assertTrue(all(abs(angle - held) < 1.0 for _, _, angle in after))
 
     def test_no_face_for_1_5_s_sweeps_around_the_map_estimate_and_widens_once(self) -> None:
         pan = turret()  # 55..125, home 90; laptop x 0.5 -> map 90
