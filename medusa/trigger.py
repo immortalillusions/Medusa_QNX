@@ -42,6 +42,7 @@ class PeeperMessage:
     seq: int | None = None
     user_x: float | None = None  # Optional: the user's x in the laptop image (PeeperMatcher's "order").
     peeper_id: int | None = None  # Optional: the laptop's peeper identity; a change drops the face lock.
+    target_size: float | None = None  # Optional: peeper face width / laptop frame width (--fusion bands).
 
 
 def _optional_number(value) -> float | None:
@@ -73,6 +74,7 @@ def parse_peeper_message(payload: bytes) -> PeeperMessage | None:
         seq=seq if isinstance(seq, int) and not isinstance(seq, bool) else None,
         user_x=_optional_number(message.get("user_x")),
         peeper_id=_optional_int(message.get("peeper_id")),
+        target_size=_optional_number(message.get("target_size")),
     )
 
 
@@ -510,6 +512,14 @@ class PanTracker:
     that its kill gate is open, resets to home every frame, so nothing winds up
     (and fallback does not run) while the firmware ignores us; its servos are
     detached then, so the reset itself moves nothing.
+
+    Fusion (opt-in, ``fusion``: a medusa.fusion.BearingFusion; None by default, and then
+    none of this runs): update() feeds the fusion the turret camera's bearing (variance by
+    ``aim_source``) and the laptop map's (``map_bearing``, ``map_var``), and the command
+    follows the fused bearing and rate (the same lead and hysteresis as above, capped at
+    ``max_rate``): "tracking" with a turret target, "fallback" on the map alone (with the
+    same local search after ``fallback_search_after_s``). With
+    neither (or the laptop gone) the fusion resets and the default paths take over.
     """
 
     def __init__(
@@ -525,7 +535,7 @@ class PanTracker:
         fallback_tau: float = 0.25, fallback_blend_s: float = 1.0, fallback_lead_s: float = 0.15,
         fallback_omega: float = 6.0, fallback_max_accel: float = 600.0, reacquire_blend_s: float = 0.3,
         lost_hold_s: float = 1.0, fallback_search_after_s: float = 1.5, fallback_search_deg: float = 20.0,
-        fallback_search_speed: float = 30.0,
+        fallback_search_speed: float = 30.0, fusion=None,
     ) -> None:
         if mode not in ("predictive", "proportional"):
             raise ValueError("pan mode must be 'predictive' or 'proportional'")
@@ -550,6 +560,7 @@ class PanTracker:
         self.servo = FirmwareAxisModel(self.home, self.minimum, self.maximum)
         self._last_now: float | None = None
         self.actual: tuple[float, float, bool] | None = None  # (time, real pan, live: armed, gate not open)
+        self.fusion = fusion  # opt-in BearingFusion (--fusion); None keeps every default path
         self.reset()
 
     def reset(self) -> None:
@@ -572,6 +583,8 @@ class PanTracker:
         self._sweep, self._sweep_dir, self._sweep_amp, self._sweep_run = 0.0, 0.0, 0.0, 0.0
         self._blend: tuple[float, float] | None = None  # (start, fallback command) while reacquiring
         self._hold_at: float | None = None
+        if self.fusion is not None:
+            self.fusion.reset()
         self.servo.target = float(round(self.home))
 
     def _clamp(self, angle: float) -> float:
@@ -623,6 +636,7 @@ class PanTracker:
         laptop_active: bool = False, handoff_angle: float | None = None, laptop_x: float | None = None,
         fallback_map: Callable[[float], float | None] | None = None,
         fallback_domain: tuple[float, float] | None = None,
+        aim_source: str | None = "face", map_bearing: float | None = None, map_var: float | None = None,
     ) -> float | None:
         """Advance one frame; return the image error (x - 0.5) or None without a target.
 
@@ -630,7 +644,8 @@ class PanTracker:
         for the laptop's target_x) and ``laptop_x`` drive acquire when ``target_x`` is None;
         ``fallback_map`` (laptop_x -> pan, None while unusable) turns acquire into fallback;
         ``fallback_domain`` (lowest, highest learned laptop x) lets it search at once while the
-        map extrapolates.
+        map extrapolates. ``aim_source``, ``map_bearing`` and ``map_var`` are read only with
+        ``fusion`` (see the class docstring).
         """
         now = time.monotonic() if now is None else now
         self.servo.advance(now)
@@ -640,6 +655,10 @@ class PanTracker:
         if self._actual_fresh(now) and not self.actual[2]:
             self.reset()  # Disarmed or gate open: the firmware ignores commands, so do not wind up.
             return None
+        if self.fusion is not None and self._fused(now, dt, captured, target_x, laptop_active, aim_source,
+                                                   map_bearing, map_var):
+            self.servo.target = self.command
+            return None if target_x is None else target_x - 0.5
         if target_x is None:
             if self._blend is not None:  # Lost mid-blend: carry on from the angle actually sent.
                 self.angle, self._blend = self._blended(now), None
@@ -706,6 +725,45 @@ class PanTracker:
         # First sight, re-acquired after giving up, or an absurd jump: a new target.
         self.bearing, self.velocity, self._filter_time = bearing, 0.0, captured
         self.moving = True
+
+    def _fused(self, now: float, dt: float, captured: float, target_x: float | None, laptop_active: bool,
+               aim_source: str | None, map_bearing: float | None, map_var: float | None) -> bool:
+        """Fusion's frame; False (fusion reset) hands the frame to the default paths."""
+        from .fusion import GIVE_UP_VAR, MAP_VAR, turret_variance
+
+        fusion = self.fusion
+        turret = None
+        if target_x is not None:
+            bearing = self.turret_position(captured, now) + self.sign * (target_x - 0.5) * self.hfov_deg
+            turret = (bearing, turret_variance(aim_source))
+        mapped = None
+        if laptop_active and map_bearing is not None:
+            mapped = (float(map_bearing), MAP_VAR if map_var is None else float(map_var))
+        coast = (turret is None and mapped is None and laptop_active and self.state == "fallback"
+                 and fusion.var is not None and fusion.var < GIVE_UP_VAR)  # a heartbeat without target_x
+        if turret is None and mapped is None and not coast:
+            fusion.reset()
+            return False
+        if self._blend is not None:
+            self.angle, self._blend = self._blended(now), None
+        fusion.step(captured, turret, mapped, start=self._clamp(self.angle),
+                    turret_source="head" if aim_source not in (None, "face") else "face")
+        if fusion.bearing is None:
+            return False
+        state = "tracking" if turret is not None else "fallback"
+        if state != self.state:
+            self.moving = True  # A new phase moves at once; the hysteresis settles it again.
+            self._start_local_search(now)
+        self.state, self.lost_at = state, None
+        # On the map alone, the same local search as fallback: a wrong map must not hold the
+        # turret where its camera never sees the face.
+        sweep = self._local_search(now, dt, fusion.bearing, None)[0] if state == "fallback" else 0.0
+        self.bearing, self.velocity, self._filter_time = fusion.bearing + sweep, fusion.rate, captured
+        before = self.angle
+        self._follow()
+        limit = self.max_rate * min(dt, _PROPORTIONAL_MAX_DT)
+        self.angle = self._clamp(before + max(-limit, min(limit, self.angle - before)))
+        return True
 
     def _centre(self, error: float, dt: float) -> None:
         """Proportional mode: nudge the turret a fraction of the way toward centring the face.

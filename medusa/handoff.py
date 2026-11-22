@@ -152,12 +152,17 @@ class HandoffMap:
     """Piecewise-linear laptop_x -> pan; ``extrapolate`` continues the end segments, clamped to ``bounds``.
 
     ``fingerprint`` (setup_fingerprint) is the setup the points were made for; it
-    is kept through with_point and save/load.
+    is kept through with_point and save/load. ``bands`` ({band name: points}) are the
+    per-distance-band points --fusion learns (medusa/fusion.py); they ride along in the
+    same file under "bands", which older code ignores, and a file without them is
+    written exactly as before.
     """
 
     def __init__(self, points=(), *, extrapolate: bool = False,
-                 bounds: tuple[float, float] | None = None, fingerprint: dict | None = None) -> None:
+                 bounds: tuple[float, float] | None = None, fingerprint: dict | None = None,
+                 bands: dict | None = None) -> None:
         self.extrapolate, self.bounds, self.fingerprint = extrapolate, bounds, fingerprint
+        self.bands = {str(name): HandoffMap(band).points for name, band in (bands or {}).items() if band}
         cleaned = {}
         for point in points:
             x, pan = (float(v) for v in point)
@@ -190,7 +195,7 @@ class HandoffMap:
         return a[1] + (x - a[0]) / (b[0] - a[0]) * (b[1] - a[1])
 
     def with_point(self, laptop_x: float, pan: float) -> "HandoffMap":
-        return HandoffMap(self.points + [(laptop_x, pan)], fingerprint=self.fingerprint)
+        return HandoffMap(self.points + [(laptop_x, pan)], fingerprint=self.fingerprint, bands=self.bands)
 
     @classmethod
     def load(cls, path) -> "HandoffMap":
@@ -206,8 +211,13 @@ class HandoffMap:
         if not isinstance(points, list) or not all(isinstance(p, list) and len(p) == 2 for p in points):
             raise ValueError(f"{path}: expected {{\"points\": [[laptop_x, pan_deg], ...]}}")
         fingerprint = data.get("fingerprint") if isinstance(data, dict) else None
+        bands = data.get("bands") if isinstance(data, dict) else None
+        if bands is not None and not (isinstance(bands, dict) and all(
+                isinstance(band, list) and all(isinstance(p, list) and len(p) == 2 for p in band)
+                for band in bands.values())):
+            raise ValueError(f"{path}: expected \"bands\": {{name: [[laptop_x, pan_deg], ...]}}")
         try:
-            return cls(points, fingerprint=fingerprint if isinstance(fingerprint, dict) else None)
+            return cls(points, fingerprint=fingerprint if isinstance(fingerprint, dict) else None, bands=bands)
         except (TypeError, ValueError) as error:
             raise ValueError(f"{path}: {error}") from error
 
@@ -218,6 +228,8 @@ class HandoffMap:
         data = {"points": [list(p) for p in self.points]}
         if self.fingerprint is not None:
             data["fingerprint"] = self.fingerprint
+        if self.bands:
+            data["bands"] = {name: [list(p) for p in band] for name, band in sorted(self.bands.items())}
         temporary.write_text(json.dumps(data, indent=1) + "\n")
         os.replace(temporary, path)  # Atomic: the running service never reads half a file.
 
@@ -296,6 +308,7 @@ class HandoffLearner:
         self.alpha, self.centred, self.steady_deg, self.steady_s = alpha, centred, steady_deg, steady_s
         self.save_every = save_every
         self.bins: dict[int, tuple[float, float]] = {}  # bin index -> (laptop_x, pan)
+        self.band_points: dict[str, list] = {}  # the file's --fusion band points, saved back untouched
         self.dirty = False
         self._saved_at: float | None = None
         self._since: float | None = None
@@ -313,18 +326,21 @@ class HandoffLearner:
         if loaded is self._seen:
             return
         self._seen, grouped = loaded, {}
-        points = loaded.points
-        if self.fingerprint is not None and points and loaded.fingerprint != self.fingerprint:
+        points, self.band_points = loaded.points, dict(loaded.bands)
+        if self.fingerprint is not None and (points or self.band_points) and loaded.fingerprint != self.fingerprint:
             print(f"warning: handoff map {self.file.path} discarded: made for setup "
                   f"{loaded.fingerprint or '(no fingerprint)'}, running {self.fingerprint}; "
                   f"it is backed up before the first save over it", file=sys.stderr)
-            points, self._backup_first = [], True
+            points, self.band_points, self._backup_first = [], {}, True  # bands belong to the setup too
         for x, pan in points:
             grouped.setdefault(self._bin(x), []).append((x, pan))
         self.bins = {i: (sum(p[0] for p in ps) / len(ps), sum(p[1] for p in ps) / len(ps))
                      for i, ps in grouped.items()}
         self.dirty = False  # The file is the truth now; learning since our last save is dropped.
         self._refit()
+
+    def _bands_to_save(self) -> dict:
+        return self.band_points
 
     def _refit(self) -> None:
         items = sorted(self.bins.items(), key=lambda item: item[1])
@@ -385,7 +401,8 @@ class HandoffLearner:
                 if backup is not None:
                     print(f"handoff map: the discarded file is kept as {backup}", file=sys.stderr)
                 self._backup_first = False
-            self.file.save(HandoffMap(sorted(self.bins.values()), fingerprint=self.fingerprint))
+            self.file.save(HandoffMap(sorted(self.bins.values()), fingerprint=self.fingerprint,
+                                      bands=self._bands_to_save()))
         except OSError as error:
             print(f"warning: handoff map not saved: {error}", file=sys.stderr)
             return False

@@ -77,7 +77,8 @@ class HeartbeatTests(unittest.TestCase):
                                  "user_x": (400 + 200) / 1280})
         last, _ = sock.sent[-1]
         self.assertEqual(set(last), {"type", "active", "target_x", "target_y", "seq", "user_x",
-                                     "peeper_id"})
+                                     "peeper_id", "target_size"})
+        self.assertAlmostEqual(last["target_size"], 120 / 1280)  # optional: peeper face width / frame width
         self.assertTrue(last["active"])
         self.assertEqual(last["peeper_id"], detector.tracker.peeper_id)  # only sent while active
         self.assertEqual(last["seq"], frames)

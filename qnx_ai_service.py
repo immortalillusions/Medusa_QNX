@@ -11,6 +11,7 @@ from pathlib import Path
 from medusa.arduino_serial import ArduinoController
 from medusa.body_detector import HeadEstimator, HeadFallback, head_status, is_head
 from medusa.control import DEFAULT_ACTUAL_PORT, ControlClient
+from medusa.fusion import BandedHandoffLearner, BearingFusion, map_variance
 from medusa.handoff import DEFAULT_PATH as DEFAULT_HANDOFF_MAP, HandoffLearner, setup_fingerprint
 from medusa.decision import SCENE_CLEAR_FRAMES, SnooperSelector
 from medusa.models import SnooperDecision
@@ -154,6 +155,11 @@ def build_parser() -> argparse.ArgumentParser:
     turret.add_argument("--no-search", action="store_true",
                         help="no handoff, search, map learning or laptop-guided fallback: coast, then glide "
                              "home, as before")
+    turret.add_argument("--fusion", action="store_true",
+                        help="opt-in (off by default): learn the handoff map per distance band from the "
+                             "laptop's target_size, and aim at a Kalman fusion of the turret camera's "
+                             "bearing (face precise, head medium) and the laptop map's (rough, rougher "
+                             "when extrapolating); status.json gains fusion: {enabled, bearing, var, sources}")
     for flag in _DEPRECATED_PAN_FLAGS:
         turret.add_argument(flag, type=float, default=None,
                             help="deprecated and ignored: the bearing tracker replaced the proportional step")
@@ -179,6 +185,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         args.face_detector = FACE_MODELS[args.face_model]
     if args.camera_on_turret and args.trigger_udp_port is None:
         parser.error("--camera-on-turret requires --trigger-udp-port")
+    if getattr(args, "fusion", False) and not args.camera_on_turret:
+        parser.error("--fusion requires --camera-on-turret")
     if args.camera_hfov <= 0 or args.pan_return_speed <= 0:
         parser.error("--camera-hfov and --pan-return-speed must be positive")
     if min(args.camera_latency, args.pan_lead, args.pan_coast, args.pan_hold or 0.0, args.pan_lost_hold) < 0:
@@ -207,6 +215,20 @@ def _laptop_peeper_id(trigger: LaptopTrigger, laptop_active: bool) -> int | None
     return trigger.latest.peeper_id if laptop_active and trigger.latest is not None else None
 
 
+def _laptop_target_size(trigger: LaptopTrigger, laptop_active: bool) -> float | None:
+    return trigger.latest.target_size if laptop_active and trigger.latest is not None else None
+
+
+def _fusion_status(pan: PanTracker, band: str | None) -> dict:
+    fusion = pan.fusion
+    if fusion is None:
+        return {"enabled": False, "bearing": None, "var": None, "sources": [], "band": None}
+    return {"enabled": True,
+            "bearing": round(fusion.bearing, 2) if fusion.bearing is not None else None,
+            "var": round(fusion.var, 3) if fusion.var is not None else None,
+            "sources": list(fusion.sources), "band": band}
+
+
 MAP_TRUST_MARGIN = 0.05  # laptop_x this far past the map's outermost learned points is still trusted
 
 
@@ -228,7 +250,8 @@ def _expected_x(pan: PanTracker | None, learned, laptop_x: float | None) -> floa
 
 def _trigger_status(trigger: LaptopTrigger, laptop_active: bool, aim, pan=None, pan_error=None,
                     fps: float | None = None, learned_points: int | None = None,
-                    matcher: PeeperMatcher | None = None, learner: HandoffLearner | None = None) -> dict:
+                    matcher: PeeperMatcher | None = None, learner: HandoffLearner | None = None,
+                    band: str | None = None) -> dict:
     age = trigger.age()
     aiming = aim is not None and aim.active
     status = {
@@ -257,18 +280,20 @@ def _trigger_status(trigger: LaptopTrigger, laptop_active: bool, aim, pan=None, 
         status["map_direction"] = learner.direction if learner is not None else None
         status["map_rejected"] = learner.rejected_points if learner is not None else None
         status["map_fingerprint"] = learner.fingerprint if learner is not None else None  # for record-now
+        status["fusion"] = _fusion_status(pan, band)  # opt-in --fusion; {"enabled": false, ...} without it
     return status
 
 
 def _pan_tracker(args) -> PanTracker | None:
     if not args.camera_on_turret:
         return None
+    extra = {"fusion": BearingFusion()} if getattr(args, "fusion", False) else {}
     return PanTracker(
         args.servo_min, args.servo_max, args.servo_home, reversed=args.servo_reversed,
         hfov_deg=args.camera_hfov, latency_s=args.camera_latency, lead_s=args.pan_lead,
         coast_s=args.pan_coast, hold_s=args.pan_hold, return_speed=args.pan_return_speed,
         lost_hold_s=args.pan_lost_hold, search_speed=0.0 if args.no_search else args.search_speed, handoff_timeout=args.handoff_timeout,
-        mode=args.pan_mode, gain=args.pan_step_gain,
+        mode=args.pan_mode, gain=args.pan_step_gain, **extra,
     )
 
 
@@ -284,7 +309,9 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
     rate = FrameRate()
     heads = HeadFallback(HeadEstimator(), every=args.head_every) if getattr(args, "head_fallback", False) else None
     aim = None
-    handoff = HandoffLearner(
+    fusion = getattr(args, "fusion", False)
+    band = None
+    handoff = (BandedHandoffLearner if fusion else HandoffLearner)(
         args.handoff_map, minimum=args.servo_min, maximum=args.servo_max,
         fingerprint=setup_fingerprint(args.servo_home, args.servo_min, args.servo_max, args.servo_reversed,
                                       args.camera_hfov),
@@ -340,6 +367,10 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
                 else:
                     pan.observe_actual(None, None)
                 learned = handoff.current() if handoff else None
+                if fusion and handoff:
+                    # The map for the peeper's distance band (the single map until the band has 2 points).
+                    size = _laptop_target_size(trigger, laptop_active)
+                    band, learned = handoff.band_for(size), handoff.map_for(size)
             # Match the laptop's peeper among the turret's faces: the map's expected image x
             # first, else the laptop's left/right ordering, else the smallest face.
             # Head fallback: with no face target, add head candidates (HeadBox) for the matcher.
@@ -353,6 +384,13 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
             if pan:
                 # A held target is a stale image position on a camera that has since moved: the
                 # tracker coasts on its own prediction instead.
+                fused = {}
+                if fusion:
+                    usable = learned is not None and learned.usable
+                    fused = {"aim_source": "head" if is_head(aim.target_box) else "face",
+                             "map_bearing": learned.angle(laptop_x) if usable else None,
+                             "map_var": map_variance(laptop_x, (learned.points[0][0], learned.points[-1][0]))
+                             if usable and laptop_x is not None else None}
                 pan_error = pan.update(
                     aim.target_x if aim.active and not aim.held else None,
                     laptop_active=laptop_active, laptop_x=laptop_x,
@@ -360,6 +398,7 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
                     fallback_map=learned.angle if learned else None,
                     fallback_domain=((learned.points[0][0], learned.points[-1][0])
                                      if learned is not None and learned.usable else None),
+                    **fused,
                 )
                 if handoff:
                     # Learn only from the one face in view, matched as the peeper, on a live turret.
@@ -368,7 +407,9 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
                                     match=matcher.match if aim.active and not aim.held
                                     and not is_head(aim.target_box) else "none",
                                     armed=actual.armed if actual is not None else None,
-                                    gate_closed=actual.gate_closed if actual is not None else None)
+                                    gate_closed=actual.gate_closed if actual is not None else None,
+                                    **({"target_size": _laptop_target_size(trigger, laptop_active)}
+                                       if fusion else {}))
                     handoff.maybe_save(pan.last_update)
             # The light is on for a turret-camera face and in laptop-guided fallback (user decision),
             # and through the short coast in between when fallback is ready, so it does not blink.
@@ -397,7 +438,7 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
                     nose_offset=nose_offset,
                     extra=_trigger_status(trigger, laptop_active, aim, pan, pan_error, fps=rate.fps(),
                                           learned_points=handoff.learned_points if handoff else None,
-                                          matcher=matcher, learner=handoff,
+                                          matcher=matcher, learner=handoff, band=band,
                                           ) | head_status(aim, fallback, heads),
                 )
     except KeyboardInterrupt:

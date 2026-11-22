@@ -162,7 +162,7 @@ def face_status(face: TrackedFace, track: Track, now: float) -> dict:
 
 
 def heartbeat(decision: SnooperDecision, seq: int, user_x: float | None = None,
-              peeper_id: int | None = None) -> bytes:
+              peeper_id: int | None = None, target_size: float | None = None) -> bytes:
     message = {
         "type": "medusa-peeper",
         "active": decision.active,
@@ -174,6 +174,8 @@ def heartbeat(decision: SnooperDecision, seq: int, user_x: float | None = None,
         message["user_x"] = user_x  # optional: the user's (largest track's) x, for the Pi's matcher
     if decision.active and peeper_id is not None:
         message["peeper_id"] = peeper_id  # optional: a change tells the Pi to drop its face lock
+    if decision.active and target_size is not None:
+        message["target_size"] = target_size  # optional: peeper face width / frame width (distance cue)
     return json.dumps(message).encode()
 
 
@@ -256,10 +258,10 @@ class PiLink:
         self._failing = False
 
     def send(self, decision: SnooperDecision, user_x: float | None = None,
-             peeper_id: int | None = None) -> None:
+             peeper_id: int | None = None, target_size: float | None = None) -> None:
         self.seq += 1
         try:
-            self.sock.sendto(heartbeat(decision, self.seq, user_x, peeper_id), self.address)
+            self.sock.sendto(heartbeat(decision, self.seq, user_x, peeper_id, target_size), self.address)
         except OSError as error:
             if not self._failing:
                 _LOG.warning("UDP send to %s:%d failed: %s", *self.address, error)
@@ -366,7 +368,8 @@ class LaptopDetector:
             user = next((face for face, track in zip(faces, tracks)
                          if track.id == result.user_id), None)
             self.link.send(decision, None if user is None else user.observation.center_x,
-                           result.peeper_id)
+                           result.peeper_id,
+                           None if peeper is None else peeper.observation.relative_size)
         if self.preview_state is not None:
             self.preview_state.update_status(
                 decision.active, decision.reason, face_count=len(faces),

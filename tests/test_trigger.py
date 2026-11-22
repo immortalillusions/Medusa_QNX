@@ -55,6 +55,11 @@ class ParseTests(unittest.TestCase):
         message = parse_peeper_message(packet(False, target_x=None, target_y=None))
         self.assertEqual((message.active, message.target_x, message.target_y), (False, None, None))
 
+    def test_target_size_is_optional(self) -> None:
+        self.assertAlmostEqual(parse_peeper_message(packet(target_size=0.07)).target_size, 0.07)
+        self.assertIsNone(parse_peeper_message(packet()).target_size)
+        self.assertIsNone(parse_peeper_message(packet(target_size="big")).target_size)
+
     def test_garbage_is_ignored(self) -> None:
         for payload in (
             b"", b"\xff\xfe", b"not json", b"[]", b"7",
