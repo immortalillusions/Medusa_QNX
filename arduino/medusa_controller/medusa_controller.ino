@@ -166,7 +166,7 @@ void startParking() {
   // Disarmed for everything else: commands are ignored and the status says 0.
   armed = false;
   parking = true;
-  softStarting = false;  // Never attach mid-park; a still-detached servo just times out limp.
+  softStarting = false;  // Never attach mid-park; a servo still in soft start just times out limp.
   parkingSinceMs = millis();
   digitalWrite(ARM_STATUS_PIN, HIGH);  // Red LED off: a button press is needed again.
   digitalWrite(LED_PIN, LOW);
