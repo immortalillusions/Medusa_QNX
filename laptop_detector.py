@@ -127,8 +127,10 @@ def small_face_defaults() -> tuple[dict, dict]:
     return SMALL_FACE_GAZE, SMALL_FACE_TRACKING
 
 
-SMALL_FACE_GAZE: dict = {}
-SMALL_FACE_TRACKING: dict = {}
+# Iris trusted fully from a 9 px eye (~5 m), not at all below 5 px (~9 m); faces under 60 px
+# wide (~4 m) smoothed twice as long. Measured on the 1 m clips shrunk to 3-10 m sizes.
+SMALL_FACE_GAZE: dict = {"eye_px_min": 5.0, "eye_px_full": 9.0}
+SMALL_FACE_TRACKING: dict = {"small_width": 60 / 1920, "small_tau_s": 0.3}
 
 
 def detection(face: TrackedFace, width: int, height: int) -> Detection:

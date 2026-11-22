@@ -42,7 +42,10 @@ class GazeConfig:
     pitch_min_deg: float = -35.0   # looking down at the bottom of the screen
     pitch_max_deg: float = 10.0    # a little above the camera still counts
     closed_ratio: float = 0.12     # lid gap / eye width below this = eye closed
-    min_eye_px: float = 0.0        # an eye narrower than this (pixels) is ignored: iris too coarse
+    # Iris trust by eye width in pixels: the eye-in-head angle is scaled from 0 at eye_px_min
+    # (head pose alone) to 1 at eye_px_full. (0, 0) = always trusted.
+    eye_px_min: float = 0.0
+    eye_px_full: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -85,8 +88,7 @@ def _clamp(value: float) -> float:
 
 
 def eye_angles(points: Sequence[tuple[float, float]], config: GazeConfig) -> tuple[float, float] | None:
-    """Eye-in-head (yaw, pitch) averaged over the open eyes, or None if both are closed
-    (or narrower than ``min_eye_px``).
+    """Eye-in-head (yaw, pitch) averaged over the open eyes, or None if both are closed.
 
     ``points`` are pixel-proportional (x, y) with y down. Each eye's ratio runs from the
     image-left corner to the image-right one, so iris-right means looking image-right.
@@ -99,13 +101,31 @@ def eye_angles(points: Sequence[tuple[float, float]], config: GazeConfig) -> tup
         iris = points[eye["iris"]]
         h, width = _ratio(iris, a, b)
         v, gap = _ratio(iris, points[eye["upper"]], points[eye["lower"]])
-        if width <= 0 or width < config.min_eye_px or gap / width < config.closed_ratio:
+        if width <= 0 or gap / width < config.closed_ratio:
             continue
         yaws.append(_clamp((h - 0.5) / H_TRAVEL) * config.eye_gain_deg)
         pitches.append(_clamp((V_CENTRE - v) / V_TRAVEL) * config.eye_gain_deg)
     if not yaws:
         return None
     return sum(yaws) / len(yaws), sum(pitches) / len(pitches)
+
+
+def eye_width_px(points: Sequence[tuple[float, float]]) -> float:
+    """Mean corner-to-corner width of the two eyes, in the units of ``points``."""
+    widths = []
+    for eye in (RIGHT_EYE, LEFT_EYE):
+        a, b = points[eye["corner_a"]], points[eye["corner_b"]]
+        widths.append(math.hypot(b[0] - a[0], b[1] - a[1]))
+    return sum(widths) / len(widths)
+
+
+def iris_trust(eye_px: float, config: GazeConfig) -> float:
+    """0..1 weight for the eye-in-head angle: 0 below eye_px_min, 1 from eye_px_full up."""
+    if config.eye_px_full <= 0 or eye_px >= config.eye_px_full:
+        return 1.0
+    if eye_px <= config.eye_px_min:
+        return 0.0
+    return (eye_px - config.eye_px_min) / (config.eye_px_full - config.eye_px_min)
 
 
 def looking_at_screen(gaze_yaw: float, gaze_pitch: float, config: GazeConfig) -> bool:
@@ -119,7 +139,11 @@ def estimate_gaze(landmarks, matrix, config: GazeConfig = GazeConfig(),
     head_yaw, head_pitch = head_pose_from_matrix(matrix)
     eyes = None
     if len(landmarks) >= IRIS_LANDMARK_COUNT:
-        eyes = eye_angles([(p.x * width, p.y * height) for p in landmarks], config)
+        points = [(p.x * width, p.y * height) for p in landmarks]
+        eyes = eye_angles(points, config)
+        trust = iris_trust(eye_width_px(points), config) if eyes is not None else 0.0
+        # A few-pixel eye: its iris is noise, so lean on head pose (all of it below eye_px_min).
+        eyes = None if trust <= 0 else (eyes[0] * trust, eyes[1] * trust)
     eye_yaw, eye_pitch = eyes if eyes is not None else (0.0, 0.0)
     gaze_yaw, gaze_pitch = head_yaw + eye_yaw, head_pitch + eye_pitch
     return GazeEstimate(
