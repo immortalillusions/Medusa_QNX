@@ -47,7 +47,7 @@ class ArduinoSerialTests(unittest.TestCase):
         arduino.mapper = ServoMapper(smoothing=0.35)
         arduino.send_angles(True, 84.4, 77.6)
         arduino.send_angles(False, 200, -5)
-        self.assertEqual(self.sent(arduino, read_fd), "M,84,78,1,1\nM,115,65,0,2\n")
+        self.assertEqual(self.sent(arduino, read_fd), "N,844,776,1,1\nN,1150,650,0,2\n")
 
     def test_safe_stop_sends_both_axes_home(self) -> None:
         arduino, read_fd = controller()

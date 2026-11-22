@@ -10,7 +10,7 @@ from pathlib import Path
 
 from medusa.arduino_serial import ArduinoController
 from medusa.control import DEFAULT_ACTUAL_PORT, ControlClient
-from medusa.handoff import DEFAULT_PATH as DEFAULT_HANDOFF_MAP, HandoffMapFile
+from medusa.handoff import DEFAULT_PATH as DEFAULT_HANDOFF_MAP, HandoffLearner
 from medusa.decision import SCENE_CLEAR_FRAMES, SnooperSelector
 from medusa.models import SnooperDecision
 from medusa.nose_offset import measure_nose_offset
@@ -20,7 +20,9 @@ from medusa.servo import ServoMapper
 from medusa.tflite_detector import (
     DEFAULT_NUM_THREADS, DEFAULT_SCORE_THRESHOLD, TFLiteFaceGazeDetector, draw_face_boxes,
 )
-from medusa.trigger import FaceConfirm, FrameRate, LaptopTrigger, PanTracker, decide_aim, draw_aim_boxes
+from medusa.trigger import (
+    FALLBACK_REASON, FaceConfirm, FrameRate, LaptopTrigger, PanTracker, decide_aim, draw_aim_boxes,
+)
 
 
 def send(sock, target, active, target_x, reason, *, scene_clear: bool = False):
@@ -112,8 +114,9 @@ def build_parser() -> argparse.ArgumentParser:
     turret.add_argument("--pan-mode", choices=("proportional", "predictive"), default="proportional",
                         help="proportional (default): nudge toward centring the face each frame, robust to "
                              "camera delay; predictive: model + filter + lead, needs an accurate --camera-latency")
-    turret.add_argument("--pan-step-gain", type=float, default=0.25,
-                        help="proportional mode: fraction of the remaining error corrected per frame")
+    turret.add_argument("--pan-step-gain", type=float, default=0.12,
+                        help="proportional mode: fraction of the remaining error corrected per 1/15 s "
+                             "(frame-rate independent); higher is faster but overshoots with camera delay")
     turret.add_argument("--camera-latency", type=float, default=0.07,
                         help="seconds from frame capture to the pan update (about one frame)")
     turret.add_argument("--pan-lead", type=float, default=0.15,
@@ -126,14 +129,17 @@ def build_parser() -> argparse.ArgumentParser:
     turret.add_argument("--pan-return-speed", type=float, default=60.0,
                         help="degrees per second for the glide home")
     turret.add_argument("--handoff-map", default=DEFAULT_HANDOFF_MAP,
-                        help="laptop_x -> pan map (python3 -m medusa.handoff); a missing file means no map")
+                        help="laptop_x -> pan map (python3 -m medusa.handoff), learned while tracking and "
+                             "saved here every 5 s; with 2+ points a lost face is aimed at from the laptop's "
+                             "x with the light on; a missing file means no map yet")
     turret.add_argument("--handoff-timeout", type=float, default=0.6,
                         help="seconds at the handoff angle without a face before the search sweep")
     turret.add_argument("--search-speed", type=float, default=60.0,
                         help="degrees per second for the search sweep when the laptop sees a peeper "
                              "but the turret camera does not")
     turret.add_argument("--no-search", action="store_true",
-                        help="no handoff or search: coast, then glide home, as before")
+                        help="no handoff, search, map learning or laptop-guided fallback: coast, then glide "
+                             "home, as before")
     for flag in _DEPRECATED_PAN_FLAGS:
         turret.add_argument(flag, type=float, default=None,
                             help="deprecated and ignored: the bearing tracker replaced the proportional step")
@@ -179,7 +185,7 @@ def _laptop_x(trigger: LaptopTrigger, laptop_active: bool) -> float | None:
 
 
 def _trigger_status(trigger: LaptopTrigger, laptop_active: bool, aim, pan=None, pan_error=None,
-                    fps: float | None = None) -> dict:
+                    fps: float | None = None, learned_points: int | None = None) -> dict:
     age = trigger.age()
     status = {
         "mode": "laptop-trigger",
@@ -196,6 +202,8 @@ def _trigger_status(trigger: LaptopTrigger, laptop_active: bool, aim, pan=None, 
         status["pan_velocity"] = round(pan.velocity, 1)
         status["pan_state"] = pan.state
         status["pan_actual"] = round(pan.actual[1], 1) if pan.actual is not None else None
+        status["fallback_aim"] = pan.state == "fallback"
+        status["learned_points"] = learned_points
     return status
 
 
@@ -219,7 +227,8 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
     pan = _pan_tracker(args)
     confirm = FaceConfirm(args.face_confirm_frames, args.face_dropout_frames)
     rate = FrameRate()
-    handoff = HandoffMapFile(args.handoff_map) if pan and pan.search_speed > 0 else None
+    handoff = HandoffLearner(args.handoff_map, minimum=args.servo_min, maximum=args.servo_max) if (
+        pan and pan.search_speed > 0) else None
     try:
         try:
             trigger = LaptopTrigger.bind(
@@ -242,7 +251,9 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
                 if preview:
                     preview.state.update_status(False, "camera frame unavailable",
                                                 extra=_trigger_status(trigger, laptop_active, None, pan,
-                                                                      fps=rate.fps()))
+                                                                      fps=rate.fps(), learned_points=(
+                                                                          handoff.learned_points
+                                                                          if handoff else None)))
                 continue
             rate.tick()
             height, width = frame.shape[:2]
@@ -251,7 +262,7 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
             except (RuntimeError, ValueError, cv2.error):
                 boxes = None
             aim = decide_aim(laptop_active, laptop_reason, boxes, width, height, confirm=confirm)
-            pan_error = None
+            pan_error = learned = laptop_x = None
             if pan:
                 actual = arduino.poll_actual() if arduino else None
                 if actual is not None:
@@ -259,17 +270,27 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
                 else:
                     pan.observe_actual(None, None)
                 laptop_x = _laptop_x(trigger, laptop_active)
-                # The light stays off (aim.active is False) until the turret camera sees a face.
+                learned = handoff.current() if handoff else None
                 # A held target is a stale image position on a camera that has since moved: the
                 # tracker coasts on its own prediction instead.
                 pan_error = pan.update(
                     aim.target_x if aim.active and not aim.held else None,
                     laptop_active=laptop_active, laptop_x=laptop_x,
-                    handoff_angle=handoff.current().angle(laptop_x) if handoff else None,
+                    handoff_angle=learned.angle(laptop_x) if learned else None,
+                    fallback_map=learned.angle if learned else None,
                 )
+                if handoff:
+                    handoff.observe(pan.last_update, laptop_x, pan_error, pan.real_pan())
+                    handoff.maybe_save(pan.last_update)
+            # The light is on for a turret-camera face and in laptop-guided fallback (user decision),
+            # and through the short coast in between when fallback is ready, so it does not blink.
+            fallback = pan is not None and pan.state == "fallback"
+            light = aim.active or fallback or (
+                pan is not None and pan.state == "coasting" and learned is not None
+                and learned.angle(laptop_x) is not None)
             if arduino and pan:
                 pitch, _ = arduino.tilt_mapper.command(aim.active, aim.target_y)
-                arduino.send_angles(aim.active, pan.angle, pitch)
+                arduino.send_angles(light, pan.command, pitch)
             elif arduino:
                 arduino.send(aim.active, aim.target_x, aim.target_y)
             if preview:
@@ -280,17 +301,20 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
                     draw_aim_boxes(frame, boxes, aim.target_box)
                 preview.state.update_frame(frame)
                 preview.state.update_status(
-                    aim.active, aim.reason,
+                    light, FALLBACK_REASON if fallback else aim.reason,
                     face_count=len(boxes) if boxes is not None else None,
                     snooper_count=1 if aim.active else 0,
                     nose_offset=nose_offset,
-                    extra=_trigger_status(trigger, laptop_active, aim, pan, pan_error, fps=rate.fps()),
+                    extra=_trigger_status(trigger, laptop_active, aim, pan, pan_error, fps=rate.fps(),
+                                          learned_points=handoff.learned_points if handoff else None),
                 )
     except KeyboardInterrupt:
         pass
     finally:
         if trigger:
             trigger.close()
+        if handoff and pan and pan.last_update is not None:
+            handoff.maybe_save(pan.last_update, force=True)  # Keep what was learned since the last save.
         if arduino:
             arduino.safe_stop()
             arduino.close()

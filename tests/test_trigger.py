@@ -283,13 +283,14 @@ INO = Path(__file__).resolve().parent.parent / "arduino" / "medusa_controller" /
 FPS = 15.0
 
 
-def simulate(pan, face_at, seconds, *, latency=1 / FPS, noise=0.0, visible=lambda t: True, seed=1):
+def simulate(pan, face_at, seconds, *, latency=1 / FPS, noise=0.0, visible=lambda t: True, seed=1, fps=FPS):
     """Closed loop: the camera rides on a simulated turret that eases exactly like the firmware.
 
     Each frame was captured ``latency`` before the tracker sees it, and the face's
     image x comes from the simulated turret's actual pan at capture time. Returns
     (samples, frames): the aim error face - actual pan every 5 ms firmware step, and
-    per frame (time, state, commanded angle, integer angle sent to the firmware).
+    per frame (time, state, commanded angle, angle sent to the firmware: whole degrees in
+    predictive mode, float in proportional mode).
     """
     rng = random.Random(seed)
     turret = FirmwareAxisModel(pan.home, pan.minimum, pan.maximum)
@@ -303,9 +304,9 @@ def simulate(pan, face_at, seconds, *, latency=1 / FPS, noise=0.0, visible=lambd
         x = 0.5 + pan.sign * (face_at(captured) - turret.position_at(captured)) / pan.hfov_deg
         x += rng.uniform(-noise, noise)
         pan.update(x if visible(captured) and 0 <= x <= 1 else None, now=now)
-        turret.target = float(round(max(pan.minimum, min(pan.maximum, pan.angle))))
+        turret.target = pan.command
         frames.append((now, pan.state, pan.angle, turret.target))
-        now += 1 / FPS + rng.uniform(-0.004, 0.004)  # The Pi's frame interval jitters a little.
+        now += 1 / fps + rng.uniform(-0.004, 0.004)  # The Pi's frame interval jitters a little.
     return samples, frames
 
 
@@ -336,13 +337,13 @@ class FirmwareAxisModelTests(unittest.TestCase):
         axis = FirmwareAxisModel(65, 65, 115)
         axis.advance(0.0)
         axis.target = 115.0
-        axis.advance(0.05)  # 10 steps of 5 ms at 2500 deg/s^2.
-        self.assertAlmostEqual(axis.velocity, 125.0)
+        axis.advance(0.05)  # 10 steps of 5 ms at 900 deg/s^2.
+        self.assertAlmostEqual(axis.velocity, 45.0)
         positions = []
-        for i in range(1, 60):
+        for i in range(1, 100):
             axis.advance(0.05 + i * 0.005)
             positions.append(axis.position)
-            self.assertLessEqual(abs(axis.velocity), 300.0)
+            self.assertLessEqual(abs(axis.velocity), 180.0)
         self.assertEqual(positions, sorted(positions))  # No overshoot and bounce back.
         self.assertEqual((axis.position, axis.velocity), (115.0, 0.0))
         self.assertAlmostEqual(axis.position_at(0.0), 65.0)
@@ -395,7 +396,8 @@ class PanTrackerTests(unittest.TestCase):
 
     def test_tracks_moving_faces_closely(self) -> None:
         # Wide limits so there is a steady state to measure; the pan stage itself is 65..115.
-        for speed, rms_limit, max_limit in ((60, 2.0, 4.0), (150, 2.5, 4.5)):
+        # 100 deg/s: the gentler firmware (900 deg/s^2) takes longer to reach a fast face.
+        for speed, rms_limit, max_limit in ((60, 2.0, 4.0), (100, 3.5, 7.5)):
             for reversed_ in (False, True):
                 with self.subTest(speed=speed, reversed=reversed_):
                     start, end = (160, 30) if reversed_ else (20, 150)
@@ -419,7 +421,9 @@ class PanTrackerTests(unittest.TestCase):
                 self.assertLessEqual(peak, overshoot_limit)
                 self.assertGreaterEqual(min(o for t, o in past if t > peak_t), -1.0)  # No ringing back.
                 self.assertLessEqual(max(abs(o) for t, o in past if t > stop + 0.7), 1.0)
-                self.assertEqual({sent for t, _, _, sent in frames if t > stop + 1.0}, {130.0})
+                settled = {sent for t, _, _, sent in frames if t > stop + 1.0}
+                self.assertEqual(len(settled), 1)  # Still, within the 1-degree start hysteresis.
+                self.assertLessEqual(abs(settled.pop() - 130.0), 1.0)
 
     def test_a_still_face_gives_a_perfectly_still_command(self) -> None:
         pan = PanTracker(65, 115, 90)
@@ -468,6 +472,80 @@ class PanTrackerTests(unittest.TestCase):
         self.assertAlmostEqual(pan.angle, held - 60 * 0.1)
         pan.reset()
         self.assertEqual((pan.angle, pan.state, pan.bearing, pan.servo.target), (90.0, "home", None, 90.0))
+
+
+def reversals(values, threshold):
+    """Direction changes whose swing back exceeds ``threshold`` degrees."""
+    count, direction, extreme = 0, 0, values[0]
+    for v in values[1:]:
+        if direction >= 0 and v < extreme - threshold:
+            count, direction, extreme = count + (direction > 0), -1, v
+        elif direction <= 0 and v > extreme + threshold:
+            count, direction, extreme = count + (direction < 0), 1, v
+        elif (direction >= 0 and v > extreme) or (direction <= 0 and v < extreme):
+            extreme = v
+    return count
+
+
+def bench_pan(**kwargs):
+    """The bench setup: pan 55..125, reversed servo, proportional mode with its defaults."""
+    return PanTracker(55, 125, 90, reversed=True, mode="proportional", **kwargs)
+
+
+def step_response(latency, fps=FPS):
+    """Face jumps 90 -> 75 at 0.5 s; returns (overshoot past 75, seconds until within 1 degree for good)."""
+    samples, _ = simulate(bench_pan(), lambda t: 90.0 if t < 0.5 else 75.0, 4.0, latency=latency, fps=fps, seed=3)
+    after = [(t, e) for t, e in samples if t >= 0.5]  # e = face - turret: positive once past 75.
+    return max(0.0, max(e for _, e in after)), next(t for t, e in reversed(after) if abs(e) > 1.0) - 0.5
+
+
+class ProportionalModeTests(unittest.TestCase):
+    def test_soft_dead_zone_ramps_the_gain_from_zero_with_the_sign_kept(self) -> None:
+        def first_step(error):
+            pan = bench_pan()
+            pan.update(0.5 + error, now=0.0)
+            pan.update(0.5 + error, now=1 / 15)  # Same error: the average is exact.
+            return pan.angle - 90.0
+
+        self.assertEqual(first_step(0.011), 0.0)  # Inside the dead zone: no motion at all.
+        full = 0.12 * 0.05 * 50  # Gain x error x hfov once past full_gain_error.
+        self.assertAlmostEqual(first_step(0.05), -full)  # Reversed servo: right of centre lowers yaw.
+        self.assertAlmostEqual(first_step(-0.05), full)
+        ramp = [-first_step(e) / (0.12 * e * 50) for e in (0.015, 0.025, 0.035, 0.045)]
+        self.assertEqual(ramp, sorted(ramp))  # The share of full gain rises smoothly ...
+        self.assertTrue(0 < ramp[0] < 0.05 and 0.9 < ramp[-1] < 1)  # ... from near zero to near full.
+
+    def test_still_face_with_noise_gives_a_still_command(self) -> None:
+        for latency in (0.067, 0.15):
+            with self.subTest(latency=latency):
+                _, frames = simulate(bench_pan(), lambda t: 95.0, 5.0, latency=latency, noise=0.01)
+                sent = [s for t, _, _, s in frames if t >= 2.0]  # 3 s after settling.
+                self.assertLess(max(sent) - min(sent), 0.3)
+                self.assertEqual(reversals(sent, 0.2), 0)
+                self.assertLess(abs(sent[-1] - 95.0), 1.0)
+
+    def test_slow_drift_gives_a_smooth_monotonic_command(self) -> None:
+        face = lambda t: 80.0 + 5.0 * max(0.0, t - 1.0)  # noqa: E731 - 5 deg/s from 1 s.
+        _, frames = simulate(bench_pan(), face, 5.0, latency=0.15, noise=0.003)
+        sent = [s for t, _, _, s in frames if t >= 1.5]
+        steps = [b - a for a, b in zip(sent, sent[1:])]
+        self.assertGreaterEqual(min(steps), 0.0)  # Never steps back.
+        self.assertLess(max(steps), 1.0)
+        self.assertNotEqual({round(s, 1) for s in sent}, {round(s) for s in sent})  # Sub-degree steps.
+
+    def test_a_step_settles_without_overshoot(self) -> None:
+        for latency in (0.067, 0.15):
+            with self.subTest(latency=latency):
+                overshoot, settle = step_response(latency)
+                self.assertLessEqual(overshoot, 1.0)
+                self.assertLess(settle, 1.5)
+
+    def test_settle_time_does_not_depend_on_the_frame_rate(self) -> None:
+        for latency in (0.067, 0.15):
+            with self.subTest(latency=latency):
+                (over15, settle15), (over30, settle30) = step_response(latency, 15.0), step_response(latency, 30.0)
+                self.assertLess(abs(settle15 - settle30), 0.25)
+                self.assertLessEqual(max(over15, over30), 1.0)
 
 
 class CameraOnTurretFlagTests(unittest.TestCase):
@@ -538,9 +616,9 @@ class CameraOnTurretServiceTests(TriggerTestCase):
         script = [
             (0.0, False, [face(0.8)]),           # 0: no laptop trigger yet -> home, LED off
             (0.1, True, [face(0.8, 0.25)]),      # 1: first sight, reversed: 90 - 0.3 * 50 -> 75
-            (0.1, True, [face(0.7737, 0.25)]),   # 2: turret at 88.7 when captured: still 75
-            (0.1, True, [face(0.5057, 0.25)]),   # 3: turret at 75.3: still 75, no hunting
-            (0.1, True, [face(0.4996, 0.25)]),   # 4: settled: still 75
+            (0.1, True, [face(0.7905, 0.25)]),   # 2: turret at 89.5 when captured: still 75
+            (0.1, True, [face(0.6420, 0.25)]),   # 3: turret at 82.1: still 75, no hunting
+            (0.1, True, [face(0.5014, 0.25)]),   # 4: turret at 75.1, settled: still 75
             (0.1, True, []),                     # 5: face lost -> coast (no velocity), LED off
             (0.1, True, []),                     # 6: 0.1 s lost -> coasting
             (0.1, True, []),                     # 7: 0.2 s lost -> coasting
@@ -597,18 +675,19 @@ class CameraOnTurretServiceTests(TriggerTestCase):
 
         sent = os.read(read_fd, 4096).decode("ascii").splitlines()
         # Pitch follows the unchanged smoothed tilt mapper: face y 0.25 -> 77.5, eased by 0.35.
+        # send_angles writes N lines (tenths); predictive mode still commands whole degrees.
         self.assertEqual(sent, [
             "M,90,90,0,1",   # safe_stop at startup
-            "M,90,90,0,2",
-            "M,75,86,1,3",
-            "M,75,83,1,4",
-            "M,75,81,1,5",
-            "M,75,80,1,6",
-            "M,75,83,0,7",
-            "M,75,86,0,8",
-            "M,75,87,0,9",
-            "M,84,88,0,10",
-            "M,90,89,0,11",
+            "N,900,900,0,2",
+            "N,750,860,1,3",
+            "N,750,830,1,4",
+            "N,750,810,1,5",
+            "N,750,800,1,6",
+            "N,750,830,0,7",
+            "N,750,860,0,8",
+            "N,750,870,0,9",
+            "N,840,880,0,10",
+            "N,900,890,0,11",
             "M,90,89,0,12",  # safe_stop at shutdown
         ])
         camera.release.assert_called_once()

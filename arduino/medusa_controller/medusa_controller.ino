@@ -1,8 +1,9 @@
 #include <Servo.h>
 
-// Serial protocol from QNX: M,<yaw>,<pitch>,<led 0|1>,<sequence>\n
-// The old M,<yaw>,<led>,<sequence>\n is still accepted (pitch = home).
-// Yaw and pitch must be within SERVO_MIN..SERVO_MAX.
+// Serial protocol from QNX: N,<yaw_x10>,<pitch_x10>,<led 0|1>,<sequence>\n
+// with angles in tenths of a degree (925 = 92.5), within SERVO_MIN*10..SERVO_MAX*10.
+// Whole-degree M,<yaw>,<pitch>,<led>,<sequence>\n and the old M,<yaw>,<led>,<sequence>\n
+// (pitch = home) are still accepted, within SERVO_MIN..SERVO_MAX.
 // If valid commands stop for 300 ms, disarm, centre both servos, LED off.
 // Status back to QNX about every 100 ms on the same UART (UNO Q D1 -> Pi RX):
 // S,<armed 0|1>,<pan_x10>,<tilt_x10>,<sequence>\n with the eased ACTUAL axis
@@ -23,8 +24,8 @@ const unsigned long BUTTON_DEBOUNCE_MS = 40;
 // the turret overshooting and bouncing on sharp aims. Pulses use microseconds.
 // The Pi models this motion to know where the camera points: keep MAX_SPEED,
 // MAX_ACCEL and MOTION_STEP_MS equal to FIRMWARE_* in medusa/trigger.py.
-const float MAX_SPEED = 300.0;   // degrees per second
-const float MAX_ACCEL = 2500.0;  // degrees per second squared
+const float MAX_SPEED = 180.0;   // degrees per second
+const float MAX_ACCEL = 900.0;   // degrees per second squared
 const unsigned long MOTION_STEP_MS = 5;
 const unsigned long STATUS_PERIOD_MS = 100;
 
@@ -91,30 +92,34 @@ void updateArmButton() {
   lastButtonReading = reading;
 }
 
-bool inRange(int degrees) {
-  return degrees >= SERVO_MIN && degrees <= SERVO_MAX;
+bool inRange(int value, int scale) {
+  return value >= SERVO_MIN * scale && value <= SERVO_MAX * scale;
 }
 
 void applyCommand(char* command) {
   int yaw, pitch = SERVO_HOME, led;
+  int scale = 1;  // 10 for N lines (tenths of a degree)
   unsigned long sequence;
-  // Count commas to pick the format (4 = new 5-field line, 3 = old 4-field line),
+  // Count commas to pick the format (4 = 5-field N or M line, 3 = old 4-field M line),
   // so the parse never relies on %n, whose support varies between C libraries.
   int commas = 0;
   for (char* c = command; *c; c++) if (*c == ',') commas++;
-  if (commas == 4) {
+  if (commas == 4 && command[0] == 'N') {
+    if (sscanf(command, "N,%d,%d,%d,%lu", &yaw, &pitch, &led, &sequence) != 4) return;
+    scale = 10;
+  } else if (commas == 4) {
     if (sscanf(command, "M,%d,%d,%d,%lu", &yaw, &pitch, &led, &sequence) != 4) return;
   } else if (commas == 3) {
     if (sscanf(command, "M,%d,%d,%lu", &yaw, &led, &sequence) != 3) return;
   } else {
     return;
   }
-  if ((led != 0 && led != 1) || !inRange(yaw) || !inRange(pitch)) return;
+  if ((led != 0 && led != 1) || !inRange(yaw, scale) || !inRange(pitch, scale)) return;
 
   // Keep receiving heartbeats while disarmed, but never move or light up.
   if (armed) {
-    pan.target = yaw;
-    tilt.target = pitch;
+    pan.target = (float)yaw / scale;
+    tilt.target = (float)pitch / scale;
     digitalWrite(LED_PIN, led ? HIGH : LOW);
   }
   lastCommandMs = millis();

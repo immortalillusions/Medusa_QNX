@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import termios
 
+from .control import format_n_line
 from .servo import ServoMapper
 
 
@@ -52,11 +53,11 @@ class ArduinoController:
         os.write(self.fd, message)
 
     def send_angles(self, active: bool, yaw: float, pitch: float) -> None:
-        """Write exact angles (no smoothing), each clamped to its mapper's safe range."""
-        yaw = round(max(self.mapper.minimum, min(self.mapper.maximum, yaw)))
-        pitch = round(max(self.tilt_mapper.minimum, min(self.tilt_mapper.maximum, pitch)))
+        """Write N,<yaw_x10>,<pitch_x10>,<led>,<seq>: exact angles in tenths (no smoothing), clamped."""
+        yaw = max(self.mapper.minimum, min(self.mapper.maximum, float(yaw)))
+        pitch = max(self.tilt_mapper.minimum, min(self.tilt_mapper.maximum, float(pitch)))
         self.sequence += 1
-        os.write(self.fd, f"M,{yaw},{pitch},{int(active)},{self.sequence}\n".encode("ascii"))
+        os.write(self.fd, format_n_line(yaw, pitch, active, self.sequence))
 
     def safe_stop(self) -> None:
         self.send(False, None)

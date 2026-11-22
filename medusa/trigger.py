@@ -14,7 +14,7 @@ import math
 import socket
 import time
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from .tflite_detector import FaceBox
@@ -23,6 +23,7 @@ PEEPER_MESSAGE_TYPE = "medusa-peeper"
 NO_FACE_REASON = "laptop sees a peeper; turret camera sees no face"
 CONFIRMING_REASON = "laptop sees a peeper; confirming the turret camera's face"
 HELD_REASON = "laptop sees a peeper; holding the last face through a dropout"
+FALLBACK_REASON = "laptop-guided aim (turret camera lost the face)"
 _MAX_PACKETS_PER_POLL = 64  # Bound the drain so a flood cannot starve the camera loop.
 
 
@@ -268,9 +269,11 @@ def draw_aim_boxes(frame, boxes: Sequence[FaceBox], target: FaceBox | None) -> N
 # match MAX_SPEED, MAX_ACCEL and MOTION_STEP_MS in
 # arduino/medusa_controller/medusa_controller.ino; tests/test_trigger.py reads
 # the .ino and fails if they drift apart.
-FIRMWARE_MAX_SPEED = 300.0   # degrees per second
-FIRMWARE_MAX_ACCEL = 2500.0  # degrees per second squared
+FIRMWARE_MAX_SPEED = 180.0   # degrees per second
+FIRMWARE_MAX_ACCEL = 900.0   # degrees per second squared
 FIRMWARE_STEP_S = 0.005      # one stepAxis() call every 5 ms
+_PROPORTIONAL_REF_FPS = 15.0  # proportional gain is the share of the error corrected per 1/15 s
+_PROPORTIONAL_MAX_DT = 0.2     # a longer frame gap moves no more than a 0.2 s one
 _FIRMWARE_HISTORY = 200      # 1 s of positions, enough to look back past the camera latency
 _FIRMWARE_MAX_GAP_S = 2.0    # a longer gap ends at the target whatever the move was
 
@@ -353,7 +356,13 @@ class PanTracker:
     within ``handoff_timeout`` s, or without a map, it sweeps the pan range back
     and forth at ``search_speed`` deg/s ("searching"), starting toward the side
     the laptop reports. ``search_speed`` 0 turns acquire off. The light is not
-    the tracker's business: the caller lights it only for a turret-camera face.
+    the tracker's business: the caller lights it for a turret-camera face, and in fallback.
+
+    Fallback (``fallback_map`` passed to update, a usable laptop_x -> pan map, e.g.
+    the learned HandoffLearner one): instead of handoff and search, the turret
+    follows the laptop ("fallback"). The laptop x is smoothed (EMA, time constant
+    ``fallback_tau``) and the command moves toward map(smoothed x) at no more than
+    ``max_rate`` deg/s. A turret-camera face takes over again at once ("tracking").
 
     Real angle: observe_actual() feeds the pan angle the firmware reports. While
     that report is fresh (``actual_timeout``), the turret's position at frame
@@ -370,13 +379,17 @@ class PanTracker:
         maneuver_deg: float = 2.0, maneuver_alpha: float = 0.8, maneuver_beta: float = 0.5,
         start_deg: float = 1.0, stop_deg: float = 0.4, still_speed: float = 3.0,
         search_speed: float = 60.0, handoff_timeout: float = 0.6, actual_timeout: float = 0.3,
-        mode: str = "predictive", gain: float = 0.3, max_step: float = 4.0,
-        start_error: float = 0.04, stop_error: float = 0.02, error_alpha: float = 0.5,
+        mode: str = "predictive", gain: float = 0.12, max_rate: float = 120.0,
+        dead_zone: float = 0.012, full_gain_error: float = 0.05, error_tau: float = 0.12,
+        fallback_tau: float = 0.25,
     ) -> None:
         if mode not in ("predictive", "proportional"):
             raise ValueError("pan mode must be 'predictive' or 'proportional'")
-        self.mode, self.gain, self.max_step = mode, gain, max_step
-        self.start_error, self.stop_error, self.error_alpha = start_error, stop_error, error_alpha
+        if not 0 <= dead_zone < full_gain_error:
+            raise ValueError("pan dead zone must be at least 0 and below the full-gain error")
+        self.mode, self.gain, self.max_rate = mode, gain, max_rate
+        self.dead_zone, self.full_gain_error, self.error_tau = dead_zone, full_gain_error, error_tau
+        self.fallback_tau = fallback_tau
         self.minimum, self.maximum, self.home = float(minimum), float(maximum), float(home)
         self.sign = -1.0 if reversed else 1.0  # Reversed: a face right of centre needs a lower yaw.
         self.hfov_deg, self.latency_s, self.lead_s = hfov_deg, latency_s, lead_s
@@ -403,6 +416,7 @@ class PanTracker:
         self._lost_velocity = 0.0
         self._acquire_at: float | None = None
         self._search_dir = 1.0
+        self._laptop_ema: float | None = None
         self.servo.target = float(round(self.home))
 
     def _clamp(self, angle: float) -> float:
@@ -415,6 +429,17 @@ class PanTracker:
     def _actual_fresh(self, now: float) -> bool:
         return self.actual is not None and now - self.actual[0] <= self.actual_timeout
 
+    @property
+    def last_update(self) -> float | None:
+        """The ``now`` of the last update()."""
+        return self._last_now
+
+    def real_pan(self) -> float | None:
+        """The firmware's reported pan if it was fresh and armed at the last update, else None."""
+        if self._last_now is None or not self._actual_fresh(self._last_now) or not self.actual[2]:
+            return None
+        return self.actual[1]
+
     def turret_position(self, captured: float, now: float) -> float:
         """Where the turret pointed at ``captured``: the real angle when fresh, else the model."""
         model = self.servo.position_at(captured)
@@ -426,11 +451,13 @@ class PanTracker:
     def update(
         self, target_x: float | None, now: float | None = None, *,
         laptop_active: bool = False, handoff_angle: float | None = None, laptop_x: float | None = None,
+        fallback_map: Callable[[float], float | None] | None = None,
     ) -> float | None:
         """Advance one frame; return the image error (x - 0.5) or None without a target.
 
         ``laptop_active`` (the laptop sees a peeper), ``handoff_angle`` (the map's pan
-        for the laptop's target_x) and ``laptop_x`` drive acquire when ``target_x`` is None.
+        for the laptop's target_x) and ``laptop_x`` drive acquire when ``target_x`` is None;
+        ``fallback_map`` (laptop_x -> pan, None while unusable) turns acquire into fallback.
         """
         now = time.monotonic() if now is None else now
         self.servo.advance(now)
@@ -441,8 +468,11 @@ class PanTracker:
             self.reset()  # Disarmed: the firmware ignores commands, so do not wind up.
             return None
         if target_x is None:
-            if laptop_active and self.search_speed > 0 and not (
-                    self.state in ("tracking", "coasting") and self._still_coasting(now)):
+            coasting = self.state in ("tracking", "coasting") and self._still_coasting(now)
+            fallback_x = self._fallback_x(fallback_map, laptop_x) if laptop_active and not coasting else None
+            if fallback_x is not None:
+                self._fallback(dt, fallback_map, fallback_x)
+            elif laptop_active and self.search_speed > 0 and not coasting:
                 self._acquire(now, dt, handoff_angle, laptop_x)
             else:
                 self._coast_or_return(now, dt, captured)
@@ -450,13 +480,21 @@ class PanTracker:
         else:
             error = target_x - 0.5  # Positive: face right of image centre.
             if self.mode == "proportional":
-                self._centre(error)
+                self._centre(error, dt)
             else:
                 self._measure(self.turret_position(captured, now) + self.sign * error * self.hfov_deg, captured)
                 self._follow()
             self.state, self.lost_at = "tracking", None
-        self.servo.target = float(round(self._clamp(self.angle)))  # What send_angles() sends.
+        if error is None and self.state not in ("tracking", "coasting"):
+            self._error_ema = None  # A face found again after a loss starts a fresh average.
+        self.servo.target = self.command  # What send_angles() sends.
         return error
+
+    @property
+    def command(self) -> float:
+        """The angle to send: float in proportional mode (N lines carry tenths), whole degrees in predictive."""
+        angle = self._clamp(self.angle)
+        return angle if self.mode == "proportional" else float(round(angle))
 
     def _measure(self, bearing: float, captured: float) -> None:
         if self.state in ("tracking", "coasting") and self.bearing is not None:
@@ -479,24 +517,30 @@ class PanTracker:
         self.bearing, self.velocity, self._filter_time = bearing, 0.0, captured
         self.moving = True
 
-    def _centre(self, error: float) -> None:
+    def _centre(self, error: float, dt: float) -> None:
         """Proportional mode: nudge the turret a fraction of the way toward centring the face.
 
-        It needs no camera-latency model, so a wrong latency guess cannot make it hunt:
-        each frame moves gain x the remaining error (capped), with a smoothed error and
-        a start/stop dead zone so a still face gives a still turret.
+        It needs no camera-latency model, so a wrong latency guess cannot make it hunt.
+        Everything is per second, not per frame, so the motion does not change with the
+        frame rate: the image error is smoothed with time constant ``error_tau``; the
+        command moves ``gain`` of the remaining error per 1/15 s (compounded over dt),
+        capped at ``max_rate`` deg/s; and a soft dead zone fades the gain from zero at
+        ``dead_zone`` to full at ``full_gain_error`` (smoothstep), so a still face gives
+        a still turret without the jolt of a hard start/stop switch.
         """
-        self._error_ema = error if self._error_ema is None else (
-            self._error_ema + self.error_alpha * (error - self._error_ema))
+        dt = min(dt, _PROPORTIONAL_MAX_DT)
+        if self._error_ema is None:
+            self._error_ema = error
+        elif dt > 0:
+            share = 1.0 - math.exp(-dt / self.error_tau) if self.error_tau > 0 else 1.0
+            self._error_ema += share * (error - self._error_ema)
         e = self._error_ema
-        if self.moving and abs(e) < self.stop_error:
-            self.moving = False
-        elif not self.moving and abs(e) > self.start_error:
-            self.moving = True
-        if self.moving:
-            step = self.gain * e * self.hfov_deg
-            step = max(-self.max_step, min(self.max_step, step))
-            self.angle = self._clamp(self.angle + self.sign * step)
+        ramp = (abs(e) - self.dead_zone) / (self.full_gain_error - self.dead_zone)
+        ramp = max(0.0, min(1.0, ramp))
+        fraction = 1.0 - (1.0 - self.gain) ** (dt * _PROPORTIONAL_REF_FPS)
+        step = fraction * ramp * ramp * (3.0 - 2.0 * ramp) * e * self.hfov_deg
+        limit = self.max_rate * dt
+        self.angle = self._clamp(self.angle + self.sign * max(-limit, min(limit, step)))
         self.bearing, self.velocity = self.angle + self.sign * e * self.hfov_deg, 0.0
 
     def _follow(self) -> None:
@@ -512,6 +556,30 @@ class PanTracker:
     def _still_coasting(self, now: float) -> bool:
         """True while a just-lost face should still be coasted on (also on the frame it is lost)."""
         return self.state == "tracking" or now - self.lost_at < self.hold_s
+
+    def _fallback_x(self, fallback_map, laptop_x: float | None) -> float | None:
+        """The laptop x to follow, or None when fallback cannot run (no usable map or x)."""
+        if fallback_map is None:
+            return None
+        if laptop_x is None and self.state == "fallback":
+            laptop_x = self._laptop_ema  # A heartbeat without target_x: keep the last aim.
+        if laptop_x is None or fallback_map(laptop_x) is None:
+            return None
+        return laptop_x
+
+    def _fallback(self, dt: float, fallback_map, laptop_x: float) -> None:
+        dt = min(dt, _PROPORTIONAL_MAX_DT)
+        if self.state != "fallback" or self._laptop_ema is None:
+            self.state, self._laptop_ema = "fallback", laptop_x
+            self.bearing, self.velocity, self.moving, self.lost_at = None, 0.0, False, None
+        elif dt > 0:
+            share = 1.0 - math.exp(-dt / self.fallback_tau) if self.fallback_tau > 0 else 1.0
+            self._laptop_ema += share * (laptop_x - self._laptop_ema)
+        wanted = fallback_map(self._laptop_ema)
+        if wanted is None:
+            return
+        limit = self.max_rate * dt
+        self.angle = self._clamp(self.angle + max(-limit, min(limit, self._clamp(wanted) - self.angle)))
 
     def _search_direction(self, handoff_angle: float | None, laptop_x: float | None) -> float:
         if handoff_angle is not None and abs(handoff_angle - self.home) > 0.5:
@@ -542,7 +610,7 @@ class PanTracker:
     def _coast_or_return(self, now: float, dt: float, captured: float) -> None:
         if self.state == "home":
             return
-        if self.state in ("handoff", "searching"):
+        if self.state in ("handoff", "searching", "fallback"):
             self.state = "returning"  # The laptop no longer sees a peeper: glide home.
         if self.state == "tracking":
             self.state, self.lost_at, self._lost_velocity = "coasting", now, self.velocity

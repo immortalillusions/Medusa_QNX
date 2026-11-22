@@ -12,6 +12,8 @@ type Status = {
   laptop_age_s?: number | null;
   aim_target?: [number, number] | null;
   fps?: number | null;
+  pan_state?: string;
+  learned_points?: number | null;
 };
 
 // Served by the high-priority control process on the Pi at :8082/control.json.
@@ -193,6 +195,8 @@ function details(status: Status) {
     const target = status.aim_target;
     lines.push(target ? `Aiming at x ${target[0].toFixed(2)}, y ${target[1].toFixed(2)}` : "No target");
   }
+  if (status.pan_state === "fallback") lines.push("Aim: FALLBACK (laptop)");
+  if (isNum(status.learned_points)) lines.push(`Learned map: ${status.learned_points} points`);
   return lines;
 }
 

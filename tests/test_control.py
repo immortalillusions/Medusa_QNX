@@ -16,8 +16,9 @@ import medusa_control
 import qnx_ai_service
 from medusa import trigger as trigger_module
 from medusa.control import (
-    ControlClient, ControlHTTPServer, ControlLoop, StatusReader, StressTest, TickStats, make_target_packet,
-    parse_actual_packet, parse_status_line, parse_target_packet, system_clock,
+    ControlClient, ControlHTTPServer, ControlLoop, StatusReader, StressTest, TickStats, format_n_line,
+    make_target_packet, parse_actual_packet, parse_command_line, parse_status_line, parse_target_packet,
+    system_clock,
 )
 from medusa.handoff import HandoffMap, HandoffMapFile, main as handoff_main, record_now
 from medusa.servo import ServoMapper
@@ -96,14 +97,40 @@ class StatusParsingTests(unittest.TestCase):
 
 class TargetPacketTests(unittest.TestCase):
     def test_round_trip_and_garbage(self) -> None:
+        self.assertEqual(json.loads(target(True, 92.54, 90, 1))["yaw"], 92.54)  # Floats on the wire.
+        self.assertEqual(parse_target_packet(b'{"type":"medusa-target","active":true,"yaw":92,"pitch":90}').yaw, 92)
         packet = parse_target_packet(target(True, 84.6, 90.2, 7, 12.5))
-        self.assertEqual((packet.active, packet.yaw, packet.pitch, packet.seq, packet.t), (True, 85, 90, 7, 12.5))
+        self.assertEqual((packet.active, packet.yaw, packet.pitch, packet.seq, packet.t), (True, 84.6, 90.2, 7, 12.5))
         for payload in (b"", b"\xff", b"[]", b'{"type":"medusa-peeper","active":true,"yaw":1,"pitch":1}',
                         b'{"type":"medusa-target","active":1,"yaw":90,"pitch":90}',
                         b'{"type":"medusa-target","active":true,"yaw":"90","pitch":90}',
                         b'{"type":"medusa-target","active":true,"yaw":NaN,"pitch":90}'):
             with self.subTest(payload=payload):
                 self.assertIsNone(parse_target_packet(payload))
+
+
+class CommandLineTests(unittest.TestCase):
+    def test_n_line_round_trip_in_tenths(self) -> None:
+        self.assertEqual(format_n_line(92.5, 90.0, True, 7), b"N,925,900,1,7\n")
+        self.assertEqual(format_n_line(84.46, 77.04, False, 8), b"N,845,770,0,8\n")
+        for yaw, pitch, led, seq in ((92.5, 90.0, True, 7), (55.0, 125.0, False, 1), (101.3, 64.9, True, 99)):
+            with self.subTest(yaw=yaw):
+                line = format_n_line(yaw, pitch, led, seq).decode("ascii")
+                self.assertEqual(parse_command_line(line, 55, 125), (yaw, pitch, led, seq))
+
+    def test_m_lines_still_parse_and_bad_lines_are_rejected(self) -> None:
+        self.assertEqual(parse_command_line("M,92,80,1,3", 55, 125), (92.0, 80.0, True, 3))
+        self.assertEqual(parse_command_line("M,92,1,3", 55, 125), (92.0, 90.0, True, 3))  # Legacy 4-field.
+        for line in ("N,925,1,3", "N,1260,900,1,3", "N,540,900,1,3", "N,925,900,2,3", "M,126,90,1,3",
+                     "N,92.5,90,1,3", "X,925,900,1,3", ""):
+            with self.subTest(line=line):
+                self.assertIsNone(parse_command_line(line, 55, 125))
+
+    def test_firmware_parses_n_lines_in_tenths(self) -> None:
+        source = INO.read_text()
+        self.assertIn('sscanf(command, "N,%d,%d,%d,%lu"', source)
+        self.assertIn("value >= SERVO_MIN * scale && value <= SERVO_MAX * scale", source)
+        self.assertIn("pan.target = (float)yaw / scale;", source)
 
 
 class ControlTickTests(unittest.TestCase):
@@ -123,8 +150,17 @@ class ControlTickTests(unittest.TestCase):
         self.loop.tick(0.34)                                  # fresh, LED off, still aimed
         self.sock.queue += [b"garbage", target(True, 200, -5, 4)]
         self.loop.tick(0.36)                                  # garbage ignored; angles clamped
-        self.assertEqual(lines(self.serial), ["M,90,90,0,1", "M,80,90,1,2", "M,80,90,1,3", "M,90,90,0,4",
-                                              "M,100,90,0,5", "M,115,65,1,6"])
+        self.assertEqual(lines(self.serial), ["M,90,90,0,1", "N,800,900,1,2", "N,800,900,1,3", "M,90,90,0,4",
+                                              "N,1000,900,0,5", "N,1150,650,1,6"])
+
+    def test_float_targets_are_sent_as_tenths(self) -> None:
+        self.sock.queue += [target(True, 92.5, 90.0, 1)]
+        self.loop.tick(0.00)
+        self.sock.queue += [b'{"type":"medusa-target","active":true,"yaw":88,"pitch":90,"seq":2}']  # ints too
+        self.loop.tick(0.02)
+        self.sock.queue += [target(True, 54.96, 125.04, 3)]
+        self.loop.tick(0.04)  # still clamped to the safe ranges
+        self.assertEqual(lines(self.serial), ["N,925,900,1,1", "N,880,900,1,2", "N,650,1150,1,3"])
 
     def test_heartbeat_never_waits_for_the_ai(self) -> None:
         for k in range(100):  # Two seconds with no AI at all: one park line every tick.
@@ -180,7 +216,7 @@ class ControlTickTests(unittest.TestCase):
         self.sock.queue += [target(True, 70)]
         self.loop.tick(0.0)
         self.loop.shutdown()
-        self.assertEqual(lines(self.serial), ["M,70,90,1,1", "M,90,90,0,2", "M,90,90,0,3", "M,90,90,0,4"])
+        self.assertEqual(lines(self.serial), ["N,700,900,1,1", "M,90,90,0,2", "M,90,90,0,3", "M,90,90,0,4"])
 
 
 class TickStatsTests(unittest.TestCase):
@@ -377,7 +413,7 @@ class UdpLinkTests(unittest.TestCase):
         client.send_angles(True, 84.4, 200)       # clamped to the tilt range
         packet = json.loads(receive(control_sock))
         self.assertEqual({k: packet[k] for k in ("type", "active", "yaw", "pitch", "seq")},
-                         {"type": "medusa-target", "active": True, "yaw": 84, "pitch": 115, "seq": 1})
+                         {"type": "medusa-target", "active": True, "yaw": 84.4, "pitch": 115, "seq": 1})
         self.assertIsInstance(packet["t"], float)
         client.safe_stop()
         client.send(True, 1.0, 0.0)
@@ -385,7 +421,7 @@ class UdpLinkTests(unittest.TestCase):
         loop = ControlLoop(serial, target_sock=control_sock)
         time.sleep(0.05)
         loop.tick(system_clock())
-        self.assertEqual(lines(serial), ["M,115,65,1,1"])  # latest of the two waiting packets
+        self.assertEqual(lines(serial), ["N,1150,650,1,1"])  # latest of the two waiting packets
 
     def test_actual_status_reaches_the_ai_client(self) -> None:
         clock = FakeClock(50.0)
@@ -422,10 +458,10 @@ class TrackerActualAngleTests(unittest.TestCase):
         pan = PanTracker(65, 115, 90)
         pan.update(0.5, now=0.0)
         pan.servo.target = 100.0
-        pan.servo.advance(0.2)  # The model has moved 90 -> 100 between 0 and 0.2 s.
+        pan.servo.advance(0.25)  # The model has moved 90 -> 100 between 0 and 0.25 s.
         pan.observe_actual(88.0, at=0.0)
-        self.assertAlmostEqual(pan.servo.position_at(0.2), 100.0, delta=0.05)
-        self.assertAlmostEqual(pan.turret_position(0.2, 0.2), 98.0, delta=0.05)
+        self.assertAlmostEqual(pan.servo.position_at(0.25), 100.0, delta=0.05)
+        self.assertAlmostEqual(pan.turret_position(0.25, 0.25), 98.0, delta=0.05)
 
     def test_stale_real_angle_is_ignored(self) -> None:
         pan = PanTracker(65, 115, 90)
@@ -617,7 +653,12 @@ class ControlModeServiceTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_targets_go_over_udp_light_waits_for_a_turret_face_and_disarm_resets(self) -> None:
+    def run_service(self, script, map_points, extra_argv=()):
+        """Run qnx_ai_service over ``script``; return (sent (active, yaw) packets, tracker states).
+
+        Each frame is (laptop, turret faces, send a disarmed S status first?), with laptop
+        None (no packet), False (an inactive packet) or the laptop's target_x (active).
+        """
         receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.addCleanup(receiver.close)
         receiver.bind(("127.0.0.1", 0))
@@ -626,19 +667,7 @@ class ControlModeServiceTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         handoff = Path(tmp.name) / "handoff.json"
-        HandoffMap([[0.0, 70], [1.0, 110]]).save(handoff)  # laptop_x 0.8 -> pan 102
-
-        face = FaceBox(300, 220, 340, 260, 0.9)  # image centre
-        # Each frame: (laptop packet?, turret faces, send a disarmed S status first?)
-        script = [
-            (False, [], False),       # 0: no laptop -> home, light off
-            (True, [], False),        # 1: laptop sees a peeper, turret does not -> handoff to 102
-            (True, [], False),        # 2: still handoff
-            (True, [], False),        # 3: 0.2 s (> 0.15) at the handoff angle -> search: 102 -> 108
-            (True, [], False),        # 4: 114
-            (True, [face], False),    # 5: turret camera sees a face -> tracking, light ON
-            (True, [face], True),     # 6: Arduino reports disarmed -> tracker home
-        ]
+        HandoffMap(map_points).save(handoff)
         frame = SimpleNamespace(shape=(480, 640, 3))
         pending, index, clients, states = [], {"i": -1}, [], []
 
@@ -648,9 +677,11 @@ class ControlModeServiceTests(unittest.TestCase):
                 raise KeyboardInterrupt
             laptop, _faces, disarm = script[index["i"]]
             self.clock.now += 0.1
-            if laptop:
-                pending.append((json.dumps({"type": "medusa-peeper", "active": True, "target_x": 0.8,
-                                            "target_y": 0.5, "seq": index["i"]}).encode(), LAPTOP))
+            if laptop is not None:
+                message = {"type": "medusa-peeper", "active": laptop is not False, "seq": index["i"]}
+                if laptop is not False:
+                    message.update(target_x=laptop, target_y=0.5)
+                pending.append((json.dumps(message).encode(), LAPTOP))
             if disarm:
                 port = clients[0].actual_sock.getsockname()[1]
                 actual_out.sendto(json.dumps({"type": "medusa-actual", "link_ok": True, "armed": False,
@@ -691,6 +722,7 @@ class ControlModeServiceTests(unittest.TestCase):
                 "--trigger-udp-port", "8767", "--trigger-from", LAPTOP[0], "--camera-on-turret",
                 "--handoff-map", str(handoff), "--handoff-timeout", "0.15",
                 "--face-confirm-frames", "1", "--face-dropout-frames", "0",  # Debounce: test_trigger.py.
+                *extra_argv,
             ]),
             patch.object(qnx_ai_service, "TFLiteFaceGazeDetector", return_value=detector),
             patch.object(qnx_ai_service, "ArduinoController", side_effect=AssertionError("no serial port")),
@@ -708,15 +740,61 @@ class ControlModeServiceTests(unittest.TestCase):
                 packets.append(json.loads(receiver.recvfrom(4096)[0]))
             except BlockingIOError:
                 break
-        sent = [(p["active"], p["yaw"]) for p in packets]
-        self.assertEqual(sent[:6], [(False, 90), (False, 90), (False, 102), (False, 102), (False, 108),
-                                    (False, 114)])
+        self.assertTrue(all(p["type"] == "medusa-target" for p in packets))
+        return [(p["active"], p["yaw"]) for p in packets], states
+
+    def test_without_a_usable_map_search_keeps_the_light_off_and_disarm_resets(self) -> None:
+        face = FaceBox(300, 220, 340, 260, 0.9)  # image centre
+        sent, states = self.run_service([
+            (None, [], False),        # 0: no laptop -> home, light off
+            (0.8, [], False),         # 1: laptop sees a peeper, turret does not -> search, from 90
+            (0.8, [], False),         # 2: 96 (right first: laptop_x 0.8)
+            (0.8, [], False),         # 3: 102
+            (0.8, [], False),         # 4: 108
+            (0.8, [face], False),     # 5: turret camera sees a face -> tracking, light ON
+            (0.8, [face], True),      # 6: Arduino reports disarmed -> tracker home
+        ], [[0.5, 90]])               # one point is not a usable map
+        # sent[0] is the startup safe_stop; then one packet per frame; the last is shutdown's.
+        self.assertEqual(sent[:6], [(False, 90), (False, 90), (False, 90), (False, 96), (False, 102),
+                                    (False, 108)])
         self.assertEqual(sent[6][0], True)          # light only once the turret camera sees the face
         self.assertEqual(sent[7], (True, 90))       # disarmed: tracker reset home (firmware ignores it)
         self.assertEqual(sent[8], (False, 90))      # safe_stop at shutdown
-        self.assertEqual(states, ["home", "handoff", "handoff", "searching", "searching", "tracking", "home"])
-        self.assertTrue(all(p["type"] == "medusa-target" for p in packets))
+        self.assertEqual(states, ["home"] + ["searching"] * 4 + ["tracking", "home"])
 
+    def test_usable_map_aims_from_the_laptop_with_the_light_on_until_the_face_returns(self) -> None:
+        face = FaceBox(300, 220, 340, 260, 0.9)  # image centre
+        sent, states = self.run_service([
+            (None, [], False),        # 0: no laptop -> home, light off
+            (0.8, [], False),         # 1: laptop only -> fallback: toward map(0.8) = 102, light ON
+            (0.8, [face], False),     # 2: turret face -> tracking
+            (0.8, [], False),         # 3: face lost -> coasting (0.3 s), light stays on
+            (0.8, [], False),         # 4
+            (0.8, [], False),         # 5
+            (0.8, [], False),         # 6: coast over (at 6 or 7: float time) -> fallback
+            (0.8, [], False),         # 7: fallback at 102
+            (0.2, [], False),         # 8: the peeper moves left: map(0.2) = 78, smoothed
+            (0.2, [], False),         # 9
+            (0.2, [], False),         # 10
+            (0.2, [face], False),     # 11: face again -> tracking
+            (False, [], False),       # 12: laptop sees no peeper -> usual coast then home, light off
+        ], [[0.0, 70], [1.0, 110]])
+        self.assertEqual(sent[:3], [(False, 90), (False, 90), (True, 102)])  # 12 deg = 120 deg/s * 0.1 s
+        self.assertEqual(states[:4], ["home", "fallback", "tracking", "coasting"])
+        self.assertEqual(states[-2:], ["tracking", "coasting"])
+        self.assertEqual(states[7:11], ["fallback"] * 4)
+        self.assertTrue(all(active for active, _yaw in sent[2:13]))  # on from fallback to the face
+        self.assertFalse(sent[13][0])                               # laptop inactive: light off
+        self.assertEqual(sent[8], (True, 102))
+        yaws = [yaw for _active, yaw in sent[9:12]]
+        steps = [b - a for a, b in zip([102] + yaws, yaws)]
+        self.assertTrue(all(-12 <= step < 0 for step in steps), yaws)  # heading for 78, rate-limited
+        self.assertGreater(yaws[-1], 78)  # smoothed (tau 0.25 s): not there in three frames
+
+    def test_no_search_turns_fallback_off(self) -> None:
+        sent, states = self.run_service([(0.8, [], False)] * 2, [[0.0, 70], [1.0, 110]], ["--no-search"])
+        self.assertEqual(states, ["home", "home"])
+        self.assertFalse(any(active for active, _yaw in sent))
 
 if __name__ == "__main__":
     unittest.main()

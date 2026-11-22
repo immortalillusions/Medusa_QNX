@@ -9,8 +9,8 @@ AI loop. Each tick it:
 1. reads the firmware's ``S,<armed>,<pan_x10>,<tilt_x10>,<seq>`` status lines
    (latest wins; anything else, such as the Zephyr boot banner, is ignored);
 2. drains ``medusa-target`` packets from the AI process (latest wins);
-3. sends ``M,yaw,pitch,led,seq``: the AI's target while it is fresh, otherwise
-   a park line (home angles, LED off);
+3. sends ``N,yaw_x10,pitch_x10,led,seq`` (tenths of a degree) with the AI's
+   target while it is fresh, otherwise an ``M`` park line (home angles, LED off);
 4. sends a ``medusa-actual`` packet back to the AI process, so its pan tracker
    can use where the turret really points.
 
@@ -56,6 +56,7 @@ STRESS_MAX_S = 60
 _MAX_PACKETS_PER_TICK = 64
 _MAX_LINE = 128
 _STATUS_LINE = re.compile(r"S,([01]),(-?\d{1,5}),(-?\d{1,5}),(\d{1,10})")
+_COMMAND_LINE = re.compile(r"([MN]),(-?\d+),(-?\d+),(-?\d+)(?:,(\d+))?")
 
 
 def system_clock() -> float:
@@ -70,6 +71,40 @@ def _number(value) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         return None
     return float(value)
+
+
+# --- Arduino command lines -----------------------------------------------------------------
+
+def tenths(degrees: float) -> int:
+    """Degrees to the firmware's integer tenths, rounding half away from zero like its tenths()."""
+    return int(math.floor(abs(degrees) * 10 + 0.5)) * (1 if degrees >= 0 else -1)
+
+
+def format_n_line(yaw: float, pitch: float, led: bool, seq: int) -> bytes:
+    """``N,<yaw_x10>,<pitch_x10>,<led>,<seq>\\n``: angles in tenths of a degree (92.5 -> 925)."""
+    return f"N,{tenths(yaw)},{tenths(pitch)},{int(bool(led))},{seq}\n".encode("ascii")
+
+
+def parse_command_line(line: str, servo_min: int = 0, servo_max: int = 180):
+    """Python twin of applyCommand() in the firmware: (yaw, pitch, led, seq) in degrees, or None.
+
+    N lines carry tenths; M lines whole degrees, and the old 4-field M line has no
+    pitch (home 90). Out-of-range angles or an LED other than 0/1 are rejected.
+    """
+    match = _COMMAND_LINE.fullmatch(line.strip())
+    if match is None:
+        return None
+    kind, a, b, c, d = match.groups()
+    if d is None:
+        if kind != "M":
+            return None
+        yaw, pitch, led, seq = int(a), 90, int(b), int(c)
+    else:
+        yaw, pitch, led, seq = int(a), int(b), int(c), int(d)
+    scale = 10 if kind == "N" else 1
+    if led not in (0, 1) or not all(servo_min * scale <= v <= servo_max * scale for v in (yaw, pitch)):
+        return None
+    return yaw / scale, pitch / scale, bool(led), seq
 
 
 # --- Arduino status -------------------------------------------------------------------------
@@ -155,8 +190,9 @@ class TargetPacket:
 
 
 def make_target_packet(active: bool, yaw: float, pitch: float, seq: int, t: float) -> bytes:
-    return json.dumps({"type": TARGET_MESSAGE_TYPE, "active": bool(active), "yaw": int(round(yaw)),
-                       "pitch": int(round(pitch)), "seq": seq, "t": t}).encode()
+    """Float angles (degrees); the control process sends them on as tenths."""
+    return json.dumps({"type": TARGET_MESSAGE_TYPE, "active": bool(active), "yaw": round(float(yaw), 3),
+                       "pitch": round(float(pitch), 3), "seq": seq, "t": t}).encode()
 
 
 def parse_target_packet(payload: bytes) -> TargetPacket | None:
@@ -344,8 +380,8 @@ class ControlLoop:
         self.ticks = 0
 
     @staticmethod
-    def _clamp(value: float, bounds) -> int:
-        return int(max(bounds[0], min(bounds[1], round(value))))
+    def _clamp(value: float, bounds) -> float:
+        return float(max(bounds[0], min(bounds[1], value)))
 
     def park_line(self) -> bytes:
         return f"M,{self.home_yaw},{self.home_pitch},0,{self.sequence}\n".encode("ascii")
@@ -365,8 +401,8 @@ class ControlLoop:
         self.sequence += 1
         if self.target_fresh(now):
             target = self.target
-            line = (f"M,{self._clamp(target.yaw, self.yaw_range)},{self._clamp(target.pitch, self.pitch_range)},"
-                    f"{int(target.active)},{self.sequence}\n").encode("ascii")
+            line = format_n_line(self._clamp(target.yaw, self.yaw_range),
+                                 self._clamp(target.pitch, self.pitch_range), target.active, self.sequence)
         else:
             line = self.park_line()  # The heartbeat continues without the AI: home, LED off.
         if not self.serial.write(line):
@@ -559,8 +595,9 @@ class ControlClient:
         self._send(led, yaw, pitch)
 
     def send_angles(self, active: bool, yaw: float, pitch: float) -> None:
-        yaw = round(max(self.mapper.minimum, min(self.mapper.maximum, yaw)))
-        pitch = round(max(self.tilt_mapper.minimum, min(self.tilt_mapper.maximum, pitch)))
+        """Float angles, clamped to the safe ranges (the control process clamps again)."""
+        yaw = max(self.mapper.minimum, min(self.mapper.maximum, float(yaw)))
+        pitch = max(self.tilt_mapper.minimum, min(self.tilt_mapper.maximum, float(pitch)))
         self._send(active, yaw, pitch)
 
     def safe_stop(self) -> None:
