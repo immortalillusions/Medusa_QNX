@@ -127,8 +127,11 @@ def build_parser() -> argparse.ArgumentParser:
     turret.add_argument("--pan-hold", type=float, default=None,
                         help="seconds after losing the target before gliding home; "
                              "default and minimum: --pan-coast")
-    turret.add_argument("--pan-return-speed", type=float, default=60.0,
-                        help="degrees per second for the glide home")
+    turret.add_argument("--pan-lost-hold", type=float, default=1.0,
+                        help="seconds to hold still after the coast (or after the laptop loses the peeper) "
+                             "before gliding home; 0 is the old behaviour")
+    turret.add_argument("--pan-return-speed", type=float, default=30.0,
+                        help="degrees per second for the glide home (60 was the old default)")
     turret.add_argument("--handoff-map", default=DEFAULT_HANDOFF_MAP,
                         help="laptop_x -> pan map (python3 -m medusa.handoff), learned while tracking and "
                              "saved here every 5 s; with 2+ points a lost face is aimed at from the laptop's "
@@ -168,8 +171,9 @@ def parse_args(argv=None) -> argparse.Namespace:
         parser.error("--camera-on-turret requires --trigger-udp-port")
     if args.camera_hfov <= 0 or args.pan_return_speed <= 0:
         parser.error("--camera-hfov and --pan-return-speed must be positive")
-    if min(args.camera_latency, args.pan_lead, args.pan_coast, args.pan_hold or 0.0) < 0:
-        parser.error("--camera-latency, --pan-lead, --pan-coast and --pan-hold must not be negative")
+    if min(args.camera_latency, args.pan_lead, args.pan_coast, args.pan_hold or 0.0, args.pan_lost_hold) < 0:
+        parser.error("--camera-latency, --pan-lead, --pan-coast, --pan-hold and --pan-lost-hold "
+                     "must not be negative")
     if args.search_speed < 0 or args.handoff_timeout < 0:
         parser.error("--search-speed and --handoff-timeout must not be negative")
     if args.control_port is not None and args.arduino_port:
@@ -224,6 +228,7 @@ def _trigger_status(trigger: LaptopTrigger, laptop_active: bool, aim, pan=None, 
         status["pan_state"] = pan.state
         status["pan_actual"] = round(pan.actual[1], 1) if pan.actual is not None else None
         status["fallback_aim"] = pan.state == "fallback"
+        status["fallback_search"] = pan.local_search  # fallback sweeping around the map estimate
         status["learned_points"] = learned_points
         # The learned map's monotonic fit: its direction (None below 3 bins) and the bins it rejected.
         status["map_direction"] = learner.direction if learner is not None else None
@@ -239,7 +244,7 @@ def _pan_tracker(args) -> PanTracker | None:
         args.servo_min, args.servo_max, args.servo_home, reversed=args.servo_reversed,
         hfov_deg=args.camera_hfov, latency_s=args.camera_latency, lead_s=args.pan_lead,
         coast_s=args.pan_coast, hold_s=args.pan_hold, return_speed=args.pan_return_speed,
-        search_speed=0.0 if args.no_search else args.search_speed, handoff_timeout=args.handoff_timeout,
+        lost_hold_s=args.pan_lost_hold, search_speed=0.0 if args.no_search else args.search_speed, handoff_timeout=args.handoff_timeout,
         mode=args.pan_mode, gain=args.pan_step_gain,
     )
 
@@ -324,6 +329,8 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
                     laptop_active=laptop_active, laptop_x=laptop_x,
                     handoff_angle=learned.angle(laptop_x) if learned else None,
                     fallback_map=learned.angle if learned else None,
+                    fallback_domain=((learned.points[0][0], learned.points[-1][0])
+                                     if learned is not None and learned.usable else None),
                 )
                 if handoff:
                     # Learn only from the one face in view, matched as the peeper, on a live turret.

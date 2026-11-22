@@ -398,6 +398,9 @@ _PROPORTIONAL_REF_FPS = 15.0  # proportional gain is the share of the error corr
 _PROPORTIONAL_MAX_DT = 0.2     # a longer frame gap moves no more than a 0.2 s one
 _FIRMWARE_HISTORY = 200      # 1 s of positions, enough to look back past the camera latency
 _FIRMWARE_MAX_GAP_S = 2.0    # a longer gap ends at the target whatever the move was
+_FALLBACK_MAX_VX = 1.5       # laptop image widths per second: a faster estimate is noise
+_FALLBACK_SWITCH_X = 0.15    # a laptop x jump past this in one sample is a new peeper, not motion
+_FALLBACK_EXTRAPOLATE_X = 0.05  # laptop x this far outside the learned points: the map is a guess
 
 
 class FirmwareAxisModel:
@@ -469,8 +472,10 @@ class PanTracker:
     ``start_deg``, then follows until a frame changes it by at most ``stop_deg``
     with the face slower than ``still_speed``, so a still face gives a still turret.
     On loss the command coasts on (velocity fading to zero over ``coast_s``), holds still until ``hold_s`` after the loss (default: no extra
-    hold), then glides home at ``return_speed`` deg/s. A face seen again resumes
-    tracking at once.
+    hold), then ("holding") stays still ``lost_hold_s`` more, then glides home at
+    ``return_speed`` deg/s ("returning"); fallback, handoff and search that lose the laptop
+    hold the same way. ``lost_hold_s=0, return_speed=60`` is the old behaviour. A face
+    seen again resumes tracking at once.
 
     Acquire (``laptop_active=True`` passed to update while the turret camera sees
     no face, after any coast): with a handoff angle from the laptop's target_x
@@ -483,8 +488,20 @@ class PanTracker:
     Fallback (``fallback_map`` passed to update, a usable laptop_x -> pan map, e.g.
     the learned HandoffLearner one): instead of handoff and search, the turret
     follows the laptop ("fallback"). The laptop x is smoothed (EMA, time constant
-    ``fallback_tau``) and the command moves toward map(smoothed x) at no more than
-    ``max_rate`` deg/s. A turret-camera face takes over again at once ("tracking").
+    ``fallback_tau``, predicted forward by its velocity so a moving x is not lagged) with a
+    smoothed velocity from successive samples, and the aim is map(x + vx * ``fallback_lead_s``)
+    plus an offset: the angle minus map(x) on entry, decaying over ``fallback_blend_s``, so
+    the handoff does not jump. The command follows the aim as a critically damped
+    second-order system (natural frequency ``fallback_omega``, velocity feed-forward, so a
+    steady ramp is followed without lag) capped at ``max_rate`` and ``fallback_max_accel``;
+    a step (the laptop switching peepers) glides there without overshoot. After
+    ``fallback_search_after_s`` in fallback without a turret face, or at once while the
+    laptop x is past the learned points (``fallback_domain``; the map is extrapolating), it
+    sweeps +-``fallback_search_deg`` around the moving map estimate at
+    ``fallback_search_speed``, widening to twice that after one full sweep, so a wrong map
+    cannot hold the turret where the camera never sees the face. A turret-camera face takes
+    over again ("tracking"), the command ramping from the fallback one to the tracking one
+    over ``reacquire_blend_s``.
 
     Real angle: observe_actual() feeds the pan angle the firmware reports. While
     that report is fresh (``actual_timeout``), the turret's position at frame
@@ -498,14 +515,17 @@ class PanTracker:
     def __init__(
         self, minimum: float, maximum: float, home: float, *, reversed: bool = False,
         hfov_deg: float = 50.0, latency_s: float = 0.07, lead_s: float = 0.15,
-        coast_s: float = 0.3, hold_s: float | None = None, return_speed: float = 60.0,
+        coast_s: float = 0.3, hold_s: float | None = None, return_speed: float = 30.0,
         alpha: float = 0.5, beta: float = 0.15, jump_deg: float = 25.0,
         maneuver_deg: float = 2.0, maneuver_alpha: float = 0.8, maneuver_beta: float = 0.5,
         start_deg: float = 1.0, stop_deg: float = 0.4, still_speed: float = 3.0,
         search_speed: float = 60.0, handoff_timeout: float = 0.6, actual_timeout: float = 0.3,
         mode: str = "predictive", gain: float = 0.12, max_rate: float = 120.0,
         dead_zone: float = 0.012, full_gain_error: float = 0.05, error_tau: float = 0.12,
-        fallback_tau: float = 0.25,
+        fallback_tau: float = 0.25, fallback_blend_s: float = 1.0, fallback_lead_s: float = 0.15,
+        fallback_omega: float = 6.0, fallback_max_accel: float = 600.0, reacquire_blend_s: float = 0.3,
+        lost_hold_s: float = 1.0, fallback_search_after_s: float = 1.5, fallback_search_deg: float = 20.0,
+        fallback_search_speed: float = 30.0,
     ) -> None:
         if mode not in ("predictive", "proportional"):
             raise ValueError("pan mode must be 'predictive' or 'proportional'")
@@ -513,7 +533,11 @@ class PanTracker:
             raise ValueError("pan dead zone must be at least 0 and below the full-gain error")
         self.mode, self.gain, self.max_rate = mode, gain, max_rate
         self.dead_zone, self.full_gain_error, self.error_tau = dead_zone, full_gain_error, error_tau
-        self.fallback_tau = fallback_tau
+        self.fallback_tau, self.fallback_blend_s, self.fallback_lead_s = fallback_tau, fallback_blend_s, fallback_lead_s
+        self.fallback_omega, self.fallback_max_accel = fallback_omega, fallback_max_accel
+        self.reacquire_blend_s, self.lost_hold_s = reacquire_blend_s, lost_hold_s
+        self.fallback_search_after_s, self.fallback_search_deg = fallback_search_after_s, fallback_search_deg
+        self.fallback_search_speed = fallback_search_speed
         self.minimum, self.maximum, self.home = float(minimum), float(maximum), float(home)
         self.sign = -1.0 if reversed else 1.0  # Reversed: a face right of centre needs a lower yaw.
         self.hfov_deg, self.latency_s, self.lead_s = hfov_deg, latency_s, lead_s
@@ -541,6 +565,13 @@ class PanTracker:
         self._acquire_at: float | None = None
         self._search_dir = 1.0
         self._laptop_ema: float | None = None
+        self._laptop_vx = 0.0
+        self._laptop_prev: tuple[float, float] | None = None  # (time, laptop x) of the last fresh sample
+        self._fb_offset = self._fb_stage = self._fb_rate = 0.0  # entry offset, damped-follow state
+        self._fb_since = 0.0  # fallback entry (or last peeper switch): the local-search clock
+        self._sweep, self._sweep_dir, self._sweep_amp, self._sweep_run = 0.0, 0.0, 0.0, 0.0
+        self._blend: tuple[float, float] | None = None  # (start, fallback command) while reacquiring
+        self._hold_at: float | None = None
         self.servo.target = float(round(self.home))
 
     def _clamp(self, angle: float) -> float:
@@ -591,12 +622,15 @@ class PanTracker:
         self, target_x: float | None, now: float | None = None, *,
         laptop_active: bool = False, handoff_angle: float | None = None, laptop_x: float | None = None,
         fallback_map: Callable[[float], float | None] | None = None,
+        fallback_domain: tuple[float, float] | None = None,
     ) -> float | None:
         """Advance one frame; return the image error (x - 0.5) or None without a target.
 
         ``laptop_active`` (the laptop sees a peeper), ``handoff_angle`` (the map's pan
         for the laptop's target_x) and ``laptop_x`` drive acquire when ``target_x`` is None;
-        ``fallback_map`` (laptop_x -> pan, None while unusable) turns acquire into fallback.
+        ``fallback_map`` (laptop_x -> pan, None while unusable) turns acquire into fallback;
+        ``fallback_domain`` (lowest, highest learned laptop x) lets it search at once while the
+        map extrapolates.
         """
         now = time.monotonic() if now is None else now
         self.servo.advance(now)
@@ -607,10 +641,12 @@ class PanTracker:
             self.reset()  # Disarmed or gate open: the firmware ignores commands, so do not wind up.
             return None
         if target_x is None:
+            if self._blend is not None:  # Lost mid-blend: carry on from the angle actually sent.
+                self.angle, self._blend = self._blended(now), None
             coasting = self.state in ("tracking", "coasting") and self._still_coasting(now)
             fallback_x = self._fallback_x(fallback_map, laptop_x) if laptop_active and not coasting else None
             if fallback_x is not None:
-                self._fallback(dt, fallback_map, fallback_x)
+                self._fallback(now, dt, fallback_map, fallback_x, laptop_x is not None, fallback_domain)
             elif laptop_active and self.search_speed > 0 and not coasting:
                 self._acquire(now, dt, handoff_angle, laptop_x)
             else:
@@ -618,12 +654,16 @@ class PanTracker:
             error = None
         else:
             error = target_x - 0.5  # Positive: face right of image centre.
+            if self.state == "fallback" and self.reacquire_blend_s > 0:
+                self._blend = (now, self._clamp(self.angle))  # Ramp from here to the tracking command.
             if self.mode == "proportional":
                 self._centre(error, dt)
             else:
                 self._measure(self.turret_position(captured, now) + self.sign * error * self.hfov_deg, captured)
                 self._follow()
             self.state, self.lost_at = "tracking", None
+            if self._blend is not None and now - self._blend[0] >= self.reacquire_blend_s:
+                self._blend = None
         if error is None and self.state not in ("tracking", "coasting"):
             self._error_ema = None  # A face found again after a loss starts a fresh average.
         self.servo.target = self.command  # What send_angles() sends.
@@ -632,8 +672,19 @@ class PanTracker:
     @property
     def command(self) -> float:
         """The angle to send: float in proportional mode (N lines carry tenths), whole degrees in predictive."""
-        angle = self._clamp(self.angle)
+        angle = self._clamp(self.angle if self._blend is None else self._blended(self._last_now))
         return angle if self.mode == "proportional" else float(round(angle))
+
+    @property
+    def local_search(self) -> bool:
+        """True while fallback sweeps around the map estimate (no turret face for a while)."""
+        return self.state == "fallback" and self._sweep_dir != 0
+
+    def _blended(self, now: float) -> float:
+        """The command ramping (smoothstep) from the fallback one to the tracking one."""
+        start, origin = self._blend
+        w = max(0.0, min(1.0, (now - start) / self.reacquire_blend_s))
+        return origin + w * w * (3.0 - 2.0 * w) * (self.angle - origin)
 
     def _measure(self, bearing: float, captured: float) -> None:
         if self.state in ("tracking", "coasting") and self.bearing is not None:
@@ -706,19 +757,92 @@ class PanTracker:
             return None
         return laptop_x
 
-    def _fallback(self, dt: float, fallback_map, laptop_x: float) -> None:
+    def _fallback(self, now: float, dt: float, fallback_map, laptop_x: float, fresh: bool,
+                  domain: tuple[float, float] | None) -> None:
         dt = min(dt, _PROPORTIONAL_MAX_DT)
+        share = (1.0 - math.exp(-dt / self.fallback_tau) if self.fallback_tau > 0 else 1.0) if dt > 0 else 0.0
         if self.state != "fallback" or self._laptop_ema is None:
             self.state, self._laptop_ema = "fallback", laptop_x
             self.bearing, self.velocity, self.moving, self.lost_at = None, 0.0, False, None
-        elif dt > 0:
-            share = 1.0 - math.exp(-dt / self.fallback_tau) if self.fallback_tau > 0 else 1.0
-            self._laptop_ema += share * (laptop_x - self._laptop_ema)
-        wanted = fallback_map(self._laptop_ema)
-        if wanted is None:
+            self._laptop_vx, self._laptop_prev = 0.0, (now, laptop_x)
+            self._fb_offset = self.angle - fallback_map(laptop_x)  # No jump: start from where we point.
+            self._fb_stage, self._fb_rate, dt = self.angle, 0.0, 0.0
+            self._start_local_search(now)
+        elif not fresh:
+            self._laptop_vx = 0.0  # A heartbeat without target_x: hold the last aim.
+        else:
+            prev_t, prev_x = self._laptop_prev
+            self._laptop_prev = (now, laptop_x)
+            if abs(laptop_x - prev_x) > _FALLBACK_SWITCH_X:
+                # The laptop picked another peeper: aim there now (the entry offset belonged to the
+                # old one); the damped follow glides over.
+                self._laptop_ema, self._laptop_vx, self._fb_offset = laptop_x, 0.0, 0.0
+                self._start_local_search(now)
+            else:
+                if now - prev_t > 1e-3:
+                    raw = (laptop_x - prev_x) / (now - prev_t)
+                    raw = max(-_FALLBACK_MAX_VX, min(_FALLBACK_MAX_VX, raw))
+                    self._laptop_vx += share * (raw - self._laptop_vx)
+                predicted = self._laptop_ema + self._laptop_vx * dt  # Predicted forward: no ramp lag.
+                self._laptop_ema = predicted + share * (laptop_x - predicted)
+        if dt > 0:
+            self._fb_offset *= math.exp(-dt / self.fallback_blend_s) if self.fallback_blend_s > 0 else 0.0
+        look = max(0.0, min(1.0, self._laptop_ema + self._laptop_vx * self.fallback_lead_s))
+        mapped = fallback_map(look)
+        if mapped is None:
+            mapped = fallback_map(self._laptop_ema)
+            if mapped is None:
+                return
+        ahead, behind = fallback_map(min(1.0, look + 0.01)), fallback_map(max(0.0, look - 0.01))
+        slope = (ahead - behind) / (min(1.0, look + 0.01) - max(0.0, look - 0.01)) if (
+            ahead is not None and behind is not None) else 0.0
+        sweep, sweep_rate = self._local_search(now, dt, mapped, domain)
+        self._damped_follow(dt, self._clamp(mapped + self._fb_offset + sweep), slope * self._laptop_vx + sweep_rate)
+
+    def _damped_follow(self, dt: float, aim: float, aim_rate: float) -> None:
+        """Critically damped (two equal first-order stages, exact for any dt) with feed-forward."""
+        if dt <= 0:
             return
-        limit = self.max_rate * dt
-        self.angle = self._clamp(self.angle + max(-limit, min(limit, self._clamp(wanted) - self.angle)))
+        share = 1.0 - math.exp(-self.fallback_omega * dt) if self.fallback_omega > 0 else 1.0
+        predicted = self._fb_stage + aim_rate * dt
+        self._fb_stage = predicted + share * (aim - predicted)
+        predicted = self.angle + aim_rate * dt
+        rate = (predicted + share * (self._fb_stage - predicted) - self.angle) / dt
+        accel = self.fallback_max_accel * dt
+        rate = max(self._fb_rate - accel, min(self._fb_rate + accel, rate))
+        rate = max(-self.max_rate, min(self.max_rate, rate))
+        self.angle = self._clamp(self.angle + rate * dt)
+        self._fb_rate = rate
+
+    def _start_local_search(self, now: float) -> None:
+        self._fb_since = now
+        self._sweep, self._sweep_dir, self._sweep_amp, self._sweep_run = 0.0, 0.0, self.fallback_search_deg, 0.0
+
+    def _local_search(self, now: float, dt: float, mapped: float,
+                      domain: tuple[float, float] | None) -> tuple[float, float]:
+        """(sweep offset, its rate) around the map estimate once fallback has gone a while without a face."""
+        if self.fallback_search_deg <= 0 or self.fallback_search_speed <= 0:
+            return 0.0, 0.0
+        if self._sweep_dir == 0:
+            extrapolating = domain is not None and not (
+                domain[0] - _FALLBACK_EXTRAPOLATE_X <= self._laptop_ema <= domain[1] + _FALLBACK_EXTRAPOLATE_X)
+            if not extrapolating and now - self._fb_since < self.fallback_search_after_s:
+                return 0.0, 0.0
+            # Toward home first: an extrapolated estimate most often overshoots outward.
+            self._sweep_dir = math.copysign(1.0, self.home - mapped) if abs(self.home - mapped) > 0.5 else 1.0
+            return 0.0, 0.0
+        step = self.fallback_search_speed * dt
+        sweep = self._sweep + self._sweep_dir * step
+        low, high = max(-self._sweep_amp, self.minimum - mapped), min(self._sweep_amp, self.maximum - mapped)
+        if sweep >= high:
+            sweep, self._sweep_dir = high, -1.0
+        elif sweep <= low:
+            sweep, self._sweep_dir = low, 1.0
+        self._sweep_run += step
+        if self._sweep_amp == self.fallback_search_deg and self._sweep_run >= 4 * self.fallback_search_deg:
+            self._sweep_amp = 2 * self.fallback_search_deg  # Nothing after one full sweep: widen once.
+        self._sweep = sweep
+        return sweep, self._sweep_dir * self.fallback_search_speed
 
     def _search_direction(self, handoff_angle: float | None, laptop_x: float | None) -> float:
         if handoff_angle is not None and abs(handoff_angle - self.home) > 0.5:
@@ -750,7 +874,7 @@ class PanTracker:
         if self.state == "home":
             return
         if self.state in ("handoff", "searching", "fallback"):
-            self.state = "returning"  # The laptop no longer sees a peeper: glide home.
+            self._start_hold(now)  # The laptop no longer sees a peeper: hold, then glide home.
         if self.state == "tracking":
             self.state, self.lost_at, self._lost_velocity = "coasting", now, self.velocity
         if self.state == "coasting":
@@ -765,9 +889,17 @@ class PanTracker:
                 self.angle = self._clamp(self.angle + mean * dt)
                 self.velocity, self._filter_time = velocity, captured
                 return
-            self.state, self.bearing, self.velocity, self.moving = "returning", None, 0.0, False
+            self._start_hold(now)
+        if self.state == "holding":
+            if now - self._hold_at < self.lost_hold_s:
+                return
+            self.state = "returning"
         step = self.return_speed * dt
         self.angle = self.home if abs(self.home - self.angle) <= step else (
             self.angle + math.copysign(step, self.home - self.angle))
         if self.angle == self.home:
             self.state = "home"
+
+    def _start_hold(self, now: float) -> None:
+        self.state = "holding" if self.lost_hold_s > 0 else "returning"
+        self.bearing, self.velocity, self.moving, self._hold_at = None, 0.0, False, now

@@ -465,7 +465,7 @@ class PanTrackerTests(unittest.TestCase):
         self.assertLess(abs(pan.velocity), 1.0)
 
     def test_losing_the_face_coasts_then_glides_home_and_a_face_resumes_at_once(self) -> None:
-        pan = PanTracker(0, 180, 20)
+        pan = PanTracker(0, 180, 20, lost_hold_s=0, return_speed=60)  # The old glide.
         face, _ = sweep(20, 180, 60, 0.3)
         lost_at = 1.3
         samples, frames = simulate(pan, face, 3.5, visible=lambda t: t < lost_at)
@@ -483,7 +483,7 @@ class PanTrackerTests(unittest.TestCase):
             self.assertLess(a1, a0)
             self.assertLessEqual(a0 - a1, 60.0 * (t1 - t0) + 1e-6)  # Glides; never jumps home.
         # A face seen mid-glide is tracked on that very frame.
-        pan = PanTracker(0, 180, 20)
+        pan = PanTracker(0, 180, 20, lost_hold_s=0, return_speed=60)
         simulate(pan, face, 2.0, visible=lambda t: t < lost_at)
         self.assertEqual(pan.state, "returning")
         before = pan.angle
@@ -492,7 +492,7 @@ class PanTrackerTests(unittest.TestCase):
         self.assertGreater(pan.angle, before)
 
     def test_hold_keeps_the_turret_still_before_gliding_home(self) -> None:
-        pan = PanTracker(65, 115, 90, hold_s=1.0)
+        pan = PanTracker(65, 115, 90, hold_s=1.0, lost_hold_s=0, return_speed=60)  # The old glide.
         pan.update(0.7, now=0.0)
         held = pan.angle
         pan.update(None, now=0.1)  # Lost here; nothing moves, so the coast changes nothing.
@@ -587,13 +587,13 @@ class CameraOnTurretFlagTests(unittest.TestCase):
         self.assertFalse(args.camera_on_turret)
         self.assertEqual(
             (args.camera_hfov, args.camera_latency, args.pan_lead, args.pan_coast, args.pan_hold,
-             args.pan_return_speed),
-            (50.0, 0.07, 0.15, 0.3, None, 60.0))
+             args.pan_return_speed, args.pan_lost_hold),
+            (50.0, 0.07, 0.15, 0.3, None, 30.0, 1.0))
         self.assertTrue(qnx_ai_service.parse_args(self.base + ["--camera-on-turret"]).camera_on_turret)
         pan = qnx_ai_service._pan_tracker(qnx_ai_service.parse_args(
             self.base + ["--camera-on-turret", "--servo-reversed", "--pan-lead", "0.1", "--pan-hold", "2"]))
-        self.assertEqual((pan.sign, pan.lead_s, pan.coast_s, pan.hold_s, pan.return_speed),
-                         (-1.0, 0.1, 0.3, 2.0, 60.0))
+        self.assertEqual((pan.sign, pan.lead_s, pan.coast_s, pan.hold_s, pan.return_speed, pan.lost_hold_s),
+                         (-1.0, 0.1, 0.3, 2.0, 30.0, 1.0))
 
     def test_old_proportional_flags_are_accepted_but_ignored(self) -> None:
         argv = self.base + ["--camera-on-turret", "--pan-gain", "0", "--pan-deadband", "0.5",
@@ -696,6 +696,7 @@ class CameraOnTurretServiceTests(TriggerTestCase):
                 "qnx_ai_service.py", "--preview-port", "0", "--arduino-port", "/dev/ser1",
                 "--servo-reversed", "--trigger-udp-port", "8767", "--trigger-from", LAPTOP[0],
                 "--camera-on-turret", "--no-search", "--pan-mode", "predictive",  # Coast-then-home path; search: tests/test_control.py.
+                "--pan-lost-hold", "0", "--pan-return-speed", "60",  # The old glide: no hold, 60 deg/s.
                 "--face-confirm-frames", "1", "--face-dropout-frames", "0",  # Debounce: FaceConfirmTests.
             ]),
             patch.object(qnx_ai_service, "TFLiteFaceGazeDetector", return_value=detector),

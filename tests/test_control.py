@@ -580,7 +580,7 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(pan.state, "tracking")
 
     def test_lost_face_coasts_first_then_searches_and_laptop_off_glides_home(self) -> None:
-        pan = PanTracker(65, 115, 90, search_speed=60, coast_s=0.3)
+        pan = PanTracker(65, 115, 90, search_speed=60, coast_s=0.3, lost_hold_s=0, return_speed=60)
         pan.update(0.5, now=0.0)
         states = []
         for k in range(1, 8):
@@ -881,30 +881,31 @@ class ControlModeServiceTests(unittest.TestCase):
         face = FaceBox(300, 220, 340, 260, 0.9)  # image centre
         sent, states = self.run_service([
             (None, [], False),        # 0: no laptop -> home, light off
-            (0.8, [], False),         # 1: laptop only -> fallback: toward map(0.8) = 102, light ON
+            (0.8, [], False),         # 1: laptop only -> fallback, light ON; starts where it points (90)
             (0.8, [face], False),     # 2: turret face -> tracking
             (0.8, [], False),         # 3: face lost -> coasting (0.3 s), light stays on
             (0.8, [], False),         # 4
             (0.8, [], False),         # 5
             (0.8, [], False),         # 6: coast over (at 6 or 7: float time) -> fallback
-            (0.8, [], False),         # 7: fallback at 102
-            (0.2, [], False),         # 8: the peeper moves left: map(0.2) = 78, smoothed
+            (0.8, [], False),         # 7: fallback, still at 90: the entry offset decays over 1 s
+            (0.2, [], False),         # 8: the laptop switches peeper: map(0.2) = 78, a damped glide
             (0.2, [], False),         # 9
             (0.2, [], False),         # 10
             (0.2, [face], False),     # 11: face again -> tracking
             (False, [], False),       # 12: laptop sees no peeper -> usual coast then home, light off
         ], [[0.0, 70], [1.0, 110]])
-        self.assertEqual(sent[:3], [(False, 90), (False, 90), (True, 102)])  # 12 deg = 120 deg/s * 0.1 s
+        # Changed with the smooth fallback: no 12-degree jump on entry (the old test pinned it).
+        self.assertEqual(sent[:3], [(False, 90), (False, 90), (True, 90)])
         self.assertEqual(states[:4], ["home", "fallback", "tracking", "coasting"])
         self.assertEqual(states[-2:], ["tracking", "coasting"])
         self.assertEqual(states[7:11], ["fallback"] * 4)
         self.assertTrue(all(active for active, _yaw in sent[2:13]))  # on from fallback to the face
         self.assertFalse(sent[13][0])                               # laptop inactive: light off
-        self.assertEqual(sent[8], (True, 102))
+        self.assertEqual(sent[8], (True, 90))
         yaws = [yaw for _active, yaw in sent[9:12]]
-        steps = [b - a for a, b in zip([102] + yaws, yaws)]
-        self.assertTrue(all(-12 <= step < 0 for step in steps), yaws)  # heading for 78, rate-limited
-        self.assertGreater(yaws[-1], 78)  # smoothed (tau 0.25 s): not there in three frames
+        steps = [b - a for a, b in zip([90] + yaws, yaws)]
+        self.assertTrue(all(-12 <= step < 0 for step in steps), yaws)  # heading for 78, capped at 120 deg/s
+        self.assertGreater(yaws[-1], 78)  # a glide: not there in three frames
 
     def test_learner_gets_face_count_match_and_turret_flags(self) -> None:
         face, other = FaceBox(300, 220, 340, 260, 0.9), FaceBox(500, 220, 540, 260, 0.9)
