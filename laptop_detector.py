@@ -359,7 +359,7 @@ class LaptopDetector:
                 extra={"faces": [face_status(face, track, now) for face, track in zip(faces, tracks)],
                        "fps": self.fps(), "peeper_id": result.peeper_id,
                        "turret_on": self.turret_on, "docs_enabled": docs_enabled,
-                       "peeper_mode": self.peeper_mode, "screen_switch": self.screen_switch,
+                       "settings": {"peeper_mode": self.peeper_mode, "screen_switch": self.screen_switch},
                        "docs_available": bool(self.action.enabled), "docs_fired": self._docs_latched},
             )
         return decision, peeper

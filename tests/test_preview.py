@@ -13,7 +13,7 @@ from medusa.preview import PreviewServer, RuntimeSettings, parse_settings
 class SettingsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.settings = RuntimeSettings()
-        self.preview = PreviewServer(0, self.settings)
+        self.preview = PreviewServer(0, self.settings, host="127.0.0.1")  # "" costs ~5 s of getfqdn
         self.preview.start()
         self.addCleanup(self.preview.stop)
         self.port = self.preview.server.server_port
@@ -49,7 +49,7 @@ class SettingsTests(unittest.TestCase):
                 self.assertIn("Content-Type", response.getheader("Access-Control-Allow-Headers"))
 
     def test_without_settings_the_endpoint_does_not_exist(self) -> None:
-        plain = PreviewServer(0)
+        plain = PreviewServer(0, host="127.0.0.1")
         plain.start()
         self.addCleanup(plain.stop)
         self.assertEqual(self.post("/settings", {"screen_switch": True}, plain.server.server_port)[0], 404)

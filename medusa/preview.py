@@ -94,7 +94,7 @@ class PreviewServer:
     With ``settings`` it also takes POST /settings (see parse_settings), answering 202.
     """
 
-    def __init__(self, port: int, settings: RuntimeSettings | None = None) -> None:
+    def __init__(self, port: int, settings: RuntimeSettings | None = None, host: str = "") -> None:
         self.state = PreviewState()
         state = self.state
 
@@ -171,7 +171,7 @@ class PreviewServer:
                 except ConnectionError:
                     return
 
-        self.server = ThreadingHTTPServer(("", port), Handler)
+        self.server = ThreadingHTTPServer((host, port), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     def start(self) -> None:

@@ -349,8 +349,9 @@ class RuntimeSettingsTests(unittest.TestCase):
 
     def test_defaults_are_reported(self):
         self.frames(1, [USER])
-        self.assertEqual((self.extra()["peeper_mode"], self.extra()["screen_switch"],
-                          self.extra()["docs_available"], self.extra()["docs_fired"]), ("two", True, True, False))
+        self.assertEqual(self.extra()["settings"], {"peeper_mode": "two", "screen_switch": True})
+        self.assertEqual((self.extra()["docs_available"], self.extra()["docs_fired"]), (True, False))
+        json.dumps(self.extra())
         self.assertIsNotNone(self.detector.user_id)
 
     def test_one_person_mode_lets_a_lone_face_trigger_and_back_to_two_drops_it(self):
@@ -358,13 +359,13 @@ class RuntimeSettingsTests(unittest.TestCase):
         self.settings.request({"peeper_mode": "one"})
         self.assertEqual(self.detector.tracker.config.min_faces, 2)  # nothing applied until the next frame
         self.assertTrue(self.frames(ENTER_FRAMES, [USER]).active)
-        self.assertEqual((self.detector.tracker.config.min_faces, self.extra()["peeper_mode"]), (1, "one"))
+        self.assertEqual((self.detector.tracker.config.min_faces, self.extra()["settings"]["peeper_mode"]), (1, "one"))
         self.assertIsNone(self.detector.user_id)  # no USER label in one-person mode
         self.settings.request({"peeper_mode": "two"})
         decision = self.frames(1, [USER])  # the lone user was the peeper: dropped at once, no stale lock
         self.assertFalse(decision.active)
         self.assertIsNone(self.detector.tracker.peeper_id)
-        self.assertEqual(self.extra()["peeper_mode"], "two")
+        self.assertEqual(self.extra()["settings"]["peeper_mode"], "two")
         self.assertEqual(self.detector.tracker.config.enter_s, 0.5)  # only min_faces changed
 
     def test_screen_switch_off_never_switches_and_on_restores_the_rule(self):
@@ -372,7 +373,7 @@ class RuntimeSettingsTests(unittest.TestCase):
         self.frames(ENTER_FRAMES + 5, [USER, PEEPER])
         self.assertTrue(self.detector.active)
         self.assertEqual(self.switch.call_count + self.browser.call_count, 0)
-        self.assertEqual((self.extra()["screen_switch"], self.extra()["docs_enabled"]), (False, False))
+        self.assertEqual((self.extra()["settings"]["screen_switch"], self.extra()["docs_enabled"]), (False, False))
         self.frames(AWAY_FRAMES, [USER])
         self.settings.request({"screen_switch": True})
         self.frames(ENTER_FRAMES, [USER, PEEPER])
