@@ -688,7 +688,7 @@ class CameraOnTurretServiceTests(TriggerTestCase):
             "N,750,870,0,9",
             "N,840,880,0,10",
             "N,900,890,0,11",
-            "M,90,89,0,12",  # safe_stop at shutdown
+            "M,90,90,0,12",  # safe_stop at shutdown: exactly home, not a smoothed step toward it
         ])
         camera.release.assert_called_once()
 

@@ -27,6 +27,7 @@ from medusa.trigger import LaptopTrigger, PanTracker
 
 INO = Path(__file__).resolve().parent.parent / "arduino" / "medusa_controller" / "medusa_controller.ino"
 LAPTOP = ("172.20.10.4", 50000)
+NO_FRAME, RAISE = object(), object()  # ControlModeServiceTests script markers
 
 
 class FakeSerial:
@@ -173,8 +174,8 @@ class ControlTickTests(unittest.TestCase):
         self.loop.tick(1.0)
         self.assertEqual((self.loop.status.armed, self.loop.status.pan, self.loop.status_at), (True, 100.0, 1.0))
         self.assertEqual(self.loop.snapshot(1.2)["arduino"],
-                         {"link_ok": True, "armed": True, "gate_closed": None, "pan": 100.0, "tilt": 90.0,
-                          "age_s": 0.2})  # A 5-field S line: the gate is unknown.
+                         {"link_ok": True, "armed": True, "parking": False, "gate_closed": None, "pan": 100.0,
+                          "tilt": 90.0, "age_s": 0.2})  # A 5-field S line: the gate is unknown.
         self.assertEqual(self.loop.snapshot(1.6)["arduino"]["link_ok"], False)
 
     def test_each_tick_forwards_the_actual_angle(self) -> None:
@@ -363,7 +364,8 @@ class HttpContractTests(unittest.TestCase):
         self.assertLessEqual(CONTRACT_KEYS, set(data))
         self.assertIn(data["state"], ("SAFE", "ACTIVE"))
         self.assertEqual(data["safe_reason"], "no AI target")
-        self.assertEqual(set(data["arduino"]), {"link_ok", "armed", "gate_closed", "pan", "tilt", "age_s"})
+        self.assertEqual(set(data["arduino"]),
+                         {"link_ok", "armed", "parking", "gate_closed", "pan", "tilt", "age_s"})
         self.assertEqual((data["arduino"]["armed"], data["arduino"]["pan"]), (True, 100.0))
         self.assertEqual(set(data["stress"]) >= {"running", "seconds_left"}, True)
         for key in ("loop_hz", "period_ms_mean", "jitter_ms_p99", "period_ms_max"):
@@ -616,10 +618,11 @@ class FirmwareStatusTests(unittest.TestCase):
     def test_firmware_sends_s_lines_every_100_ms_in_the_parsed_format(self) -> None:
         source = INO.read_text()
         self.assertIn("const unsigned long STATUS_PERIOD_MS = 100;", source)
-        self.assertIn('"S,%d,%ld,%ld,%lu,%d\\n"', source)
+        self.assertIn('"S,%d,%ld,%ld,%lu,%d,%d\\n"', source)
+        self.assertIn("parking ? 1 : 0);", source)
         self.assertIn("Serial1.print(status);", source)
-        status = parse_status_line("S,%d,%ld,%ld,%lu,%d" % (1, 1015, 900, 4294967295, 1))
-        self.assertEqual((status.seq, status.gate_closed), (4294967295, True))
+        status = parse_status_line("S,%d,%ld,%ld,%lu,%d,%d" % (1, 1015, 900, 4294967295, 1, 0))
+        self.assertEqual((status.seq, status.gate_closed, status.parking), (4294967295, True, False))
 
 
 class ControlFlagTests(unittest.TestCase):
@@ -659,7 +662,9 @@ class ControlModeServiceTests(unittest.TestCase):
         """Run qnx_ai_service over ``script``; return (sent (active, yaw) packets, tracker states).
 
         Each frame is (laptop, turret faces, send a disarmed S status first?), with laptop
-        None (no packet), False (an inactive packet) or the laptop's target_x (active).
+        None (no packet), False (an inactive packet) or the laptop's target_x (active), and
+        turret faces NO_FRAME (camera.read fails) or RAISE (the face model raises).
+        Every packet, with its pitch, is kept in ``self.packets``.
         """
         receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.addCleanup(receiver.close)
@@ -691,7 +696,7 @@ class ControlModeServiceTests(unittest.TestCase):
                                               "pan": 90.0, "tilt": 90.0, "t": self.clock.now}).encode(),
                                   ("127.0.0.1", port))
                 time.sleep(0.05)
-            return True, frame
+            return _faces is not NO_FRAME, frame
 
         def recvfrom(_size):
             if pending:
@@ -710,7 +715,13 @@ class ControlModeServiceTests(unittest.TestCase):
         camera.read.side_effect = read
         cv2 = SimpleNamespace(VideoCapture=Mock(return_value=camera), error=RuntimeError)
         detector = Mock()
-        detector.face_detector.detect.side_effect = lambda _frame: script[index["i"]][1]
+        def detect(_frame):
+            faces = script[index["i"]][1]
+            if faces is RAISE:
+                raise RuntimeError("TFLite invoke failed")
+            return faces
+
+        detector.face_detector.detect.side_effect = detect
         real_update = PanTracker.update
 
         def update(pan, *args, **kwargs):
@@ -744,7 +755,51 @@ class ControlModeServiceTests(unittest.TestCase):
             except BlockingIOError:
                 break
         self.assertTrue(all(p["type"] == "medusa-target" for p in packets))
+        self.packets = packets
         return [(p["active"], p["yaw"]) for p in packets], states
+
+    def test_camera_frame_failure_and_inference_error_command_home_exactly(self) -> None:
+        face = FaceBox(480, 100, 520, 140, 0.9)  # right of and above centre: yaw and pitch leave home
+        _sent, states = self.run_service([
+            (0.8, [face], False),     # 1: tracking, light on
+            (0.8, [face], False),     # 2
+            (0.8, NO_FRAME, False),   # 3: camera frame fails -> home, light off
+            (0.8, [face], False),     # 4: tracking again
+            (0.8, [face], False),     # 5
+            (0.8, RAISE, False),      # 6: the face model raises -> home, light off
+        ], [[0.5, 90]])
+        angles = [(p["active"], p["yaw"], p["pitch"]) for p in self.packets]
+        home = (False, 90.0, 90.0)  # default --servo-home and --tilt-home
+        self.assertEqual(angles[0], home)  # startup safe_stop
+        for k in (1, 2, 4, 5):
+            with self.subTest(frame=k):
+                self.assertTrue(angles[k][0])
+                self.assertNotEqual(angles[k][1:], home[1:])  # aimed away from home
+        self.assertEqual(angles[3], home)   # camera fault: exactly home, not a smoothed step
+        self.assertEqual(angles[6], home)   # inference error: exactly home
+        self.assertEqual(angles[7], home)   # shutdown
+        self.assertEqual(len(angles), 8)
+        self.assertEqual(states, ["tracking"] * 4)  # the error frames never reach the tracker
+
+    def test_error_home_uses_the_configured_homes(self) -> None:
+        face = FaceBox(480, 100, 520, 140, 0.9)
+        with redirect_stderr(io.StringIO()):  # the test map's setup does not match: discarded, logged
+            self.run_service([(0.8, [face], False), (0.8, NO_FRAME, False), (0.8, [face], False),
+                              (0.8, RAISE, False)], [[0.5, 90]],
+                             ["--servo-min", "0", "--servo-max", "70", "--servo-home", "0",
+                              "--tilt-min", "55", "--tilt-max", "125", "--tilt-home", "90"])
+        angles = [(p["active"], p["yaw"], p["pitch"]) for p in self.packets]
+        self.assertEqual([angles[k] for k in (0, 2, 4, 5)], [(False, 0.0, 90.0)] * 4)
+        self.assertTrue(angles[1][0] and angles[3][0])
+        self.assertNotEqual(angles[1][1:], (0.0, 90.0))
+
+    def test_fallback_still_aims_from_the_laptop_without_errors(self) -> None:
+        # No error: the turret camera merely loses the face, so laptop-guided fallback aims (unchanged).
+        face = FaceBox(300, 220, 340, 260, 0.9)
+        sent, states = self.run_service([(0.8, [face], False)] + [(0.8, [], False)] * 6,
+                                        [[0.0, 70], [1.0, 110]])
+        self.assertIn("fallback", states)
+        self.assertTrue(all(active for active, _yaw in sent[1:8]))
 
     def test_without_a_usable_map_search_keeps_the_light_off_and_disarm_resets(self) -> None:
         face = FaceBox(300, 220, 340, 260, 0.9)  # image centre

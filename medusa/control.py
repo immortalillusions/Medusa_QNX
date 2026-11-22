@@ -6,14 +6,17 @@ priority (QNX: ``on -p 21 python3 -u medusa_control.py ...``; every thread it
 starts inherits that priority) so the Arduino heartbeat never depends on the
 AI loop. Each tick it:
 
-1. reads the firmware's ``S,<armed>,<pan_x10>,<tilt_x10>,<seq>[,<gate>]`` status
-   lines (gate 1: kill gate closed, servo power on; older firmware sends no gate;
-   latest wins; anything else, such as the Zephyr boot banner, is ignored);
+1. reads the firmware's ``S,<armed>,<pan_x10>,<tilt_x10>,<seq>[,<gate>[,<parking>]]``
+   status lines (gate 1: kill gate closed, servo power on; parking 1: the firmware
+   lost the heartbeat while armed and is gliding home before it goes limp; older
+   firmware sends neither; latest wins; anything else, such as the Zephyr boot
+   banner, is ignored);
 2. drains ``medusa-target`` packets from the AI process (latest wins);
 3. sends ``N,yaw_x10,pitch_x10,led,seq`` (tenths of a degree) with the AI's
    target while it is fresh and the kill gate is not reported open, otherwise an
-   ``M`` park line (home angles, LED off) that only keeps the heartbeat: the
-   firmware ignores motion while disarmed, and its servos are detached then;
+   ``M`` park line (the configured ``home`` angles, LED off): an armed turret
+   glides home on it, and a disarmed one only takes it as the heartbeat (its
+   servos are detached then);
 4. sends a ``medusa-actual`` packet back to the AI process, so its pan tracker
    can use where the turret really points.
 
@@ -58,7 +61,7 @@ WINDOW_S = 10.0
 STRESS_MAX_S = 60
 _MAX_PACKETS_PER_TICK = 64
 _MAX_LINE = 128
-_STATUS_LINE = re.compile(r"S,([01]),(-?\d{1,5}),(-?\d{1,5}),(\d{1,10})(?:,([01]))?")
+_STATUS_LINE = re.compile(r"S,([01]),(-?\d{1,5}),(-?\d{1,5}),(\d{1,10})(?:,([01])(?:,([01]))?)?")
 _COMMAND_LINE = re.compile(r"([MN]),(-?\d+),(-?\d+),(-?\d+)(?:,(\d+))?")
 
 
@@ -119,16 +122,18 @@ class ArduinoStatus:
     tilt: float
     seq: int
     gate_closed: bool | None = None  # None: a 5-field line from firmware without the kill-gate sense
+    parking: bool = False  # link lost while armed: gliding home, then limp (7-field line only)
 
 
 def parse_status_line(line: str) -> ArduinoStatus | None:
-    """``S,armed,pan_x10,tilt_x10,seq`` or the 6-field form with ``,gate`` (1 closed, 0 open)."""
+    """``S,armed,pan_x10,tilt_x10,seq``, the 6-field form with ``,gate`` (1 closed, 0 open),
+    or the 7-field form with ``,gate,parking`` (1: gliding home after a lost heartbeat)."""
     match = _STATUS_LINE.fullmatch(line.strip())
     if match is None:
         return None
-    armed, pan, tilt, seq, gate = match.groups()
+    armed, pan, tilt, seq, gate, parking = match.groups()
     return ArduinoStatus(armed == "1", int(pan) / 10, int(tilt) / 10, int(seq),
-                         None if gate is None else gate == "1")
+                         None if gate is None else gate == "1", parking == "1")
 
 
 class StatusReader:
@@ -391,6 +396,7 @@ class ControlLoop:
         return float(max(bounds[0], min(bounds[1], value)))
 
     def park_line(self) -> bytes:
+        """``M,<home yaw>,<home pitch>,0,<seq>``: the configured homes (--servo-home, --tilt-home)."""
         return f"M,{self.home_yaw},{self.home_pitch},0,{self.sequence}\n".encode("ascii")
 
     def target_fresh(self, now: float) -> bool:
@@ -448,11 +454,14 @@ class ControlLoop:
         target_age = None if target_at is None else round(now - target_at, 3)
         fresh = self.target_fresh(now)
         armed = bool(link_ok and status and status.armed)
+        parking = bool(link_ok and status and status.parking)
         gate_closed = status.gate_closed if link_ok and status else None
         if not link_ok:
             reason = "Arduino link lost" if status_at is not None else "no Arduino status yet"
         elif gate_closed is False:
             reason = "kill gate open"
+        elif parking:
+            reason = "returning home after link loss"
         elif not armed:
             reason = "turret disarmed"
         elif target is None:
@@ -470,7 +479,7 @@ class ControlLoop:
             "target_age_s": target_age,
             "ai_alive": target_age is not None and target_age < AI_ALIVE_S,
             "arduino": {
-                "link_ok": link_ok, "armed": armed, "gate_closed": gate_closed,
+                "link_ok": link_ok, "armed": armed, "parking": parking, "gate_closed": gate_closed,
                 "pan": status.pan if status else None, "tilt": status.tilt if status else None,
                 "age_s": None if status_at is None else round(now - status_at, 3),
             },
@@ -616,7 +625,8 @@ class ControlClient:
         self._send(active, yaw, pitch)
 
     def safe_stop(self) -> None:
-        self.send(False, None)
+        """Home on both axes, light off: exactly the configured homes, not a smoothed step toward them."""
+        self._send(False, self.mapper.park(), self.tilt_mapper.park())
 
     def poll_actual(self) -> ActualStatus | None:
         """Latest medusa-actual whose S status is fresh, else None (the tracker falls back to its model)."""

@@ -31,10 +31,11 @@ negative side to the 2N2222A collector. Check the transistor's pinout before
 powering it.
 
 The button uses Arduino `INPUT_PULLUP`: do not connect it to 5 V. The built-in
-Arduino LED is on while armed and off while disarmed. At boot, after a button
-press to disarm, or after a 300 ms heartbeat timeout, Medusa is disarmed:
-the servo centres, the LED turns off, and QNX commands are ignored until the
-button is pressed again.
+Arduino LED is on while armed and off while disarmed. At boot or after a button
+press to disarm, Medusa is disarmed: the servos stop where they are and go limp,
+the LED turns off, and QNX commands are ignored until the button is pressed
+again. After a 300 ms heartbeat timeout while armed, the servos first glide home
+(at most 2 s), then go limp the same way.
 
 ## 4. Pi connections
 

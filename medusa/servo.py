@@ -36,3 +36,8 @@ class ServoMapper:
         yaw = round(max(self.minimum, min(self.maximum, self._last_yaw)))
         return yaw, active
 
+    def park(self) -> int:
+        """Home, exactly: forget the smoothing so the next command also starts from home."""
+        self._last_yaw = None
+        return self.home
+

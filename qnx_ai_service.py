@@ -264,31 +264,39 @@ def run_laptop_trigger(args, camera, detector, preview, arduino) -> int:
             print(f"Medusa cannot start safely: laptop trigger port {args.trigger_udp_port} "
                   f"unavailable: {error}", file=sys.stderr)
             return 2
+        def go_home(reason: str) -> None:
+            # An error on the Pi (no camera frame, the face model failed) is not a brief
+            # detection drop: forget the target and command home now (the firmware eases there).
+            confirm.reset()
+            matcher.reset()
+            if pan:
+                pan.reset()
+            if arduino:
+                arduino.safe_stop()
+            if preview:
+                preview.state.update_status(False, reason,
+                                            extra=_trigger_status(trigger, laptop_active, None, pan,
+                                                                  fps=rate.fps(), learned_points=(
+                                                                      handoff.learned_points
+                                                                      if handoff else None),
+                                                                  matcher=matcher, learner=handoff))
+
         while True:
             ok, frame = camera.read()
             trigger.poll()
             laptop_active, laptop_reason = trigger.status()
             if not ok:
-                confirm.reset()
-                matcher.reset()
-                if pan:
-                    pan.reset()  # A camera fault is not a brief detection drop: park, matching safe_stop.
-                if arduino:
-                    arduino.safe_stop()
-                if preview:
-                    preview.state.update_status(False, "camera frame unavailable",
-                                                extra=_trigger_status(trigger, laptop_active, None, pan,
-                                                                      fps=rate.fps(), learned_points=(
-                                                                          handoff.learned_points
-                                                                          if handoff else None),
-                                                                      matcher=matcher, learner=handoff))
+                go_home("camera frame unavailable")
                 continue
             rate.tick()
             height, width = frame.shape[:2]
             try:
                 boxes = detector.face_detector.detect(frame)
             except (RuntimeError, ValueError, cv2.error):
-                boxes = None
+                if preview:
+                    preview.state.update_frame(frame)
+                go_home("AI inference unavailable")
+                continue
             laptop_x = _laptop_x(trigger, laptop_active)
             pan_error = learned = None
             if pan:
@@ -435,11 +443,13 @@ def main() -> int:
                         preview.state.update_status(False, "camera frame unavailable")
                     continue
                 boxes = None
+                inference_failed = False
                 try:
                     boxes = detector.face_detector.detect(frame)
                     decision = selector.update(detector.detect(frame, boxes=boxes))
                 except (RuntimeError, ValueError, cv2.error):
                     decision = SnooperDecision(active=False, reason="AI inference unavailable")
+                    inference_failed = True
                 # Count clear frames at the camera, where missed UDP packets cannot affect the streak.
                 if boxes is not None and len(boxes) < 2:
                     clear_frames = min(clear_frames + 1, SCENE_CLEAR_FRAMES)
@@ -448,7 +458,10 @@ def main() -> int:
                 send(events, target, decision.active, decision.target_x, decision.reason,
                      scene_clear=clear_frames == SCENE_CLEAR_FRAMES)
                 if arduino:
-                    arduino.send(decision.active, decision.target_x, decision.target_y)
+                    if inference_failed:
+                        arduino.safe_stop()  # An error: exactly home, not a smoothed step toward it.
+                    else:
+                        arduino.send(decision.active, decision.target_x, decision.target_y)
                 if preview:
                     snoopers = select_snoopers(boxes) if boxes is not None else []
                     closest_snooper = snoopers[0] if snoopers else None

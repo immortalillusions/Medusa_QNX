@@ -34,12 +34,16 @@ def function_body(source: str, signature: str) -> str:
 
 
 class StatusLineGateTests(unittest.TestCase):
-    def test_five_and_six_field_lines(self) -> None:
+    def test_five_six_and_seven_field_lines(self) -> None:
         self.assertIsNone(parse_status_line("S,1,450,900,7").gate_closed)  # old firmware: unknown
         closed, opened = parse_status_line("S,1,450,900,8,1\r"), parse_status_line("S,0,-12,900,9,0")
         self.assertEqual((closed.armed, closed.pan, closed.seq, closed.gate_closed), (True, 45.0, 8, True))
         self.assertEqual((opened.armed, opened.pan, opened.gate_closed), (False, -1.2, False))
-        for line in ("S,1,450,900,8,2", "S,1,450,900,8,", "S,1,450,900,8,1,1"):
+        self.assertFalse(closed.parking or opened.parking)  # no parking field: not parking
+        parking, idle = parse_status_line("S,0,350,900,10,1,1"), parse_status_line("S,1,350,900,11,1,0")
+        self.assertEqual((parking.armed, parking.gate_closed, parking.parking), (False, True, True))
+        self.assertEqual((idle.armed, idle.parking), (True, False))
+        for line in ("S,1,450,900,8,2", "S,1,450,900,8,", "S,1,450,900,8,1,2", "S,1,450,900,8,1,1,1"):
             with self.subTest(line=line):
                 self.assertIsNone(parse_status_line(line))
 
@@ -98,7 +102,13 @@ class FirmwareOffMeansOffTests(unittest.TestCase):
     def test_disarm_detaches_and_never_eases_home(self) -> None:
         source = self.source
         self.assertNotIn("parkSafely", source)
-        self.assertIsNone(re.search(r"target\s*=\s*\w+\.home", source))  # nothing ever targets home
+        # Only the link-loss park targets home; disarming, detaching and arming never do.
+        homing = re.findall(r"target\s*=\s*\w+\.home", source)
+        self.assertEqual(len(homing), 2)
+        self.assertEqual(len(re.findall(r"target\s*=\s*\w+\.home", function_body(source, "void startParking("))), 2)
+        for name in ("void setArmed(", "void detachAxis(", "void attachAxis(", "void updateArmButton(",
+                     "void updateKillGate("):
+            self.assertNotIn(".home", function_body(source, name))
         disarm = function_body(source, "void setArmed(")
         self.assertIn("detachAxis(pan);", disarm)
         self.assertIn("detachAxis(tilt);", disarm)

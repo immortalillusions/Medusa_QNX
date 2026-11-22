@@ -70,11 +70,15 @@ the QNX OSS TensorFlow Lite runtime—not the full MediaPipe runtime.
    ```
 
 Before this command, upload `arduino/medusa_controller/medusa_controller.ino`
-to the UNO Q. It accepts `M,yaw,pitch,led,sequence` commands at 115200 baud and
-disarms if the heartbeat stops for 300 ms. Disarmed (boot, button, heartbeat
-loss, or the kill gate open on A2) means the servos are detached: no pulses, no
-motion, LED off. The arm button re-attaches them where they stopped, and only
-while the kill gate is closed and the heartbeat is live.
+to the UNO Q. It accepts `M,yaw,pitch,led,sequence` commands at 115200 baud.
+Disarmed on purpose (boot, button, or the kill gate open on A2) means the servos
+stop where they are and detach: no pulses, no motion, LED off. A heartbeat gap of
+300 ms while armed is an error instead: the firmware parks, gliding both axes home
+with the normal easing (status `parking` 1, armed 0, LED off), then detaches once
+home or after 2 s and stays disarmed; the button or the kill gate opening during
+the glide cuts straight to limp. The arm button re-attaches the servos where they
+stopped, and only while the kill gate is closed and the heartbeat is live. On the
+Pi, a failed camera frame or face-model error commands both axes exactly home.
 Use `--servo-reversed` if left/right movement is backwards.
 
 When the camera is clipped on the turret's pan stage, add `--camera-on-turret`
@@ -109,9 +113,13 @@ gate closed, uses a monotonic fit of the bins (`status.json`: `map_direction`,
 `medusa_control.py` owns `/dev/ser1` and runs a fixed 50 Hz loop on absolute
 deadlines: it forwards the AI's latest target while it is fresh (< 0.3 s) and
 otherwise sends a park line, so the Arduino heartbeat never depends on the AI
-loop. It reads the firmware's `S,<armed>,<pan_x10>,<tilt_x10>,<seq>,<gate>` status
-(every 100 ms on UNO Q D1 -> Pi RX pin 10; gate 1 = kill gate closed; the old
-5-field line is still accepted), sends only the park heartbeat while the gate is
+loop. The park line is `M,<--servo-home>,<--tilt-home>,0,<seq>`, so an armed turret
+glides home on it; both homes must lie inside the firmware's `PAN_*`/`TILT_*`
+ranges or the firmware rejects every park line. It reads the firmware's
+`S,<armed>,<pan_x10>,<tilt_x10>,<seq>,<gate>,<parking>` status
+(every 100 ms on UNO Q D1 -> Pi RX pin 10; gate 1 = kill gate closed; parking 1 =
+gliding home after a lost heartbeat, `control.json`: `arduino.parking`, `safe_reason`
+"returning home after link loss"; the old 5- and 6-field lines are still accepted), sends only the park heartbeat while the gate is
 open (`control.json`: `arduino.gate_closed`, `safe_reason` "kill gate open"),
 forwards the status to the AI process (UDP 8769) so the pan tracker uses the real
 angle and resets while disarmed or gated,

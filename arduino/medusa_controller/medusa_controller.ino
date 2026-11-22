@@ -5,17 +5,23 @@
 // Whole-degree M,<yaw>,<pitch>,<led>,<sequence>\n and the old M,<yaw>,<led>,<sequence>\n
 // (pitch = tilt home) are still accepted.
 // Off means off: while disarmed both servos are DETACHED (no pulses at all), so
-// they cannot move or twitch. Disarming (button, a 300 ms gap in valid commands,
-// the kill gate opening, boot) stops the axes where they are, detaches them and
-// turns the LED off; the position estimate is kept. Arming (button press, only
-// while the kill gate is closed) re-attaches both servos at that estimate, so
-// nothing jumps; only then do commands move them.
+// they cannot move or twitch. Disarming on purpose (button, the kill gate opening,
+// boot) stops the axes where they are, detaches them and turns the LED off; the
+// position estimate is kept. Arming (button press, only while the kill gate is
+// closed) re-attaches both servos at that estimate, so nothing jumps; only then do
+// commands move them.
+// Link loss is an error, not an off switch: a 300 ms gap in valid commands while
+// armed starts PARKING. The LED goes off, armed reads 0 and commands are ignored,
+// but the servos stay attached and glide home (PAN_HOME, TILT_HOME) with the
+// normal easing; once both are home, or after PARK_TIMEOUT_MS, they detach and the
+// turret is disarmed (a button press re-arms). The button or the kill gate opening
+// during parking cuts straight to limp.
 // Kill gate: KILL 1 of the kill plug feeds the servo +5 V rail, and a 3 x 10k
 // divider from that rail feeds A2 (about 1.67 V with the tab in, 0 V with it out).
 // An open gate forces a disarm and refuses to arm.
 // Status back to QNX about every 100 ms on the same UART (UNO Q D1 -> Pi RX):
-// S,<armed 0|1>,<pan_x10>,<tilt_x10>,<sequence>,<gate 1 closed|0 open>\n with the
-// eased ACTUAL axis positions in tenths of a degree. The Zephyr boot banner also
+// S,<armed 0|1>,<pan_x10>,<tilt_x10>,<sequence>,<gate 1 closed|0 open>,<parking 0|1>\n
+// with the eased ACTUAL axis positions in tenths of a degree. The Zephyr boot banner also
 // appears on D1 at reset; the Pi ignores any line that does not match.
 
 const byte SERVO_PIN = 9;
@@ -29,6 +35,7 @@ const byte KILL_SENSE_PIN = A2;
 const int PAN_MIN = 0, PAN_MAX = 70, PAN_HOME = 0;
 const int TILT_MIN = 55, TILT_MAX = 125, TILT_HOME = 90;
 const unsigned long HEARTBEAT_TIMEOUT_MS = 300;
+const unsigned long PARK_TIMEOUT_MS = 2000;  // longest glide home before going limp anyway
 const unsigned long BUTTON_DEBOUNCE_MS = 40;
 // analogRead on the arduino:zephyr core is 10-bit (0..1023) unless
 // analogReadResolution() is called, over the MCU's 3.3 V: 1.67 V reads ~517.
@@ -65,6 +72,8 @@ byte lineLength = 0;
 unsigned long lastCommandMs = 0;
 unsigned long buttonChangedMs = 0;
 bool armed = false;
+bool parking = false;  // link lost while armed: gliding home, then detach
+unsigned long parkingSinceMs = 0;
 bool lastButtonReading = HIGH;
 bool stableButtonReading = HIGH;
 unsigned long lastMotionMs = 0;
@@ -117,6 +126,7 @@ void setArmed(bool shouldArm) {
   // No live QNX heartbeat: refuse too, rather than attach for one loop and drop out.
   if (millis() - lastCommandMs > HEARTBEAT_TIMEOUT_MS) shouldArm = false;
   armed = shouldArm;
+  parking = false;  // Either way any glide home is over: armed, or detached right here.
   // The UNO Q's red LED is active-low: LOW lights it. Lit means armed.
   digitalWrite(ARM_STATUS_PIN, armed ? LOW : HIGH);
   if (armed) {
@@ -127,6 +137,23 @@ void setArmed(bool shouldArm) {
     detachAxis(tilt);
     digitalWrite(LED_PIN, LOW);
   }
+}
+
+void startParking() {
+  // The QNX heartbeat stopped while armed (control process dead, UART out): glide
+  // both axes home with the normal easing, still attached, then go limp in loop().
+  // Disarmed for everything else: commands are ignored and the status says 0.
+  armed = false;
+  parking = true;
+  parkingSinceMs = millis();
+  digitalWrite(ARM_STATUS_PIN, HIGH);  // Red LED off: a button press is needed again.
+  digitalWrite(LED_PIN, LOW);
+  pan.target = pan.home;
+  tilt.target = tilt.home;
+}
+
+bool reachedHome(const Axis& axis) {
+  return axis.position == (float)axis.home && axis.velocity == 0;
 }
 
 void updateKillGate() {
@@ -147,7 +174,8 @@ void updateKillGate() {
   if (millis() - gateDisagreeSinceMs >= (gateClosed ? GATE_OPEN_MS : GATE_CLOSE_MS)) {
     gateClosed = !gateClosed;
     gateDisagreeing = false;
-    if (!gateClosed && armed) setArmed(false);  // Closing never arms: that takes the button.
+    // No servo power: limp at once, mid-park too. Closing never arms: that takes the button.
+    if (!gateClosed && (armed || parking)) setArmed(false);
   }
 }
 
@@ -157,7 +185,8 @@ void updateArmButton() {
   if (millis() - buttonChangedMs >= BUTTON_DEBOUNCE_MS && reading != stableButtonReading) {
     stableButtonReading = reading;
     // INPUT_PULLUP means a pressed button reads LOW.
-    if (stableButtonReading == LOW) setArmed(!armed);
+    // A press while parking cuts to limp; it never re-arms mid-glide.
+    if (stableButtonReading == LOW) setArmed(parking ? false : !armed);
   }
   lastButtonReading = reading;
 }
@@ -201,8 +230,9 @@ long tenths(float degrees) {
 
 void sendStatus() {
   char status[40];
-  snprintf(status, sizeof(status), "S,%d,%ld,%ld,%lu,%d\n", armed ? 1 : 0,
-           tenths(pan.position), tenths(tilt.position), ++statusSequence, gateClosed ? 1 : 0);
+  snprintf(status, sizeof(status), "S,%d,%ld,%ld,%lu,%d,%d\n", armed ? 1 : 0,
+           tenths(pan.position), tenths(tilt.position), ++statusSequence, gateClosed ? 1 : 0,
+           parking ? 1 : 0);
   Serial1.print(status);
 }
 
@@ -234,9 +264,12 @@ void loop() {
   }
 
   if (armed && millis() - lastCommandMs > HEARTBEAT_TIMEOUT_MS) {
-    // A lost QNX heartbeat requires a physical button press before movement
-    // can resume; this prevents a surprise re-arm after a restart.
-    setArmed(false);
+    // A lost QNX heartbeat: glide home, then disarm. A physical button press is
+    // needed before movement can resume; this prevents a surprise re-arm after a restart.
+    startParking();
+  }
+  if (parking && ((reachedHome(pan) && reachedHome(tilt)) || millis() - parkingSinceMs >= PARK_TIMEOUT_MS)) {
+    setArmed(false);  // Home (or out of time): detach and go limp.
   }
 
   if (millis() - lastMotionMs >= MOTION_STEP_MS) {

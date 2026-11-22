@@ -60,7 +60,9 @@ class ArduinoController:
         os.write(self.fd, format_n_line(yaw, pitch, active, self.sequence))
 
     def safe_stop(self) -> None:
-        self.send(False, None)
+        """M,<home>,<tilt home>,0,<seq>: exactly home on both axes, light off (no smoothing)."""
+        self.sequence += 1
+        os.write(self.fd, f"M,{self.mapper.park()},{self.tilt_mapper.park()},0,{self.sequence}\n".encode("ascii"))
 
     def poll_actual(self):
         """Direct mode has no status feedback (the port is write-only): the tracker uses its model."""
