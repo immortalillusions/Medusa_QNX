@@ -148,11 +148,10 @@ main {
 .toggle-track {
   position: relative; width: 2.75rem; height: 1.5rem; flex: none;
   border-radius: 999px; background: var(--inset); border: 1px solid var(--line-strong);
-  transition: background 0.15s, border-color 0.15s;
 }
 .toggle-knob {
   position: absolute; top: 0.18rem; left: 0.18rem; width: 1rem; height: 1rem;
-  border-radius: 50%; background: var(--muted); transition: transform 0.15s, background 0.15s;
+  border-radius: 50%; background: var(--muted);
 }
 .toggle-on .toggle-track { background: var(--accent); border-color: var(--accent); }
 .toggle-on .toggle-knob { transform: translateX(1.25rem); background: var(--bg); }

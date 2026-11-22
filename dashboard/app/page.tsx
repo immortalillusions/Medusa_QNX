@@ -508,8 +508,8 @@ function TopBar({ laptop, turret, control, controlUrl }: {
   const linkAge = turret.connected ? turret.status.laptop_age_s : undefined;
   const arduino = c?.arduino;
 
-  const modeValue = s.pending?.peeper_mode ?? s.settings?.peeper_mode;
-  const switchValue = s.pending?.screen_switch ?? s.settings?.screen_switch;
+  const modeValue = s.settings?.peeper_mode;
+  const switchValue = s.settings?.screen_switch;
   const disabled = !!s.unavailable || s.pending !== null;
 
   return <header className="topbar">
@@ -666,13 +666,18 @@ function Metrics({ laptop, turret, control, latency }: {
   const sysNote = !c ? "control loop offline" : !sys ? "needs control.json system stats" : undefined;
 
   const bar = (v: unknown) => (isNum(v) ? `${Math.max(0, Math.min(100, v))}%` : "0%");
+  // Process shares may be per-core percentages (AI on four cores can read 200%+) while the total
+  // is machine-wide; squeeze the split into the total so the bar never overflows.
+  const split = (isNum(ctl) ? ctl : 0) + (isNum(ai) ? ai : 0);
+  const squeeze = isNum(cpu) && split > cpu && split > 0 ? cpu / split : 1;
+  const perCore = (isNum(ctl) && ctl > 100) || (isNum(ai) && ai > 100);
 
   return <section className="metrics" aria-label="Demo metrics">
     <Tile label="Detection → docs switch" value={docsValue} unit={docsUnit} sub={docsSub} tone={docs ? "ok" : "idle"} />
     <Tile label="Detection → turret aiming" value={aimValue} unit={aimUnit} tone={aim ? "ok" : "idle"}
       sub={aim ? `approx, polled · ${aim.n} event${aim.n === 1 ? "" : "s"}` : "approx, polled · waiting for a peeper"} />
     <Tile label="Centring error" value={isNum(panError) ? Math.abs(panError).toFixed(1) : "—"} unit="°" tone={errTone}
-      sub={isNum(panError) ? `pan ${fmt(t?.pan_angle, 1, "°")} · ${panError >= 0 ? "right" : "left"} of target` : t ? "no target" : "turret offline"} />
+      sub={isNum(panError) ? `pan ${fmt(t?.pan_angle, 1, "°")} · signed ${panError.toFixed(1)}°` : t ? "no target" : "turret offline"} />
     <Tile label="Laptop detector" value={fmt(laptopFps, 1)} unit="fps" tone={!l ? "idle" : "ok"}
       sub={l ? `${l.face_count ?? 0} face${l.face_count === 1 ? "" : "s"} in view` : "offline"} />
     <Tile label="Turret AI (QNX)" value={fmt(turretFps, 1)} unit="fps"
@@ -681,17 +686,17 @@ function Metrics({ laptop, turret, control, latency }: {
     <Tile label="Control loop period" value={fmt(c?.period_ms_mean, 2)} unit="ms" tone={c ? "ok" : "idle"}
       sub={c ? `target ${fmt(nominal, 1, " ms")} · ${fmt(c.loop_hz, 1, " Hz")}` : "control loop offline"} />
     <Tile label="p99 jitter" value={fmt(jitter, 2)} unit="ms"
-      tone={!isNum(jitter) ? "idle" : jitter > 10 ? "bad" : jitter > 5 ? "warn" : "ok"}
+      tone={!isNum(jitter) ? "idle" : jitter > 5 ? "warn" : "ok"}
       sub={c ? `worst period ${fmt(c.period_ms_max, 1, " ms")}` : "control loop offline"} />
     <Tile label="Missed deadlines" value={fmt(missed, 0)}
       tone={!isNum(missed) ? "idle" : missed > 0 ? "warn" : "ok"}
       sub={c ? (isNum(c.missed_deadlines_total) ? `recent window · ${c.missed_deadlines_total} since boot` : "recent window") : "control loop offline"} />
     <Tile label="Pi CPU" value={fmt(cpu, 0)} unit="%" tone={!isNum(cpu) ? "idle" : cpu > 90 ? "warn" : "ok"}
-      sub={sysNote ?? `control ${fmt(ctl, 0, "%")} · AI ${fmt(ai, 0, "%")}`}>
+      sub={sysNote ?? `control ${fmt(ctl, 0, "%")} · AI ${fmt(ai, 0, "%")}${perCore ? " (per core)" : ""}`}>
       <div className="cpu-bar" aria-hidden>
-        <span className="cpu-ctl" style={{ width: bar(ctl) }} />
-        <span className="cpu-ai" style={{ width: bar(ai) }} />
-        <span className="cpu-rest" style={{ width: bar(isNum(cpu) ? cpu - (ctl ?? 0) - (ai ?? 0) : 0) }} />
+        <span className="cpu-ctl" style={{ width: bar(isNum(ctl) ? ctl * squeeze : 0) }} />
+        <span className="cpu-ai" style={{ width: bar(isNum(ai) ? ai * squeeze : 0) }} />
+        <span className="cpu-rest" style={{ width: bar(isNum(cpu) ? cpu - split * squeeze : 0) }} />
       </div>
     </Tile>
     <Tile label="Memory used" value={isNum(memUsed) ? (memUsed / 1024).toFixed(2) : "—"} unit="GB"
