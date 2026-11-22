@@ -6,11 +6,13 @@ venv/
 *.egg-info/
 
 # Next.js dashboard build/dependencies
-dashboard/node_modules/
-dashboard/.next/
+node_modules/
+.next/
+*.tsbuildinfo
 
-# camera captures
+# camera captures and logs
 captures/
+*.log
 /build/qnx/
 /qnx/libmedusa_camera.so
 
