@@ -27,7 +27,10 @@ type Control = {
   missed_deadlines?: number;
   target_age_s?: number;
   ai_alive?: boolean;
-  arduino?: { link_ok?: boolean; armed?: boolean; pan?: number; tilt?: number; age_s?: number };
+  arduino?: {
+    link_ok?: boolean; armed?: boolean; parking?: boolean; gate_closed?: boolean | null;
+    pan?: number; tilt?: number; age_s?: number;
+  };
   safe_reason?: string;
   stress?: { running?: boolean; seconds_left?: number };
 };
@@ -229,6 +232,8 @@ function SafetyPanel({ turret, control, controlUrl }: {
   const [history, setHistory] = useState<number[]>([]);
   const [stressPending, setStressPending] = useState(false);
   const [stressError, setStressError] = useState<string | null>(null);
+  const [armPending, setArmPending] = useState(false);
+  const [armError, setArmError] = useState<string | null>(null);
 
   const sparkMetric = isNum(c?.period_ms_max) ? "period max" : "p99 jitter";
   useEffect(() => {
@@ -271,6 +276,32 @@ function SafetyPanel({ turret, control, controlUrl }: {
       setStressPending(false);
     }
   };
+  // Arm / switch off: POST /arm or /disarm queues an A line; the firmware decides (kill gate,
+  // heartbeat) and the button only ever shows what control.json's arduino fields report.
+  const armed = arduino?.armed === true;
+  const parking = arduino?.parking === true;
+  const armBlocked = !c ? "control loop offline"
+    : arduino?.link_ok !== true ? "Arduino link down"
+    : arduino.gate_closed === false ? "kill gate open: insert the tab to arm"
+    : parking ? "gliding home, then limp; arm again once it stops"
+    : null;
+  const armLabel = armPending ? "Sending…" : parking ? "Returning home…" : armed ? "Switch off" : "Arm turret";
+  const toggleArm = async () => {
+    setArmPending(true);
+    setArmError(null);
+    const request = new AbortController();
+    const timeout = window.setTimeout(() => request.abort(), 3000);
+    try {
+      const response = await fetch(`${controlUrl.url}/${armed ? "disarm" : "arm"}`, { method: "POST", signal: request.signal });
+      if (!response.ok) setArmError(`control loop refused (HTTP ${response.status})`);
+    } catch {
+      setArmError("control loop offline");
+    } finally {
+      window.clearTimeout(timeout);
+      setArmPending(false);
+    }
+  };
+
   const stressNote = stressRunning ? `${fmt(c?.stress?.seconds_left, 0, " s")} left`
     : !c ? "control loop offline" : stressError;
 
@@ -280,6 +311,12 @@ function SafetyPanel({ turret, control, controlUrl }: {
         <p className="eyebrow">SAFETY</p>
         <strong>{stateText}</strong>
         {stateReason && <small>{stateReason}</small>}
+        <div className="arm-switch">
+          <button className={armed ? "off" : undefined} onClick={toggleArm} disabled={!!armBlocked || armPending}>
+            {armLabel}
+          </button>
+          {(armBlocked || armError) && <small>{armBlocked ?? armError}</small>}
+        </div>
       </aside>
 
       <div className="lights">

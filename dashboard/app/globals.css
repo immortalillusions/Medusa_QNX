@@ -25,5 +25,6 @@ header { display:flex; justify-content:space-between; align-items:flex-start; ma
 .spark { display:block; width:100%; height:44px; background:#091014; border-radius:6px; } .spark-line { fill:none; stroke:#41d6aa; stroke-width:1.5; vector-effect:non-scaling-stroke; } .spark-nominal { stroke:#465553; stroke-dasharray:4 4; vector-effect:non-scaling-stroke; }
 .rt-stress { grid-area:stress; display:flex; flex-direction:column; align-items:flex-end; } .rt-stress button { padding:11px 16px; } .rt-stress small { margin-top:6px; }
 button:disabled { background:#26363a; color:#8ba6a1; cursor:not-allowed; } button.secondary { background:#26363a; color:#e8f0ef; }
+.arm-switch { margin-top:16px; } .arm-switch button { width:100%; padding:13px 16px; font-size:16px; } .arm-switch button.off:not(:disabled) { background:#ff5e66; color:#2a0508; } .arm-switch small { margin-top:6px; }
 .advanced summary { color:#8ba6a1; cursor:pointer; font-size:13px; } .advanced .setup { margin-top:8px; }
 @media(max-width:900px) { .safety-top { grid-template-columns:1fr; } .realtime { grid-template-columns:1fr; grid-template-areas:"head" "stats" "spark" "stress"; } .rt-stress { align-items:stretch; } }
