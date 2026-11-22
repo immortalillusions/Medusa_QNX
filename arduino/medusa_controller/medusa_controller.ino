@@ -4,6 +4,10 @@
 // with angles in tenths of a degree (925 = 92.5), each within its axis range (PAN_*/TILT_*).
 // Whole-degree M,<yaw>,<pitch>,<led>,<sequence>\n and the old M,<yaw>,<led>,<sequence>\n
 // (pitch = tilt home) are still accepted.
+// Dashboard switch: A,<1 arm|0 switch off>,<sequence>\n. A,1 arms like a button press
+// from off (still refused with the kill gate open or no live heartbeat) and does nothing
+// while armed or parking. A,0 starts the glide home while armed and does nothing while
+// parking or off. An A line is not a heartbeat: only N/M lines feed the 300 ms timeout.
 // Off means off: while disarmed both servos are DETACHED (no pulses at all), so
 // they cannot move or twitch. Disarming on purpose (button, the kill gate opening,
 // boot) stops the axes where they are, detaches them and turns the LED off; the
@@ -220,6 +224,16 @@ void updateArmButton() {
   lastButtonReading = reading;
 }
 
+void applyArmRequest(bool arm) {
+  // The dashboard's switch (A line): the button's transitions, except that it never cuts a
+  // glide home short and never arms mid-glide. setArmed() keeps its gate and heartbeat checks.
+  if (arm) {
+    if (!armed && !parking) setArmed(true);
+  } else if (armed) {
+    startParking();
+  }
+}
+
 bool inRange(const Axis& axis, int value, int scale) {
   return value >= axis.minimum * scale && value <= axis.maximum * scale;
 }
@@ -228,7 +242,8 @@ void applyCommand(char* command) {
   int yaw, pitch = TILT_HOME, led;
   int scale = 1;  // 10 for N lines (tenths of a degree)
   unsigned long sequence;
-  // Count commas to pick the format (4 = 5-field N or M line, 3 = old 4-field M line),
+  // Count commas to pick the format (4 = 5-field N or M line, 3 = old 4-field M line,
+  // 2 = A arm/switch-off line),
   // so the parse never relies on %n, whose support varies between C libraries.
   int commas = 0;
   for (char* c = command; *c; c++) if (*c == ',') commas++;
@@ -239,6 +254,11 @@ void applyCommand(char* command) {
     if (sscanf(command, "M,%d,%d,%d,%lu", &yaw, &pitch, &led, &sequence) != 4) return;
   } else if (commas == 3) {
     if (sscanf(command, "M,%d,%d,%lu", &yaw, &led, &sequence) != 3) return;
+  } else if (commas == 2 && command[0] == 'A') {
+    int arm;
+    if (sscanf(command, "A,%d,%lu", &arm, &sequence) != 2 || (arm != 0 && arm != 1)) return;
+    applyArmRequest(arm == 1);
+    return;  // Not a heartbeat: lastCommandMs is left where the last N/M line put it.
   } else {
     return;
   }

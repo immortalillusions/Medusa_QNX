@@ -76,6 +76,45 @@ class FirmwareParkingTests(unittest.TestCase):
         self.assertIn("parking ? 1 : 0);", function_body(self.source, "void sendStatus("))
 
 
+class FirmwareArmLineTests(unittest.TestCase):
+    """A,<0|1>,<seq>: the dashboard's arm / switch-off line, which is never a heartbeat."""
+
+    def setUp(self) -> None:
+        self.source = INO.read_text()
+        self.apply = function_body(self.source, "void applyCommand(")
+
+    def test_a_line_is_parsed_and_returns_before_the_heartbeat(self) -> None:
+        branch = re.search(r"\} else if \(commas == 2 && command\[0\] == 'A'\) \{(.*?)\n  \}", self.apply, re.S)
+        self.assertIsNotNone(branch)
+        body = branch.group(1)
+        self.assertIn('sscanf(command, "A,%d,%lu", &arm, &sequence) != 2 || (arm != 0 && arm != 1)', body)
+        self.assertLess(body.index("applyArmRequest(arm == 1);"), body.index("return;  // Not a heartbeat"))
+        self.assertNotIn("lastCommandMs =", body)
+        # The heartbeat stamp is still the last statement, reached only by valid N/M lines.
+        self.assertEqual(self.apply.count("lastCommandMs = millis();"), 1)
+        self.assertGreater(self.apply.index("lastCommandMs = millis();"), self.apply.index("if (armed) {"))
+        self.assertLess(self.apply.index("commas == 2"), self.apply.index("if ((led != 0"))
+
+    def test_arm_request_follows_the_state_rules(self) -> None:
+        request = function_body(self.source, "void applyArmRequest(")
+        self.assertIn("if (!armed && !parking) setArmed(true);", request)   # gate/heartbeat checks inside
+        self.assertIn("} else if (armed) {\n    startParking();", request)  # off glides home first
+        self.assertNotIn("setArmed(false)", request)  # never cuts a glide short
+        self.assertNotIn("lastCommandMs", request)
+        setarm = function_body(self.source, "void setArmed(")
+        self.assertIn("if (!gateClosed) shouldArm = false;", setarm)
+        self.assertIn("if (millis() - lastCommandMs > HEARTBEAT_TIMEOUT_MS) shouldArm = false;", setarm)
+
+    def test_button_is_unchanged_and_the_line_fits_the_buffer(self) -> None:
+        button = function_body(self.source, "void updateArmButton(")
+        self.assertIn("if (parking) setArmed(false);\n      else if (armed) startParking();\n"
+                      "      else setArmed(true);", button)
+        self.assertNotIn("applyArmRequest", button)
+        size = int(re.search(r"char line\[(\d+)\];", self.source).group(1))
+        self.assertLess(len("A,1,4294967295"), size)
+        self.assertIn("// Dashboard switch: A,<1 arm|0 switch off>,<sequence>", self.source)
+
+
 class ControlParkLineTests(unittest.TestCase):
     """The control loop's stale-target line is the configured home, which the firmware accepts."""
 
