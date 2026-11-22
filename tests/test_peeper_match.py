@@ -60,6 +60,21 @@ class ExpectedImageXTests(unittest.TestCase):
         self.assertIsNone(qnx_ai_service._expected_x(pan, None, 0.5))
         self.assertIsNone(qnx_ai_service._expected_x(None, learned, 0.5))
 
+    def test_service_expected_x_is_none_outside_the_learned_range(self) -> None:
+        # Live bug: points only at laptop_x 0.08..0.46; a peeper at 0.85 was gated out by the
+        # map's extrapolated guess, so the turret never aimed at the face it saw or learned.
+        pan = PanTracker(15, 165, 90, reversed=True)
+        learned = HandoffMap([(0.08, 102.6), (0.22, 89.3), (0.46, 66.6)], extrapolate=True, bounds=(15, 165))
+        self.assertIsNotNone(qnx_ai_service._expected_x(pan, learned, 0.30))
+        self.assertIsNotNone(qnx_ai_service._expected_x(pan, learned, 0.50))   # inside the margin
+        self.assertIsNone(qnx_ai_service._expected_x(pan, learned, 0.85))
+        self.assertIsNone(qnx_ai_service._expected_x(pan, learned, 0.01))
+        # With no expected_x the matcher takes the only face the turret sees.
+        matcher = PeeperMatcher()
+        picked = matcher.pick([face(0.6)], W, H, expected_x=qnx_ai_service._expected_x(pan, learned, 0.85),
+                              laptop_x=0.85)
+        self.assertEqual((picked_x(picked), matcher.match), (0.6, "single"))
+
 
 class MapMatchTests(unittest.TestCase):
     def test_the_face_nearest_expected_x_wins_regardless_of_size(self) -> None:
