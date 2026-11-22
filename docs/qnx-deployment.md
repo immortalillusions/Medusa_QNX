@@ -1,48 +1,101 @@
-# QNX deployment and judging checklist
+# QNX deployment
 
-## Required demo architecture
+## Take a face detection snapshot
 
-```text
-C270 fixed camera -> QNX capture -> TensorFlow Lite face + landmark models
-                    -> sustained snooper selector -> Arduino safety controller
-                    -> local event -> laptop opens the blank document
+Use a Raspberry Pi 5 running a QNX image with USB camera support, such as the
+QNX 8.0.5 Quick Start Target Image. Plug in the webcam and copy this checkout
+to the Pi, including the files in `qnx/`. The standard Pi 5 image assigns the
+USB camera to Sensor Framework unit 5. The QNX workshop verified USB capture
+with the Logitech C270 and C920. [QNX camera setup](https://qnx.com/developers/docs/qnxeverywhere/com.qnx.doc.target_images/topic/qsti/next-steps.html#camera) · [QNX AI workshop](https://github.com/qnx/QNX-AI-workshop#camera)
+
+To copy the Pi files from Windows, run these commands in PowerShell from the
+local repo directory and replace `PI_IP` with the Pi's address. QNX documents
+the `hmac-sha2-256` setting for Windows transfers. [QNX file transfer instructions](https://qnx.com/developers/docs/qnxeverywhere/com.qnx.doc.target_images/topic/qsti/next-steps.html#adding-binaries)
+
+```powershell
+ssh -o "MACs=hmac-sha2-256" qnxuser@PI_IP "mkdir -p Medusa_QNX"
+scp -o "MACs=hmac-sha2-256" -r capture_face.py qnx_ai_service.py medusa_control.py medusa qnx "qnxuser@PI_IP:Medusa_QNX/"
 ```
 
-The Pi is the AI host. Frames stay on the Pi; the laptop receives only an
-`active`/`inactive` privacy event.
+On the Pi, install the Python runtime packages and development headers from
+the QNX APK repositories configured for the image. The camera headers
+include `screen/screen.h`, provided by `qnx-screen-dev`. This is a build
+dependency for headless setups too. The build uses a native C compiler such
+as Clang, CMake, and Make.
 
-## Required QNX OSS AI module
+```sh
+sudo apk update
+sudo apk add cmake make qnx-sf-base-dev qnx-screen-dev python3-numpy python3-opencv python3-tflite-runtime
+```
 
-Use **TensorFlow Lite runtime** from QNX OSS on the Pi. The project uses the
-checked-in `qnx/blaze_face_short_range.tflite` and
-`qnx/face_landmark_detector.tflite` files. The first finds faces; the second
-provides landmarks used to estimate whether a face is directed at the display.
+From the repo directory on the Pi, build the camera library once, verify the
+Python imports, and take a photo.
 
-## Run on the QNX Pi
+```sh
+CC=clang cmake -S qnx -B build/qnx
+cmake --build build/qnx
+cp build/qnx/libmedusa_camera.so qnx/
+python3 -c 'import cv2, numpy; from tflite_runtime.interpreter import Interpreter'
+python3 capture_face.py --camera-unit 5 --output captures/face.jpg
+```
 
-1. Confirm QNX sees the C270 and can acquire frames with the intended index.
-2. Install the TensorFlow Lite runtime/Python binding matching the exact QNX
-   AArch64 image.
-3. Copy this repository, including the `qnx/` model files, to the Pi.
-4. Start the Arduino safety controller, then the laptop event listener.
-5. Run:
+The script prints the face count and saves the annotated JPEG on the Pi.
+Each run replaces the selected output path. For the first check, stand
+near the camera in good light, run the command, and open the saved JPEG.
+Run it again with a clear view of an empty area to check the zero-face case.
 
-   ```sh
-   python3 qnx_ai_service.py --event-host 192.168.1.20
-   ```
+If the camera open fails, run `usb` to check that QNX sees the webcam and
+`ls /dev/sensor` to check that the Sensor Framework exposes a camera unit.
+Use the configured unit number, close any app already using that camera, and
+check your account's access to the camera device. The bridge needs an
+uncompressed viewfinder format such as YCbYCr (YUYV). Check the sensor
+configuration if the webcam is set to MJPEG. [QNX USB camera diagnostics](https://qnx.github.io/codelabs/configure-multiple-camera-sources-on-RPI5/index.html)
 
-If a camera frame, runtime, model, or inference result is unavailable, the
-service emits an inactive event. The Arduino must park the servo and turn the
-LED off after a missed QNX heartbeat.
+## AI on the Pi
 
-## Pre-demo proof points
+The Pi uses the **TensorFlow Lite runtime** from QNX OSS, with checked-in
+models and no cloud service:
 
-- Both TFLite models load on the QNX Pi.
-- The service processes a C270 frame and emits a local event.
-- Disconnecting the camera emits an inactive event.
-- Stopping QNX causes the Arduino to park the servo and turn off the LED.
-- The application never downloads a model or sends video to the cloud.
+- `qnx/face_detector.tflite`: BlazeFace "back" (256x256), which finds smaller,
+  farther faces. It is the default in laptop-trigger mode.
+- `qnx/blaze_face_short_range.tflite`: BlazeFace short-range (128x128), used by
+  `capture_face.py` and the older Pi-only mode.
+- `qnx/face_landmark_detector.tflite`: 468-point face landmarks.
 
-QNX OSS has published an AArch64 TensorFlow Lite runtime package; verify the
-matching package against the installed QNX image before deployment.
+These are MediaPipe-derived model files run through `tflite_runtime`, not the
+full MediaPipe runtime. QNX OSS publishes an AArch64 TFLite runtime package;
+match it to the installed QNX release.
 
+## Run Medusa on the Pi
+
+1. Flash the UNO Q and wire it to the Pi header UART (`/dev/ser1`), following
+   [the wiring guide](wiring-diagram.md).
+2. Start the control process at priority 21, then the AI process at the
+   default priority. The commands are in the
+   [README](../README.md#2-start-the-pi-qnx-8).
+3. Start the laptop detector on the Mac. The Pi accepts its heartbeats on
+   UDP 8767 from the address given in `--trigger-from`.
+
+On the Pi:
+
+- `:8080/status.json` and `:8080/stream.mjpg`: the AI decision and the turret
+  camera view.
+- `:8082/control.json`: loop timing, Arduino link, arm and gate state, and
+  `safe_reason`.
+- `POST :8082/stress?seconds=N`: CPU hog workers at the AI's priority, for
+  the real-time demo.
+- `POST :8082/arm` and `POST :8082/disarm`: the dashboard's arm / switch-off
+  button. Returns 202; the loop sends one `A` line on its next tick and the
+  firmware decides (kill gate and heartbeat still apply).
+
+## Pre-demo checks
+
+- Both processes start, and `/control.json` shows 50 Hz with p99 jitter of a
+  few ms.
+- With the kill plug out, the turret will not arm. With it in, the D2 button
+  arms it and the red LED lights.
+- Stopping `medusa_control.py` makes the turret glide home and go limp.
+- Unplugging the turret camera sends the turret home.
+- A stress run drops the AI frame rate, but the control loop period stays at
+  20 ms.
+- No model is downloaded and no video leaves the local network.

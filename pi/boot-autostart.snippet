@@ -1,0 +1,4 @@
+# medusa autostart - delete this block to turn it off
+case "$0" in *post_startup*)
+  ( sleep 30; sudo -u qnxuser -H /data/home/qnxuser/Medusa_QNX-bench/start_medusa.sh > /tmp/medusa_boot.log 2>&1 ) &
+;; esac

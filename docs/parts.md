@@ -48,3 +48,14 @@ Everything runs off the laptop's three USB-C ports:
 3. UNO Q #2, which feeds the servos' 5 V through the kill plug
 
 The light uses its own batteries. With all three USB-C ports in use, the laptop charges by MagSafe or runs on a full battery. Stop it from sleeping, or it may cut USB power mid-demo.
+
+## Bench notes (22 Nov, demo build)
+
+- Power the Pi from its wall charger: on a laptop USB-C port it can brown out and drop.
+- The servo 5 V rail runs through the kill plug, with the 470 µF capacitor near the
+  servos and a 10 kΩ divider from that rail to A2 so the firmware senses the kill gate.
+- The arm button is D2 to GND.
+- Pan rests forward at 90° and tracks 15–165°; tilt is held at 0°, where the light sits
+  level.
+- The ArUco marker and the foil on/off switch for the light were dropped; the light is
+  left on.

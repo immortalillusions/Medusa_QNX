@@ -1,12 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
-
-
-class Mode(str, Enum):
-    LAPTOP_ONLY = "laptop-only"
-    FULL_HARDWARE = "full-hardware"
 
 
 @dataclass(frozen=True)
@@ -30,6 +24,7 @@ class FaceObservation:
 class SnooperDecision:
     active: bool
     target_x: float | None = None
+    target_y: float | None = None
     source: str | None = None
     reason: str = ""
 

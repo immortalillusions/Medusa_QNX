@@ -1,0 +1,73 @@
+"""QNX POSIX serial transport for the Arduino safety controller."""
+
+from __future__ import annotations
+
+import os
+import termios
+
+from .control import format_n_line
+from .servo import ServoMapper
+
+
+def open_serial(device: str, baud: int = 115200, *, read: bool = False) -> int:
+    """Open a raw 8N1 non-blocking serial port; write-only unless ``read``.
+
+    Shared by ArduinoController (direct mode, write-only) and the control
+    process (medusa/control.py), which also reads the firmware's S, status lines.
+    """
+    fd = os.open(device, (os.O_RDWR if read else os.O_WRONLY) | os.O_NOCTTY | os.O_NONBLOCK)
+    try:
+        attrs = termios.tcgetattr(fd)
+        attrs[0] = 0
+        attrs[1] = 0
+        attrs[2] = termios.CS8 | termios.CLOCAL | termios.CREAD
+        attrs[3] = 0
+        attrs[4] = getattr(termios, f"B{baud}")
+        attrs[5] = getattr(termios, f"B{baud}")
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+class ArduinoController:
+    def __init__(
+        self,
+        device: str,
+        mapper: ServoMapper,
+        baud: int = 115200,
+        tilt_mapper: ServoMapper | None = None,
+    ) -> None:
+        self.mapper = mapper
+        self.tilt_mapper = tilt_mapper or ServoMapper()
+        self.sequence = 0
+        self.fd = open_serial(device, baud)
+
+    def send(self, active: bool, target_x: float | None, target_y: float | None = None) -> None:
+        """Write M,<yaw>,<pitch>,<led>,<sequence>; tilt goes home without a target_y."""
+        yaw, led = self.mapper.command(active, target_x)
+        pitch, _ = self.tilt_mapper.command(active, target_y)
+        self.sequence += 1
+        message = f"M,{yaw},{pitch},{int(led)},{self.sequence}\n".encode("ascii")
+        os.write(self.fd, message)
+
+    def send_angles(self, active: bool, yaw: float, pitch: float) -> None:
+        """Write N,<yaw_x10>,<pitch_x10>,<led>,<seq>: exact angles in tenths (no smoothing), clamped."""
+        yaw = max(self.mapper.minimum, min(self.mapper.maximum, float(yaw)))
+        pitch = max(self.tilt_mapper.minimum, min(self.tilt_mapper.maximum, float(pitch)))
+        self.sequence += 1
+        os.write(self.fd, format_n_line(yaw, pitch, active, self.sequence))
+
+    def safe_stop(self) -> None:
+        """M,<home>,<tilt home>,0,<seq>: exactly home on both axes, led bit 0 (no smoothing)."""
+        self.sequence += 1
+        os.write(self.fd, f"M,{self.mapper.park()},{self.tilt_mapper.park()},0,{self.sequence}\n".encode("ascii"))
+
+    def poll_actual(self):
+        """Direct mode has no status feedback (the port is write-only): the tracker uses its model."""
+        return None
+
+    def close(self) -> None:
+        os.close(self.fd)
+
