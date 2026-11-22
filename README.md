@@ -16,6 +16,16 @@ to face them. It was built at Hack Western 13 for the QNX track.
 - **A real-time control loop on QNX** runs at 50 Hz and keeps its timing while
   the AI process is starved of CPU.
 
+## Who it helps
+
+Shoulder-surfing is one of the simplest ways private information leaks: patient records at a
+clinic front desk or nursing station, account numbers at a bank counter, an open-plan office.
+Staff can't watch the screen and the room at the same time. Medusa covers the record with a
+blank document the moment a second person looks, so the staff member also sees that someone
+was looking. It identifies, records and uploads no one: detection runs on the laptop and the
+turret, and laptop images never leave the laptop. A clinic could run screen-hiding alone, with
+no turret or light. It needs no change to the clinic's software and uses a laptop's own webcam.
+
 ## Architecture
 
 ```text
