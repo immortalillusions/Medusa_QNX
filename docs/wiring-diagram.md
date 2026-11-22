@@ -56,5 +56,5 @@ pins.
 2. Put the plug in, start `medusa_control.py`, and arm. Over about 1.5 s the
    servos should creep to their last position, not jump.
 3. Stop `medusa_control.py`. The turret should glide home (pan 90,
-   tilt 90), then go limp.
+   tilt 0), then go limp.
 4. Arm again and pull the kill plug. The servos must lose power at once.

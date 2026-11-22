@@ -10,7 +10,7 @@ thread. The AI process stays at the default priority 10 and sends targets with
 ``qnx_ai_service.py --control-port 8768``. See medusa/control.py.
 
 The servo defaults (65..115, home 90) predate the current turret. Pass the
-firmware's ranges (``--servo-min 15 --servo-max 165 --servo-home 90``, tilt 90),
+firmware's ranges (``--servo-min 15 --servo-max 165 --servo-home 90``, tilt 0),
 or the firmware rejects every park line.
 """
 
