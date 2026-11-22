@@ -123,6 +123,8 @@ shield, with pin map, BOM and v2 changes.
 
 ## Run it
 
+For the demo itself, follow `docs/demo-day.md`: what to bring, setup order, checks, and fixes (including a one-command rollback).
+
 ### 1. Flash the UNO Q
 
 Upload `arduino/medusa_controller/medusa_controller.ino` with the
