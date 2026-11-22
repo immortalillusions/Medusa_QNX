@@ -16,6 +16,7 @@ either way.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
 import socket
@@ -33,7 +34,7 @@ from medusa.decision import screen_facing_from_landmarks
 from medusa.gaze import NOSE_TIP, GazeConfig, GazeEstimate, estimate_gaze
 from medusa.models import FaceObservation, SnooperDecision
 from medusa.peeper_tracker import Detection, PeeperTracker, Track, TrackerConfig
-from medusa.preview import PreviewServer
+from medusa.preview import PreviewServer, RuntimeSettings
 from qnx.face_webcam import detect_faces  # lazy cv2/mediapipe imports inside
 
 
@@ -264,13 +265,15 @@ class LaptopDetector:
     ``clock`` must advance between frames: every dwell and timeout is in seconds.
     ``turret`` (a TurretPoller) gates the docs switch: it fires once per encounter, when the
     peeper is active and the turret is ON, whichever came second. No turret = OFF, unless
-    ``docs_always``.
+    ``docs_always``. ``settings`` (RuntimeSettings, from the dashboard) are applied at the start
+    of each step: peeper mode one/two (tracker min_faces 1/2) and screen switching on/off.
     """
 
     def __init__(self, action: PrivacyAction, link: PiLink | None, preview_state=None,
                  tracker: PeeperTracker | None = None, extract=face_observations,
                  debug_gaze: bool = False, clock=time.monotonic,
-                 turret: TurretPoller | None = None, docs_always: bool = False) -> None:
+                 turret: TurretPoller | None = None, docs_always: bool = False,
+                 settings: RuntimeSettings | None = None) -> None:
         self.tracker = tracker or PeeperTracker()
         self.action = action
         self.link = link
@@ -280,6 +283,9 @@ class LaptopDetector:
         self.clock = clock
         self.turret = turret
         self.docs_always = docs_always
+        self.settings = settings
+        self.screen_switch = True  # dashboard switch; OFF never switches to Docs
+        self.user_id: int | None = None
         self.active = False
         self.turret_on = False
         self._docs_latched = False  # this encounter has met the gate; cleared when it ends
@@ -294,8 +300,26 @@ class LaptopDetector:
             return None
         return round((len(times) - 1) / (times[-1] - times[0]), 1)
 
+    @property
+    def peeper_mode(self) -> str:
+        return "one" if self.tracker.config.min_faces <= 1 else "two"
+
+    def _apply_settings(self) -> None:
+        update = self.settings.take() if self.settings is not None else {}
+        mode = update.get("peeper_mode")
+        if mode is not None and mode != self.peeper_mode:
+            self.tracker.config = dataclasses.replace(self.tracker.config,
+                                                      min_faces=1 if mode == "one" else 2)
+            # Who may be the peeper changed: drop the lock so the next frame decides afresh.
+            self.tracker.peeper_id = None
+            _LOG.info("peeper mode: %s-person", mode)
+        if "screen_switch" in update and update["screen_switch"] != self.screen_switch:
+            self.screen_switch = update["screen_switch"]
+            _LOG.info("screen switching %s", "ON" if self.screen_switch else "OFF")
+
     def step(self, raw, width: int, height: int) -> tuple[SnooperDecision, TrackedFace | None]:
         """Returns the decision and the peeper's face (None unless active)."""
+        self._apply_settings()
         now = self.clock()
         self._frame_times.append(now)
         faces = self.faces = self.extract(raw, width, height)
@@ -303,6 +327,7 @@ class LaptopDetector:
                                      aspect=height / width if width else 1.0)
         decision, tracks = result.decision, result.tracks
         self.face_tracks = tracks
+        self.user_id = result.user_id if self.peeper_mode == "two" else None  # one-person: no USER
         peeper = None
         if decision.active:
             peeper = next((face for face, track in zip(faces, tracks)
@@ -333,7 +358,9 @@ class LaptopDetector:
                 snooper_count=1 if decision.active else 0,
                 extra={"faces": [face_status(face, track, now) for face, track in zip(faces, tracks)],
                        "fps": self.fps(), "peeper_id": result.peeper_id,
-                       "turret_on": self.turret_on, "docs_enabled": docs_enabled},
+                       "turret_on": self.turret_on, "docs_enabled": docs_enabled,
+                       "peeper_mode": self.peeper_mode, "screen_switch": self.screen_switch,
+                       "docs_available": bool(self.action.enabled), "docs_fired": self._docs_latched},
             )
         return decision, peeper
 
@@ -344,7 +371,7 @@ class LaptopDetector:
             _LOG.info("turret %s (%s): docs switching %s", "ON" if on else "OFF", reason,
                       "enabled" if on or self.docs_always else "paused")
             self.turret_on = on
-        return bool(self.action.enabled) and (on or self.docs_always)
+        return bool(self.action.enabled) and self.screen_switch and (on or self.docs_always)
 
     def _log_gaze(self, faces: list[TrackedFace], tracks: list[Track], now: float,
                   user_id: int | None) -> None:
@@ -501,7 +528,8 @@ def main(argv: list[str] | None = None) -> int:
     vision = mp.tasks.vision
     landmarker = args.detector == "landmarker"
     try:
-        preview = PreviewServer(args.preview_port)
+        settings = RuntimeSettings()
+        preview = PreviewServer(args.preview_port, settings)
         preview.start()
         tracker = PeeperTracker(tracker_config)
         extract = partial(landmarker_faces, config=gaze_config) if landmarker else face_observations
@@ -509,7 +537,7 @@ def main(argv: list[str] | None = None) -> int:
             turret.start()
         detector = LaptopDetector(PrivacyAction(enabled=not args.no_browser), link, preview.state,
                                   tracker=tracker, extract=extract, debug_gaze=args.debug_gaze,
-                                  turret=turret, docs_always=args.docs_always)
+                                  turret=turret, docs_always=args.docs_always, settings=settings)
         _LOG.info("Camera %d open, %s. Preview http://localhost:%d/stream.mjpg . Heartbeats to %s. "
                   "Docs switch: %s.", args.camera, args.detector, args.preview_port,
                   "nobody (--no-pi)" if link is None else f"{args.pi_host}:{args.pi_port}",

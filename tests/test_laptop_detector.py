@@ -320,6 +320,87 @@ class GazeDetectorTests(unittest.TestCase):
         self.assertFalse([line for line in logs.output if "gaze[" in line])
 
 
+
+class RuntimeSettingsTests(unittest.TestCase):
+    """Dashboard switches: peeper mode (min_faces 2/1) and screen switching, applied next frame."""
+
+    def setUp(self):
+        self.settings = laptop_detector.RuntimeSettings()
+        self.detector, _, _, self.preview = make_detector()
+        self.detector.settings = self.settings
+        self.detector.docs_always = True
+        self.detector.action = laptop_detector.PrivacyAction(enabled=True)
+        switch = patch("medusa.actions._switch_to_docs", return_value="focused chrome")
+        browser = patch("medusa.actions.webbrowser.open_new_tab")
+        self.switch, self.browser = switch.start(), browser.start()
+        self.addCleanup(switch.stop)
+        self.addCleanup(browser.stop)
+
+    def frames(self, n, faces):
+        for _ in range(n):
+            decision, _ = self.detector.step(faces, 1280, 720)
+        pending = getattr(self.detector.action, "_pending", None)
+        if pending is not None:
+            pending.result(timeout=2)
+        return decision
+
+    def extra(self):
+        return self.preview.update_status.call_args[1]["extra"]
+
+    def test_defaults_are_reported(self):
+        self.frames(1, [USER])
+        self.assertEqual((self.extra()["peeper_mode"], self.extra()["screen_switch"],
+                          self.extra()["docs_available"], self.extra()["docs_fired"]), ("two", True, True, False))
+        self.assertIsNotNone(self.detector.user_id)
+
+    def test_one_person_mode_lets_a_lone_face_trigger_and_back_to_two_drops_it(self):
+        self.assertFalse(self.frames(ENTER_FRAMES + 5, [USER]).active)  # two-person: the user never counts
+        self.settings.request({"peeper_mode": "one"})
+        self.assertEqual(self.detector.tracker.config.min_faces, 2)  # nothing applied until the next frame
+        self.assertTrue(self.frames(ENTER_FRAMES, [USER]).active)
+        self.assertEqual((self.detector.tracker.config.min_faces, self.extra()["peeper_mode"]), (1, "one"))
+        self.assertIsNone(self.detector.user_id)  # no USER label in one-person mode
+        self.settings.request({"peeper_mode": "two"})
+        decision = self.frames(1, [USER])  # the lone user was the peeper: dropped at once, no stale lock
+        self.assertFalse(decision.active)
+        self.assertIsNone(self.detector.tracker.peeper_id)
+        self.assertEqual(self.extra()["peeper_mode"], "two")
+        self.assertEqual(self.detector.tracker.config.enter_s, 0.5)  # only min_faces changed
+
+    def test_screen_switch_off_never_switches_and_on_restores_the_rule(self):
+        self.settings.request({"screen_switch": False})
+        self.frames(ENTER_FRAMES + 5, [USER, PEEPER])
+        self.assertTrue(self.detector.active)
+        self.assertEqual(self.switch.call_count + self.browser.call_count, 0)
+        self.assertEqual((self.extra()["screen_switch"], self.extra()["docs_enabled"]), (False, False))
+        self.frames(AWAY_FRAMES, [USER])
+        self.settings.request({"screen_switch": True})
+        self.frames(ENTER_FRAMES, [USER, PEEPER])
+        self.assertEqual(self.switch.call_count + self.browser.call_count, 1)
+        self.assertTrue(self.extra()["docs_fired"])
+
+    def test_screen_switch_on_still_needs_the_turret_without_docs_always(self):
+        self.detector.docs_always = False
+        self.detector.turret = FakeTurret(on=False)
+        self.settings.request({"screen_switch": True})
+        self.frames(ENTER_FRAMES + 5, [USER, PEEPER])
+        self.assertEqual(self.switch.call_count + self.browser.call_count, 0)
+
+    def test_main_wires_the_settings_into_the_preview_and_the_detector(self):
+        camera = MagicMock()
+        camera.isOpened.return_value = True
+        camera.read.side_effect = KeyboardInterrupt
+        modules = {"cv2": SimpleNamespace(CAP_AVFOUNDATION=1200, VideoCapture=MagicMock(return_value=camera)),
+                   "mediapipe": MagicMock()}
+        with patch.dict(sys.modules, modules), \
+                patch.object(laptop_detector, "PreviewServer") as preview, \
+                patch.object(laptop_detector, "PrivacyAction"), \
+                patch.object(laptop_detector, "LaptopDetector", wraps=LaptopDetector) as made:
+            self.assertEqual(laptop_detector.main(["--no-pi"]), 0)
+        settings = made.call_args.kwargs["settings"]
+        self.assertIsInstance(settings, laptop_detector.RuntimeSettings)
+        self.assertIs(preview.call_args.args[1], settings)
+
 class MainTests(unittest.TestCase):
     def fake_modules(self, opened):
         camera = MagicMock()
