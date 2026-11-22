@@ -46,6 +46,14 @@ class GazeConfig:
     # (head pose alone) to 1 at eye_px_full. (0, 0) = always trusted.
     eye_px_min: float = 0.0
     eye_px_full: float = 0.0
+    # Head pose source: "matrix" (the landmarker's, fitted to all 468 points), "upper"
+    # (medusa.upper_pose: solvePnP on eyes/brows/forehead/bridge only) or "auto": the matrix
+    # unless there is none or the lower face is implausible (jaw_ratio outside the range).
+    # Measured on synthetic masks the matrix stays within 0.4-2.4 deg of the unmasked pose
+    # while upper-only pitch drifts 3-7 deg, so "auto" keeps the matrix whenever it can.
+    head_pose: str = "auto"
+    jaw_ratio_min: float = 1.3     # chin-to-eyes / eyes-to-forehead; ~2.2 on a real face,
+    jaw_ratio_max: float = 3.5     # 1.5-2.4 with a mask the landmarker filled in
 
 
 @dataclass(frozen=True)
@@ -58,6 +66,7 @@ class GazeEstimate:
     gaze_pitch: float
     looking: bool
     method: str  # "eyes" (head + iris) or "head" (both eyes closed or no iris landmarks)
+    pose: str = "matrix"  # where head yaw/pitch came from: "matrix" or "upper"
 
 
 def head_pose_from_matrix(matrix) -> tuple[float, float]:
@@ -133,10 +142,42 @@ def looking_at_screen(gaze_yaw: float, gaze_pitch: float, config: GazeConfig) ->
             and config.pitch_min_deg <= gaze_pitch <= config.pitch_max_deg)
 
 
+CHIN, FOREHEAD = 152, 10
+
+
+def jaw_ratio(points: Sequence[tuple[float, float]]) -> float:
+    """|chin - eye midpoint| / |eye midpoint - forehead|: ~2.2 on the canonical face."""
+    a, b = points[RIGHT_EYE["corner_a"]], points[LEFT_EYE["corner_b"]]
+    mid = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+    up = math.dist(mid, points[FOREHEAD])
+    return math.dist(points[CHIN], mid) / up if up > 0 else float("inf")
+
+
+def head_pose(landmarks, matrix, config: GazeConfig, width: float, height: float):
+    """(yaw, pitch, source) from the matrix or the upper face, per config.head_pose."""
+    use_upper = config.head_pose == "upper" or matrix is None
+    points = None
+    if not use_upper and config.head_pose == "auto" and len(landmarks) >= IRIS_LANDMARK_COUNT:
+        points = [(p.x * width, p.y * height) for p in landmarks]
+        ratio = jaw_ratio(points)
+        use_upper = not config.jaw_ratio_min <= ratio <= config.jaw_ratio_max
+    if use_upper:
+        from .upper_pose import upper_face_pose
+
+        if points is None:
+            points = [(p.x * width, p.y * height) for p in landmarks]
+        upper = upper_face_pose(points, width, height)
+        if upper is not None:
+            return upper[0], upper[1], "upper"
+    if matrix is None:
+        raise ValueError("no transformation matrix and no upper-face pose")
+    return (*head_pose_from_matrix(matrix), "matrix")
+
+
 def estimate_gaze(landmarks, matrix, config: GazeConfig = GazeConfig(),
                   width: float = 1.0, height: float = 1.0) -> GazeEstimate:
-    """landmarks: MediaPipe normalized landmarks (.x, .y); matrix: 4x4 transformation."""
-    head_yaw, head_pitch = head_pose_from_matrix(matrix)
+    """landmarks: MediaPipe normalized landmarks (.x, .y); matrix: 4x4 transformation or None."""
+    head_yaw, head_pitch, source = head_pose(landmarks, matrix, config, width, height)
     eyes = None
     if len(landmarks) >= IRIS_LANDMARK_COUNT:
         points = [(p.x * width, p.y * height) for p in landmarks]
@@ -150,5 +191,5 @@ def estimate_gaze(landmarks, matrix, config: GazeConfig = GazeConfig(),
         head_yaw=head_yaw, head_pitch=head_pitch, eye_yaw=eye_yaw, eye_pitch=eye_pitch,
         gaze_yaw=gaze_yaw, gaze_pitch=gaze_pitch,
         looking=looking_at_screen(gaze_yaw, gaze_pitch, config),
-        method="eyes" if eyes is not None else "head",
+        method="eyes" if eyes is not None else "head", pose=source,
     )
