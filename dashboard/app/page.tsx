@@ -579,7 +579,7 @@ function TopBar({ laptop, turret, control, controlUrl }: {
         <HealthChip label="Control" tone={c ? "ok" : "bad"} value={c ? fmt(c.loop_hz, 0, " Hz") : "offline"} />
         <HealthChip label="Arduino" tone={arduino?.link_ok === true ? "ok" : arduino?.link_ok === false ? "bad" : "idle"}
           value={!arduino ? (c ? "no data" : "unknown")
-            : `${arduino.armed ? "armed" : "disarmed"}${isNum(arduino.pan) ? ` · pan ${arduino.pan.toFixed(0)}°` : ""}`} />
+            : `${arduino.armed ? "armed" : "disarmed"}${isNum(arduino.pan) ? ` · pan ${arduino.pan.toFixed(0)}°` : ""}${isNum(arduino.tilt) ? ` tilt ${arduino.tilt.toFixed(0)}°` : ""}`} />
       </div>
     </div>
   </header>;
